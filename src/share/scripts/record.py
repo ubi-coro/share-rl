@@ -1,7 +1,6 @@
 import logging
 import time
 from dataclasses import asdict
-from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -166,7 +165,9 @@ def record_loop(
         dt_loop = time.perf_counter() - start_loop_t
         logging.info(
             f"[{task}] "
-            f"{transition[TransitionKey.ACTION]}"
+            f"{transition[TransitionKey.OBSERVATION]["main.x.ee_pos"]}, "
+            f"{transition[TransitionKey.OBSERVATION]["main.y.ee_pos"]}, "
+            f"{transition[TransitionKey.OBSERVATION]["main.z.ee_pos"]}"
             f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
             f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
         )

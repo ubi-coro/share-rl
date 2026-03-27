@@ -348,7 +348,6 @@ class InterventionActionProcessorStep(ProcessorStep):
             gripper_enable=self.gripper_enable,
             like=policy_actions,
         )
-
         new_transition[TransitionKey.ACTION] = full_action_dict
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
         new_transition[TransitionKey.INFO] = info
@@ -367,10 +366,7 @@ class InterventionActionProcessorStep(ProcessorStep):
             key = frame.action_key_for_axis(axis)
             if key not in encoded_action:
                 raise ValueError(f"Missing learning-space action key '{key}' for task-frame projection")
-            value = encoded_action[key]
-            if frame.control_mode[axis] in {ControlMode.VEL, ControlMode.WRENCH}:
-                value = self._bound_differential_axis(frame, axis, value)
-            full_target[key] = float(value)
+            full_target[key] = float(encoded_action[key])
 
         if absolute_rot_axes:
             rotation_keys = rotation_component_keys(frame, absolute_rot_axes)
@@ -413,14 +409,6 @@ class InterventionActionProcessorStep(ProcessorStep):
             if key in robot_action:
                 teleop_action[feature_name] = robot_action[key]
         return teleop_action
-
-    @staticmethod
-    def _bound_differential_axis(frame: TaskFrame, axis: int, value: float) -> float:
-        if frame.min_target is not None and frame.max_target is not None:
-            scale = max(abs(frame.min_target[axis]), abs(frame.max_target[axis]))
-            if scale > 0:
-                return math.tanh(value) * scale
-        return math.tanh(value)
 
     def _decode_absolute_rotation(self, absolute_rot_axes: list[int], raw: list[float]) -> tuple[list[float], int]:
         rot = [0.0, 0.0, 0.0]
