@@ -112,7 +112,7 @@ The primitive config is a registry with three intended primitive families:
 
 - `static`: legacy behavior; task-frame targets come directly from config.
 - `move_delta`: resolves fixed task-space `POS` axes once on entry from `start_pose + delta`, with `delta_frame` in `world` or `ee_current`. For those fixed axes, `task_frame.target` is ignored at runtime and a zero delta holds the entry pose.
-- `open_loop_trajectory`: owns a single `trajectory` spec with exactly one of `target` or `delta`, a `frame`, and `duration_s`. The config resolves the start/goal poses on entry and samples the current scripted target every substep via `target_pose_at(...)`.
+- `open_loop_trajectory`: owns a single `trajectory` spec with exactly one of `target` or `delta`, a `frame`, and `duration_s`. The config resolves the start/goal poses on entry and samples the current scripted target every substep via `target_pose_at(...)`. After the nominal duration elapses, the runtime keeps calling `target_pose_at(alpha)` with `alpha > 1` while `trajectory_progress` stays clamped at `1.0` and `primitive_complete` stays true. Simple configs can clamp internally to hold the final target; richer configs can keep evolving their scripted motion while waiting for a transition.
 
 Configs stay declarative: runtime target state lives in the primitive env. `move_delta` updates the env target on entry so downstream action projection and transition checks observe the same target. `open_loop_trajectory` is scripted-only in v1, publishes its final goal as `primitive_target_pose`, and exposes completion/progress through the info keys above while the env handles stepping.
 

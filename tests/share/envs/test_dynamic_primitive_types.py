@@ -289,6 +289,47 @@ def test_move_delta_only_resolves_fixed_pos_axes_from_entry_delta():
     )
 
 
+def test_move_delta_resolves_partial_fixed_rotation_axes_independently():
+    start_rpy = [0.2, 0.3, -0.1]
+    start_rotvec = Rotation.from_euler("xyz", start_rpy, degrees=False).as_rotvec()
+    config = MoveDeltaPrimitiveConfig(
+        task_frame={
+            "arm": TaskFrame(
+                target=[0.0, 0.0, 0.0, 9.0, 8.0, 7.0],
+                origin=[0.0] * 6,
+                policy_mode=[None, None, None, None, PolicyMode.RELATIVE, PolicyMode.RELATIVE],
+                control_mode=[ControlMode.POS] * 6,
+            )
+        },
+        delta={"arm": [0.0, 0.0, 0.0, 0.4, 0.2, 0.5]},
+        delta_frame={"arm": "ee_current"},
+    )
+    config.validate(
+        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+    )
+    env = DummyPrimitiveEnv({})
+
+    config.on_entry(
+        env,
+        PrimitiveEntryContext(
+            observation={
+                "arm.x.ee_pos": 0.0,
+                "arm.y.ee_pos": 0.0,
+                "arm.z.ee_pos": 0.0,
+                "arm.rx.ee_pos": float(start_rotvec[0]),
+                "arm.ry.ee_pos": float(start_rotvec[1]),
+                "arm.rz.ee_pos": float(start_rotvec[2]),
+            },
+            task_frame_origin={"arm": [0.0] * 6},
+        ),
+    )
+
+    assert env.target_pose["arm"][3] == pytest.approx(start_rpy[0] + 0.4)
+    assert env.target_pose["arm"][4] == pytest.approx(8.0)
+    assert env.target_pose["arm"][5] == pytest.approx(7.0)
+
+
 def test_move_delta_zero_rotation_delta_publishes_current_orientation_as_rpy():
     config = _validated_move_delta([0.0] * 6, delta_frame="world")
     env = DummyPrimitiveEnv({})
@@ -450,6 +491,45 @@ def test_open_loop_trajectory_runs_chunked_substeps_and_reports_progress():
     assert env._trajectory_substeps == 4
     assert second[4]["trajectory_progress"] == pytest.approx(1.0)
     assert second[4]["primitive_complete"] is True
+
+
+def test_open_loop_trajectory_keeps_sampling_after_nominal_completion():
+    config = _validated_open_loop(delta=[0.4, 0.0, 0.0, 0.0, 0.0, 0.0], frame="world", duration_s=0.4, fps=5.0)
+    robot = MockRobot(name="arm", is_task_frame=True)
+    robot.config.frequency = 10.0
+
+    env, _, _ = config.make(
+        robot_dict={"arm": robot},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+        cameras={},
+    )
+    env.robot_dict["arm"].get_observation = lambda: {
+        f"{axis}.ee_pos": float(env.robot_dict["arm"].current_frame.target[index])
+        for index, axis in enumerate(["x", "y", "z", "rx", "ry", "rz"])
+    }
+    config.on_entry(
+        env,
+        PrimitiveEntryContext(
+            observation={
+                "arm.x.ee_pos": 0.0,
+                "arm.y.ee_pos": 0.0,
+                "arm.z.ee_pos": 0.0,
+                "arm.rx.ee_pos": 0.0,
+                "arm.ry.ee_pos": 0.0,
+                "arm.rz.ee_pos": 0.0,
+            },
+            task_frame_origin={"arm": [0.0] * 6},
+        ),
+    )
+
+    env.step({})
+    env.step({})
+    third = env.step({})
+
+    assert env._trajectory_substeps == 6
+    assert third[4]["trajectory_progress"] == pytest.approx(1.0)
+    assert third[4]["primitive_complete"] is True
+    assert env.task_frame["arm"].target == pytest.approx([0.4, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 def test_open_loop_trajectory_uses_entry_pose_for_fixed_pos_axes():

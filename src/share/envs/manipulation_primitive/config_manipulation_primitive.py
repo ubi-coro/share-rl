@@ -678,7 +678,18 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
             )
             resolved_target = world_pose_to_task_pose(target_world, frame.origin)
             target_pose[name] = [float(v) for v in frame.target]
-            for axis in self._fixed_pos_axes(frame):
+            fixed_pos_axes = self._fixed_pos_axes(frame)
+            fixed_rotation_axes = [axis for axis in fixed_pos_axes if axis >= 3]
+            for axis in fixed_pos_axes:
+                if axis >= 3 and len(fixed_rotation_axes) < 3:
+                    target_pose[name][axis] = self._resolve_partial_rotation_axis_target(
+                        start_pose_world=start_world,
+                        frame=frame,
+                        delta=[float(v) for v in self.delta[name]],
+                        delta_frame=self.delta_frame[name],
+                        axis=axis,
+                    )
+                    continue
                 target_pose[name][axis] = float(resolved_target[axis])
         return start_pose, target_pose
 
@@ -689,6 +700,25 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
             for axis in range(len(frame.target))
             if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] is None
         ]
+
+    @staticmethod
+    def _resolve_partial_rotation_axis_target(
+        *,
+        start_pose_world: list[float],
+        frame: TaskFrame,
+        delta: list[float],
+        delta_frame: str,
+        axis: int,
+    ) -> float:
+        single_axis_delta = [0.0] * 6
+        single_axis_delta[axis] = float(delta[axis])
+        axis_target_world = compose_delta_pose(
+            start_pose_world=start_pose_world,
+            delta=single_axis_delta,
+            frame_name=delta_frame,
+        )
+        axis_target_task = world_pose_to_task_pose(axis_target_world, frame.origin)
+        return float(axis_target_task[axis])
 
 
 @ManipulationPrimitiveConfig.register_subclass("open_loop_trajectory")

@@ -256,12 +256,7 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
             values after executing up to the configured internal robot
             steps.
         """
-        remaining = max(0, int(self._duration_substeps) - self._trajectory_substeps)
-        substeps = min(int(self._substeps_per_step), remaining)
-        if substeps <= 0:
-            self._primitive_complete = True
-            return self._get_observation(), 0.0, False, False, self._get_info()
-
+        substeps = max(1, int(self._substeps_per_step))
         obs = self._get_observation()
         reward = 0.0
         terminated = False
@@ -278,12 +273,11 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
             scripted_action = self._action_from_pose(scripted_pose)
             obs, step_reward, terminated, truncated, _info = super().step(scripted_action)
             reward += step_reward
-            self._trajectory_progress = alpha
+            self._trajectory_progress = min(1.0, alpha)
+            self._primitive_complete = alpha >= 1.0
             if terminated or truncated:
                 break
 
-        if self._trajectory_substeps >= int(self._duration_substeps):
-            self._primitive_complete = True
         return obs, reward, terminated, truncated, self._get_info()
 
     def _set_live_task_frame_pose(self, pose_by_robot: dict[str, list[float]]) -> None:
