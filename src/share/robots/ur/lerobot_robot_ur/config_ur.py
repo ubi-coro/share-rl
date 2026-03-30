@@ -22,6 +22,7 @@ import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.robots import RobotConfig
+from share.robots.ur.lerobot_robot_ur.controller import ComplianceSafetyMode
 
 @RobotConfig.register_subclass("ur")
 @dataclass
@@ -50,6 +51,8 @@ class URConfig(RobotConfig):
     shm_manager: Optional[SharedMemoryManager] = None
     ft_filter_cutoff_hz: Optional[float] = None  # Hz, EMA low-pass cutoff for f/t sensor
     force_mode_gain_scaling: float = 1.0
+    kp: list[float] = field(default_factory=lambda: [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])
+    kd: list[float] = field(default_factory=lambda: [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])
 
     # safety
     max_pose_rpy: list[float] = field(default_factory = lambda: [float("inf")] * 6)
@@ -58,7 +61,7 @@ class URConfig(RobotConfig):
     speed_limits: list[float] = field(default_factory = lambda: [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])
 
     # compliance / anti-windup behavior
-    compliance_safety_mode: Literal["none", "adaptive_wrench_limits", "reference_limits", "both"] = "both"
+    compliance_safety_mode: ComplianceSafetyMode = ComplianceSafetyMode.BOTH
     compliance_safety_enable: list[bool] = field(default_factory=lambda: [False] * 6)
     compliance_desired_wrench: list[float] = field(default_factory=lambda: [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])
     compliance_adaptive_limit_theta: Optional[list[float]] = None
@@ -72,6 +75,10 @@ class URConfig(RobotConfig):
     debug_axis: int = 0
 
     def __post_init__(self):
+        if len(self.kp) != 6:
+            raise ValueError("URConfig.kp must be a length-6 list.")
+        if len(self.kd) != 6:
+            raise ValueError("URConfig.kd must be a length-6 list.")
         if self.compliance_adaptive_limit_theta is None:
             if self.verbose:
                 logging.info(f"=== Compute parameters for exponential contact force limit scaling: ===")

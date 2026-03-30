@@ -15,7 +15,9 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import Transition
 
 from share.envs.manipulation_primitive.config_manipulation_primitive import PrimitiveEntryContext
+from share.envs.manipulation_primitive.task_frame import ControlMode
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
+from share.envs.manipulation_primitive_net.transitions import DEFAULT_TARGET_POSE_AXES_INFO_KEY
 from share.envs.utils import task_frame_origins
 from share.teleoperators import TeleopEvents
 
@@ -196,6 +198,7 @@ class ManipulationPrimitiveNet(gym.Env):
         info["transition_from"] = active
         info["transition_to"] = active
         info["transition_reason"] = None
+        info[DEFAULT_TARGET_POSE_AXES_INFO_KEY] = self._default_target_pose_axes(primitive)
 
         # 6) Check for transitions
         for transition in self._transitions[self._active]:
@@ -221,8 +224,21 @@ class ManipulationPrimitiveNet(gym.Env):
             info["transition_reason"] = result.reason
             break
 
+        info.pop(DEFAULT_TARGET_POSE_AXES_INFO_KEY, None)
         processed_transition[TransitionKey.INFO] = info
         return processed_transition
+
+    @staticmethod
+    def _default_target_pose_axes(primitive: Any) -> dict[str, list[int]]:
+        default_axes: dict[str, list[int]] = {}
+        for name, frame in primitive.task_frame.items():
+            axes = [
+                axis
+                for axis in range(len(frame.target))
+                if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] is None
+            ]
+            default_axes[name] = axes
+        return default_axes
 
     def _step_reset_path_until_start(self, obs: dict[str, np.ndarray], info: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         """Walk the reset graph until ``start_primitive`` becomes active.

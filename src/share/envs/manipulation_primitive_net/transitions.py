@@ -9,6 +9,8 @@ from share.envs.utils import to_scalar, resolve_value, compare, axis_to_index
 from share.teleoperators import TeleopEvents
 from share.utils.transformation_utils import get_robot_pose_from_observation
 
+DEFAULT_TARGET_POSE_AXES_INFO_KEY = "_primitive_target_pose_axes"
+
 
 @dataclass
 class Outcome:
@@ -145,7 +147,7 @@ class OnTargetPoseReached(Transition):
         for robot_name in robot_names:
             current_pose = get_robot_pose_from_observation(obs, robot_name)
             target_pose = [float(v) for v in targets[robot_name]]
-            axes = self._resolved_axes()
+            axes = self._resolved_axes(info=info, robot_name=robot_name)
             tolerances = self._resolved_tolerances()
             for axis in axes:
                 error = current_pose[axis] - target_pose[axis]
@@ -163,9 +165,12 @@ class OnTargetPoseReached(Transition):
             reason="target_pose_reached" if fired and self.reason is None else self.reason if fired else None,
         )
 
-    def _resolved_axes(self) -> list[int]:
+    def _resolved_axes(self, info: dict[str, Any], robot_name: str) -> list[int]:
         if self.axes is not None:
             return [axis_to_index(axis) for axis in self.axes]
+        inferred_axes = info.get(DEFAULT_TARGET_POSE_AXES_INFO_KEY, {})
+        if robot_name in inferred_axes and inferred_axes[robot_name]:
+            return [int(axis) for axis in inferred_axes[robot_name]]
         return [0, 1, 2, 3, 4, 5]
 
     def _resolved_tolerances(self) -> list[float]:
@@ -174,6 +179,5 @@ class OnTargetPoseReached(Transition):
         if len(self.tolerance) != 6:
             raise ValueError("OnTargetPoseReached.tolerance must be a scalar or length-6 list.")
         return [float(v) for v in self.tolerance]
-
 
 

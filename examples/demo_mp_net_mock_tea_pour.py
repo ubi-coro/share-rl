@@ -9,6 +9,7 @@ from _mock_mp_net_utils import make_mock_connect
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
     ManipulationPrimitiveConfig,
     MoveDeltaPrimitiveConfig,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, TaskFrame
@@ -32,10 +33,11 @@ tilt_cfg = MoveDeltaPrimitiveConfig(
 pour_arc_cfg = OpenLoopTrajectoryPrimitiveConfig(
     notes="Trace a gentle pouring arc while maintaining the wrist tilt.",
     task_frame={"arm": TaskFrame(target=[0.0, 0.0, 0.18, 0.0, 0.35, 0.0], control_mode=[ControlMode.POS] * 6)},
-    delta={"arm": [0.08, 0.00, -0.02, 0.0, 0.0, 0.20]},
-    delta_frame={"arm": "world"},
-    duration_substeps=10,
-    substeps_per_step=2,
+    trajectory=OpenLoopTrajectorySpec(
+        delta={"arm": [0.08, 0.00, -0.02, 0.0, 0.0, 0.20]},
+        frame={"arm": "world"},
+        duration_s={"arm": 1.0},
+    ),
 )
 
 recover_cfg = MoveDeltaPrimitiveConfig(

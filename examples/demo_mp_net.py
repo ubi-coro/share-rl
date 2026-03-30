@@ -6,6 +6,7 @@ from share.envs.manipulation_primitive.task_frame import TaskFrame, PolicyMode, 
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
     ManipulationPrimitiveConfig,
     MoveDeltaPrimitiveConfig,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
 )
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
@@ -68,9 +69,11 @@ final_success_cfg = ManipulationPrimitiveConfig(
 # 3. Reset Step 1: Retract
 retract_cfg = OpenLoopTrajectoryPrimitiveConfig(
     task_frame={"random_bot": TaskFrame(target=[0.4, 0.0, 0.6, 0, 0, 0])},
-    delta={"random_bot": [0.0, 0.0, 0.2, 0.0, 0.0, 0.0]},
-    duration_substeps=6,
-    substeps_per_step=2,
+    trajectory=OpenLoopTrajectorySpec(
+        delta={"random_bot": [0.0, 0.0, 0.2, 0.0, 0.0, 0.0]},
+        frame={"random_bot": "world"},
+        duration_s={"random_bot": 0.6},
+    ),
 )
 
 # 4. Reset Step 2: Home

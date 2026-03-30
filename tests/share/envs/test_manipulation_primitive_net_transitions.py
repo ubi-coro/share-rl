@@ -9,9 +9,11 @@ from __future__ import annotations
 import numpy as np
 
 from share.envs.manipulation_primitive_net.transitions import (
+    DEFAULT_TARGET_POSE_AXES_INFO_KEY,
     Always,
     OnObservationThreshold,
     OnSuccess,
+    OnTargetPoseReached,
     OnTimeLimit,
     RewardClassifierTransition,
 )
@@ -104,3 +106,24 @@ def test_reward_classifier_transition_is_noop_below_threshold():
     assert outcome.truncated is False
     assert outcome.reward == 0.0
     assert outcome.reason is None
+
+
+def test_target_pose_transition_defaults_to_fixed_pos_axes():
+    transition = OnTargetPoseReached(source="pick", target="place", robot_name="arm", tolerance=0.05)
+
+    outcome = transition.evaluate(
+        obs={
+            "arm.x.ee_pos": 0.52,
+            "arm.y.ee_pos": 0.5,
+            "arm.z.ee_pos": 0.1,
+            "arm.rx.ee_pos": 0.3,
+            "arm.ry.ee_pos": 0.2,
+            "arm.rz.ee_pos": -0.1,
+        },
+        info={
+            "primitive_target_pose": {"arm": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            DEFAULT_TARGET_POSE_AXES_INFO_KEY: {"arm": [0]},
+        },
+    )
+
+    assert outcome.terminated is True

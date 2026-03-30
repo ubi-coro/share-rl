@@ -25,6 +25,7 @@ try:
     from lerobot.configs.policies import PreTrainedConfig
     from share.envs.manipulation_primitive.config_manipulation_primitive import (
         MoveDeltaPrimitiveConfig,
+        OpenLoopTrajectorySpec,
         OpenLoopTrajectoryPrimitiveConfig,
         ManipulationPrimitiveConfig,
     )
@@ -54,10 +55,9 @@ except Exception:  # noqa: BLE001
         policy_mode: list[PolicyMode | None] = field(default_factory=lambda: 6 * [None])
         control_mode: list[ControlMode] = field(default_factory=lambda: 6 * [ControlMode.VEL])
         origin: list[float] | None = None
-        kp: list[float] | None = None
-        kd: list[float] | None = None
         min_pose: list[float] | None = None
         max_pose: list[float] | None = None
+        controller_overrides: dict[str, Any] | None = None
 
         def __post_init__(self) -> None:
             width = len(self.target)
@@ -135,12 +135,16 @@ except Exception:  # noqa: BLE001
         publish_target_info: bool | dict[str, bool] = True
 
     @dataclass(slots=True)
-    class OpenLoopTrajectoryPrimitiveConfig(MoveDeltaPrimitiveConfig):
-        duration_substeps: int = 10
-        substeps_per_step: int = 1
-        controller_hz: float | None = None
-        substep_dt_s: float | None = None
-        interruption_policy: str = "stop_on_events"
+    class OpenLoopTrajectorySpec:
+        target: list[float] | dict[str, list[float]] | None = None
+        delta: list[float] | dict[str, list[float]] | None = None
+        frame: str | dict[str, str] = "task"
+        duration_s: float | dict[str, float] = 1.0
+
+    @dataclass(slots=True)
+    class OpenLoopTrajectoryPrimitiveConfig(ManipulationPrimitiveConfig):
+        trajectory: OpenLoopTrajectorySpec = field(default_factory=OpenLoopTrajectorySpec)
+        publish_target_info: bool | dict[str, bool] = True
 
     @dataclass(slots=True)
     class ManipulationPrimitiveNetConfig:
@@ -264,10 +268,9 @@ def _encode_task_frame(frame: TaskFrame) -> dict[str, Any]:
         "policy_mode": [None if item is None else int(item) for item in frame.policy_mode],
         "control_mode": [int(item) for item in frame.control_mode],
         "origin": list(frame.origin) if frame.origin is not None else None,
-        "kp": frame.kp,
-        "kd": frame.kd,
         "min_pose": frame.min_pose,
         "max_pose": frame.max_pose,
+        "controller_overrides": copy.deepcopy(frame.controller_overrides),
     }
 
 
@@ -278,10 +281,9 @@ def _decode_task_frame(payload: dict[str, Any]) -> TaskFrame:
         policy_mode=[PolicyMode(item) if item is not None else None for item in payload.get("policy_mode", [None] * 6)],
         control_mode=[ControlMode(item) for item in payload.get("control_mode", [0] * 6)],
         origin=payload.get("origin"),
-        kp=payload.get("kp"),
-        kd=payload.get("kd"),
         min_pose=payload.get("min_pose"),
         max_pose=payload.get("max_pose"),
+        controller_overrides=copy.deepcopy(payload.get("controller_overrides")),
     )
 
 
@@ -337,11 +339,13 @@ def _encode_primitive(primitive: PrimitiveConfig) -> dict[str, Any]:
         payload["delta_frame"] = primitive.delta_frame
         payload["publish_target_info"] = primitive.publish_target_info
     if isinstance(primitive, OpenLoopTrajectoryPrimitiveConfig):
-        payload["duration_substeps"] = primitive.duration_substeps
-        payload["substeps_per_step"] = primitive.substeps_per_step
-        payload["controller_hz"] = primitive.controller_hz
-        payload["substep_dt_s"] = primitive.substep_dt_s
-        payload["interruption_policy"] = primitive.interruption_policy
+        payload["trajectory"] = {
+            "target": primitive.trajectory.target,
+            "delta": primitive.trajectory.delta,
+            "frame": primitive.trajectory.frame,
+            "duration_s": primitive.trajectory.duration_s,
+        }
+        payload["publish_target_info"] = primitive.publish_target_info
     return payload
 
 
@@ -388,12 +392,36 @@ def _decode_primitive(payload: dict[str, Any]) -> PrimitiveConfig:
             publish_target_info=payload.get("publish_target_info", True),
         )
     if issubclass(primitive_cls, OpenLoopTrajectoryPrimitiveConfig):
+        legacy_delta = payload.get("delta")
+        legacy_delta_frame = payload.get("delta_frame", "world")
+        legacy_duration_substeps = payload.get("duration_substeps")
+        legacy_substeps_per_step = payload.get("substeps_per_step")
+        legacy_fps = payload.get("fps")
+        if isinstance(payload.get("trajectory"), dict):
+            trajectory_payload = payload["trajectory"]
+        else:
+            duration_s = 1.0
+            if legacy_duration_substeps is not None:
+                if legacy_substeps_per_step:
+                    duration_steps = float(legacy_duration_substeps) / max(float(legacy_substeps_per_step), 1.0)
+                else:
+                    duration_steps = float(legacy_duration_substeps)
+                fps = float(legacy_fps) if legacy_fps not in (None, 0) else 1.0
+                duration_s = duration_steps / fps
+            trajectory_payload = {
+                "target": None,
+                "delta": legacy_delta if legacy_delta is not None else [0.0] * 6,
+                "frame": legacy_delta_frame,
+                "duration_s": duration_s,
+            }
         kwargs.update(
-            duration_substeps=payload.get("duration_substeps", 10),
-            substeps_per_step=payload.get("substeps_per_step", 1),
-            controller_hz=payload.get("controller_hz"),
-            substep_dt_s=payload.get("substep_dt_s"),
-            interruption_policy=payload.get("interruption_policy", "stop_on_events"),
+            trajectory=OpenLoopTrajectorySpec(
+                target=trajectory_payload.get("target"),
+                delta=trajectory_payload.get("delta"),
+                frame=trajectory_payload.get("frame", "task"),
+                duration_s=trajectory_payload.get("duration_s", 1.0),
+            ),
+            publish_target_info=payload.get("publish_target_info", True),
         )
     return primitive_cls(**kwargs)
 

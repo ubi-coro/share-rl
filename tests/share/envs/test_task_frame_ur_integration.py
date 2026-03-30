@@ -26,10 +26,12 @@ def test_task_frame_to_task_frame_command_preserves_modes_targets_and_gains():
             ControlMode.VEL,
             ControlMode.FORCE,
         ],
-        kp=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        kd=[6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
         min_pose=[-1.0] * 6,
         max_pose=[1.0] * 6,
+        controller_overrides={
+            "kp": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "kd": [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+        },
     )
 
     command = frame.to_task_frame_command()
@@ -67,8 +69,10 @@ def test_tf_ur_set_task_frame_accepts_shared_task_frame_spec():
             ControlMode.VEL,
             ControlMode.FORCE,
         ],
-        kp=[1.0] * 6,
-        kd=[2.0] * 6,
+        controller_overrides={
+            "kp": [1.0] * 6,
+            "kd": [2.0] * 6,
+        },
     )
 
     robot.set_task_frame(frame)

@@ -170,11 +170,12 @@ def get_robot_pose_from_observation(observation: dict[str, Any], robot_name: str
     position: list[float] = []
     raw_rotvec: list[float] = []
     missing: list[str] = []
+    suffixes = (".ee_pos", ".pos")
     for axis_name in TASK_FRAME_AXIS_NAMES[:3]:
         aliases = (axis_name,)
         value: float | None = None
         for alias in aliases:
-            for suffix in (".ee_pos", ".pos"):
+            for suffix in suffixes:
                 key = f"{robot_name}.{alias}{suffix}"
                 if key in observation:
                     value = _to_float(observation[key])
@@ -190,7 +191,7 @@ def get_robot_pose_from_observation(observation: dict[str, Any], robot_name: str
         aliases = ROTATION_AXIS_ALIASES.get(axis_name, (axis_name,))
         value: float | None = None
         for alias in aliases:
-            for suffix in (".ee_pos", ".pos"):
+            for suffix in suffixes:
                 key = f"{robot_name}.{alias}{suffix}"
                 if key in observation:
                     value = _to_float(observation[key])

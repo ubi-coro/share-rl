@@ -126,16 +126,26 @@ class ManipulationPrimitive(gymnasium.Env):
         self._primitive_complete = False
         self._trajectory_progress = 0.0
 
-    def set_target_pose(self, target_pose: dict[str, list[float]], info_key: str | None) -> None:
+    def set_target_pose(
+        self,
+        target_pose: dict[str, list[float]],
+        info_key: str | None,
+        *,
+        update_task_frame: bool = True,
+    ) -> None:
         """Store the current runtime target pose and update task-frame targets.
 
         Args:
             target_pose: Per-robot 6D target poses in this primitive's task
                 frame. These values become the live task-frame targets.
             info_key: Optional info key used to publish the target pose.
+            update_task_frame: Whether these targets should also become the live
+                task-frame command stored on the env.
         """
         self._target_pose = {name: list(pose) for name, pose in target_pose.items()}
         self._target_pose_info_key = info_key
+        if not update_task_frame:
+            return
         for name, pose in self._target_pose.items():
             if name not in self.task_frame:
                 continue
@@ -205,12 +215,15 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
     def reset_runtime_state(self) -> None:
         super().reset_runtime_state()
         self._start_pose: dict[str, list[float]] = {}
+        self._duration_substeps = 0
+        self._substeps_per_step = 1
         self._trajectory_substeps = 0
 
     def configure_trajectory(
         self,
         start_pose: dict[str, list[float]],
         target_pose: dict[str, list[float]],
+        info_key: str | None,
     ) -> None:
         """Initialize one scripted trajectory from entry-time poses.
 
@@ -220,7 +233,13 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
                 frame. These are also published as the env target pose.
         """
         self._start_pose = {name: list(pose) for name, pose in start_pose.items()}
-        self.set_target_pose(target_pose=target_pose, info_key=self._target_pose_info_key)
+        self._duration_substeps, self._substeps_per_step = self.open_loop_config.trajectory_timing(self.robot_dict)
+        self.set_target_pose(
+            target_pose=target_pose,
+            info_key=info_key,
+            update_task_frame=False,
+        )
+        self._set_live_task_frame_pose(start_pose)
         self._primitive_complete = False
         self._trajectory_progress = 0.0
         self._trajectory_substeps = 0
@@ -234,11 +253,11 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
 
         Returns:
             Standard gym ``(observation, reward, terminated, truncated, info)``
-            values after executing up to ``substeps_per_step`` internal robot
+            values after executing up to the configured internal robot
             steps.
         """
-        remaining = max(0, int(self.open_loop_config.duration_substeps) - self._trajectory_substeps)
-        substeps = min(int(self.open_loop_config.substeps_per_step), remaining)
+        remaining = max(0, int(self._duration_substeps) - self._trajectory_substeps)
+        substeps = min(int(self._substeps_per_step), remaining)
         if substeps <= 0:
             self._primitive_complete = True
             return self._get_observation(), 0.0, False, False, self._get_info()
@@ -249,36 +268,44 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
         truncated = False
         for _ in range(substeps):
             self._trajectory_substeps += 1
-            alpha = self._trajectory_substeps / float(self.open_loop_config.duration_substeps)
-            scripted_action = self._interpolated_action(alpha)
+            alpha = self._trajectory_substeps / float(self._duration_substeps)
+            scripted_pose = self.open_loop_config.target_pose_at(
+                alpha=alpha,
+                start_pose=self._start_pose,
+                goal_pose=self._target_pose,
+            )
+            self._set_live_task_frame_pose(scripted_pose)
+            scripted_action = self._action_from_pose(scripted_pose)
             obs, step_reward, terminated, truncated, _info = super().step(scripted_action)
             reward += step_reward
             self._trajectory_progress = alpha
             if terminated or truncated:
                 break
 
-        if self._trajectory_substeps >= int(self.open_loop_config.duration_substeps):
+        if self._trajectory_substeps >= int(self._duration_substeps):
             self._primitive_complete = True
         return obs, reward, terminated, truncated, self._get_info()
 
-    def _interpolated_action(self, alpha: float) -> dict[str, dict[str, float]]:
-        """Build one low-level action dict from the current trajectory alpha.
+    def _set_live_task_frame_pose(self, pose_by_robot: dict[str, list[float]]) -> None:
+        """Update the live task-frame setpoint used by the scripted runner."""
+        for name, pose in pose_by_robot.items():
+            if name not in self.task_frame:
+                continue
+            for axis in range(min(len(self.task_frame[name].target), len(pose))):
+                self.task_frame[name].target[axis] = float(pose[axis])
+
+    def _action_from_pose(self, pose_by_robot: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+        """Build one low-level action dict from the current scripted target pose.
 
         Args:
-            alpha: Normalized trajectory progress in ``[0, 1]``.
+            pose_by_robot: Per-robot scripted task-space pose for this substep.
 
         Returns:
-            Nested low-level robot commands interpolated between the configured
-            start pose and target pose for each robot.
+            Nested low-level robot commands matching the current scripted pose.
         """
         action: dict[str, dict[str, float]] = {}
-        for name, frame in self.task_frame.items():
-            start_pose = self._start_pose.get(name, [float(v) for v in frame.target])
-            target_pose = self._target_pose.get(name, [float(v) for v in frame.target])
-            pose = [
-                float(start_pose[axis] + alpha * (target_pose[axis] - start_pose[axis]))
-                for axis in range(len(frame.target))
-            ]
+        for name, pose in pose_by_robot.items():
+            frame = self.task_frame[name]
             action[name] = {
                 frame.action_key_for_axis(axis): float(pose[axis])
                 for axis in range(len(frame.target))

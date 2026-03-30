@@ -18,6 +18,7 @@ from share.workspace.mpnet import (
     ManipulationPrimitiveConfig,
     ManipulationPrimitiveNetConfig,
     OnSuccess,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
     Always,
     TaskFrame,
@@ -28,9 +29,11 @@ def _make_debug_config() -> ManipulationPrimitiveNetConfig:
     home = ManipulationPrimitiveConfig(task_frame={"arm": TaskFrame(target=[0.0] * 6)})
     scripted = OpenLoopTrajectoryPrimitiveConfig(
         task_frame={"arm": TaskFrame(target=[0.0] * 6)},
-        delta={"arm": [0.3, 0.0, 0.1, 0.0, 0.0, 0.0]},
-        duration_substeps=4,
-        substeps_per_step=2,
+        trajectory=OpenLoopTrajectorySpec(
+            delta={"arm": [0.3, 0.0, 0.1, 0.0, 0.0, 0.0]},
+            frame={"arm": "world"},
+            duration_s={"arm": 0.5},
+        ),
     )
     done = ManipulationPrimitiveConfig(task_frame={"arm": TaskFrame(target=[0.3, 0.0, 0.1, 0.0, 0.0, 0.0])}, is_terminal=True)
     return ManipulationPrimitiveNetConfig(

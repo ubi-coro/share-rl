@@ -19,6 +19,7 @@ class MockRobot(Robot):
         # Initialize with a dummy config
         cfg = RobotConfig(id=name)
         super().__init__(cfg)
+        self.config = cfg
         self._is_task_frame = is_task_frame
         self.current_joints = np.zeros(6)
         # Mock bus for configuration validation (looks for motors dict)
@@ -530,4 +531,3 @@ class MockRTDEReceiveInterface:
 
     def disconnect(self):
         pass
-

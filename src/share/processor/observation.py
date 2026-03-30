@@ -12,7 +12,11 @@ from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry, Obs
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 from share.envs.manipulation_primitive.task_frame import TASK_FRAME_AXIS_NAMES
-from share.utils.transformation_utils import rotation_from_extrinsic_xyz, euler_xyz_from_rotation
+from share.utils.transformation_utils import (
+    rotation_from_extrinsic_xyz,
+    euler_xyz_from_rotation,
+    get_robot_pose_from_observation,
+)
 
 for _registry_name in (
     "default_observation_processor",
@@ -381,14 +385,14 @@ class RelativeFrameObservationProcessor(ProcessorStep):
 
         new_transition = transition.copy()
         new_observation = dict(observation)
-        axis_names = ["x", "y", "z", "wx", "wy", "wz"]
 
         robot_names = self._robot_names(observation)
         for name in robot_names:
             if not self._enabled(name):
                 continue
-            pose = self._extract_pose(observation, name)
-            if pose is None:
+            try:
+                pose = get_robot_pose_from_observation(observation, name)
+            except KeyError:
                 continue
             reference = self._reference_pose.setdefault(name, pose)
 
@@ -417,17 +421,6 @@ class RelativeFrameObservationProcessor(ProcessorStep):
             if "." in key:
                 names.add(key.split(".", 1)[0])
         return names
-
-    @staticmethod
-    def _extract_pose(observation: dict[str, Any], name: str) -> list[float] | None:
-        pose = []
-        for axis_name in ["x", "y", "z", "wx", "wy", "wz"]:
-            key = f"{name}.{axis_name}.ee_pos"
-            if key not in observation:
-                return None
-            value = observation[key]
-            pose.append(float(value.item()) if isinstance(value, torch.Tensor) else float(value))
-        return pose
 
     def reset(self) -> None:
         self._reference_pose.clear()

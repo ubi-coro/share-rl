@@ -28,7 +28,11 @@ from lerobot.robots import Robot
 from lerobot.utils.errors import DeviceNotConnectedError, DeviceAlreadyConnectedError
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, TASK_FRAME_AXIS_NAMES, TaskFrame
 from share.robots.ur.lerobot_robot_ur.config_ur import URConfig
-from share.robots.ur.lerobot_robot_ur.controller import TaskFrameCommand, RTDETaskFrameController
+from share.robots.ur.lerobot_robot_ur.controller import (
+    ComplianceSafetyMode,
+    TaskFrameCommand,
+    RTDETaskFrameController,
+)
 
 from share.grippers.robotiq_controller import RTDERobotiqController
 
@@ -36,7 +40,6 @@ logger = logging.getLogger(__name__)
 
 
 class UR(Robot):
-
     config_class = URConfig
     name = "ur"
 
@@ -54,7 +57,7 @@ class UR(Robot):
         self.config = config
         self.robot_type = self.name
         self.id = config.id
-        self.task_frame = TaskFrameCommand()
+        self.task_frame = TaskFrameCommand(controller_overrides=self._default_controller_overrides())
 
         self.shm = SharedMemoryManager()
         self.shm.start()
@@ -271,11 +274,39 @@ class UR(Robot):
         self.gripper.move(gripper_action, vel=self.config.gripper_vel, force=self.config.gripper_force)
 
     def set_task_frame(self, new_task_frame: TaskFrameCommand | TaskFrame):
-        if isinstance(new_task_frame, TaskFrame) and not isinstance(new_task_frame, TaskFrameCommand):
-            new_task_frame = TaskFrameCommand(**asdict(new_task_frame))
+        new_task_frame = self._task_frame_command_from_frame(new_task_frame)
 
         self._ensure_control_space(new_task_frame.space)
         self.task_frame = new_task_frame
+
+    def _task_frame_command_from_frame(self, frame: TaskFrameCommand | TaskFrame) -> TaskFrameCommand:
+        if isinstance(frame, TaskFrameCommand):
+            command = TaskFrameCommand(**asdict(frame))
+        else:
+            command = TaskFrameCommand(**asdict(frame))
+        command.controller_overrides = self._merged_controller_overrides(command.controller_overrides)
+        return command
+
+    def _default_controller_overrides(self) -> dict[str, Any]:
+        return {
+            "kp": list(self.config.kp),
+            "kd": list(self.config.kd),
+            "wrench_limits": list(self.config.wrench_limits),
+            "compliance_safety_mode": self.config.compliance_safety_mode,
+            "compliance_safety_enable": list(self.config.compliance_safety_enable),
+            "compliance_desired_wrench": list(self.config.compliance_desired_wrench),
+            "compliance_adaptive_limit_min": list(self.config.compliance_adaptive_limit_min),
+        }
+
+    def _merged_controller_overrides(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
+        unknown = set(overrides or {}) - TaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(f"Unsupported UR task-frame controller overrides: {', '.join(sorted(unknown))}")
+        merged = dict(self.task_frame.controller_overrides or self._default_controller_overrides())
+        if not overrides:
+            return merged
+        merged.update(overrides)
+        return merged
 
     def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
         """Lock the robot wrapper to its first commanded control space."""
@@ -319,3 +350,6 @@ class UR(Robot):
         self.shm.shutdown()
 
         logger.info(f"{self} disconnected.")
+
+
+URV2 = UR

@@ -46,8 +46,10 @@ cmd = TaskFrameCommand(
     target=[0.0] * 6,
     control_mode=6 * [ControlMode.POS],
     policy_mode=6 * [PolicyMode.RELATIVE],
-    kp=[2500, 2500, 2500, 100, 100, 100],
-    kd=[160, 160, 160, 6, 6, 6],
+    controller_overrides={
+        "kp": [2500, 2500, 2500, 100, 100, 100],
+        "kd": [160, 160, 160, 6, 6, 6],
+    },
 )
 
 while not controller.is_ready:

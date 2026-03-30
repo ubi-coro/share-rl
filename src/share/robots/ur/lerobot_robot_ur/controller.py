@@ -7,6 +7,7 @@ import enum
 import multiprocessing as mp
 from dataclasses import dataclass, asdict, replace
 from multiprocessing.managers import SharedMemoryManager
+from typing import Any, ClassVar
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -19,6 +20,13 @@ from share.utils.shared_memory import SharedMemoryRingBuffer, SharedMemoryQueue,
 # Internal enums
 # ---------------------------------------------------------------------------
 DeltaMode = PolicyMode
+
+
+class ComplianceSafetyMode(enum.IntEnum):
+    NONE = 0
+    ADAPTIVE_WRENCH_LIMITS = 1
+    REFERENCE_LIMITS = 2
+    BOTH = 3
 
 class Command(enum.IntEnum):
     SET = 0
@@ -37,6 +45,17 @@ class TaskFrameCommand(TaskFrame):
     the controller converts them to rotation vectors before use.
     """
     cmd: Command = Command.SET
+    SUPPORTED_CONTROLLER_OVERRIDE_KEYS: ClassVar[set[str]] = {
+        "kp",
+        "kd",
+        "min_pose",
+        "max_pose",
+        "wrench_limits",
+        "compliance_safety_mode",
+        "compliance_safety_enable",
+        "compliance_desired_wrench",
+        "compliance_adaptive_limit_min",
+    }
 
     @property
     def delta_mode(self) -> list[DeltaMode]:
@@ -50,6 +69,10 @@ class TaskFrameCommand(TaskFrame):
         roll-pitch-yaw [rad] and converted to an internal rotation vector.
         """
         d = asdict(self)
+        raw_overrides = d.pop("controller_overrides", None) or {}
+        unknown = set(raw_overrides) - self.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
+        if unknown:
+            raise ValueError(f"Unsupported UR task-frame controller overrides: {', '.join(sorted(unknown))}")
         try:
             d["cmd"] = self.cmd.value
             d.pop("policy_mode", None)
@@ -60,10 +83,25 @@ class TaskFrameCommand(TaskFrame):
             d["target"] = np.asarray(self.target).astype(np.float64)
             d["origin"] = np.asarray(self.origin).astype(np.float64)
             #d["origin"][3:6] = R.from_euler("xyz", d["origin"][3:6], degrees=False).as_rotvec()
-            d["max_pose"] = np.asarray(self.max_pose).astype(np.float64)
-            d["min_pose"] = np.asarray(self.min_pose).astype(np.float64)
-            d["kp"] = np.asarray(self.kp).astype(np.float64)
-            d["kd"] = np.asarray(self.kd).astype(np.float64)
+            d["max_pose"] = np.asarray(raw_overrides.get("max_pose", self.max_pose)).astype(np.float64)
+            d["min_pose"] = np.asarray(raw_overrides.get("min_pose", self.min_pose)).astype(np.float64)
+            d["kp"] = np.asarray(raw_overrides.get("kp", [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])).astype(np.float64)
+            d["kd"] = np.asarray(raw_overrides.get("kd", [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])).astype(np.float64)
+            d["wrench_limits"] = np.asarray(
+                raw_overrides.get("wrench_limits", [30.0, 30.0, 30.0, 3.0, 3.0, 3.0])
+            ).astype(np.float64)
+            d["compliance_safety_mode"] = int(
+                raw_overrides.get("compliance_safety_mode", ComplianceSafetyMode.BOTH)
+            )
+            d["compliance_safety_enable"] = np.asarray(
+                raw_overrides.get("compliance_safety_enable", [False] * 6)
+            ).astype(np.bool_)
+            d["compliance_desired_wrench"] = np.asarray(
+                raw_overrides.get("compliance_desired_wrench", [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])
+            ).astype(np.float64)
+            d["compliance_adaptive_limit_min"] = np.asarray(
+                raw_overrides.get("compliance_adaptive_limit_min", [0.1] * 6)
+            ).astype(np.float64)
         except Exception as e:
             raise ValueError(f"TaskFrameCommand seems to be missing fields: {e}")
         return d
@@ -192,19 +230,41 @@ class RTDETaskFrameController(mp.Process):
             target=np.zeros((6,)),
             control_mode=[ControlMode.POS] * 6,
             policy_mode=[PolicyMode.RELATIVE] * 6,  # delta mode is derived from that
-            kp=np.array([2500, 2500, 2500, 150, 150, 150]),
-            kd=np.array([80, 80, 80, 8, 8, 8]),
             max_pose=np.full(6, np.inf),
-            min_pose=np.full(6, -np.inf)
+            min_pose=np.full(6, -np.inf),
+            controller_overrides={
+                "kp": np.array(self.config.kp, dtype=np.float64),
+                "kd": np.array(self.config.kd, dtype=np.float64),
+                "wrench_limits": np.array(self.config.wrench_limits, dtype=np.float64),
+                "compliance_safety_mode": self.config.compliance_safety_mode,
+                "compliance_safety_enable": np.array(self.config.compliance_safety_enable, dtype=bool),
+                "compliance_desired_wrench": np.array(self.config.compliance_desired_wrench, dtype=np.float64),
+                "compliance_adaptive_limit_min": np.array(self.config.compliance_adaptive_limit_min, dtype=np.float64),
+            },
         )
         self.origin = self._last_cmd.origin
         self.control_mode = self._last_cmd.control_mode
         self.delta_mode = self._last_cmd.delta_mode
         self.target = self._last_cmd.target
-        self.kp = self._last_cmd.kp
-        self.kd = self._last_cmd.kd
         self.max_pose = self._last_cmd.max_pose
         self.min_pose = self._last_cmd.min_pose
+        default_overrides = self._last_cmd.controller_overrides or {}
+        self.kp = np.asarray(default_overrides["kp"], dtype=np.float64).copy()
+        self.kd = np.asarray(default_overrides["kd"], dtype=np.float64).copy()
+        (
+            self.active_wrench_limits,
+            self.active_compliance_safety_enable,
+            self.active_compliance_desired_wrench,
+            self.active_compliance_adaptive_limit_min,
+            self.active_compliance_adaptive_limit_theta,
+            self.active_compliance_safety_mode,
+        ) = self._resolved_active_compliance_settings(
+            wrench_limits=default_overrides["wrench_limits"],
+            compliance_safety_enable=default_overrides["compliance_safety_enable"],
+            compliance_desired_wrench=default_overrides["compliance_desired_wrench"],
+            compliance_adaptive_limit_min=default_overrides["compliance_adaptive_limit_min"],
+            compliance_safety_mode=default_overrides["compliance_safety_mode"],
+        )
         self._active_space: ControlSpace | None = None
 
     # =========== launch & shutdown =============
@@ -276,6 +336,10 @@ class RTDETaskFrameController(mp.Process):
         self._last_cmd = cmd
         self.robot_cmd_queue.put(cmd.to_queue_dict())
 
+    @property
+    def task_frame(self) -> TaskFrameCommand:
+        return replace(self._last_cmd)
+
     def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
         """Lock the controller to its first commanded control space."""
         resolved = ControlSpace(int(space))
@@ -344,10 +408,7 @@ class RTDETaskFrameController(mp.Process):
                 e = 0.0
                 edot = 0.0
 
-            if (
-                self.config.compliance_safety_mode == "reference_limits"
-                and self.config.compliance_safety_enable[i]
-            ):
+            if self._reference_limits_enabled() and self.active_compliance_safety_enable[i]:
                 e, edot = self.clip_reference_errors(e, edot, i)
 
             wrench_F[i] = self.kp[i] * e + self.kd[i] * edot
@@ -423,6 +484,20 @@ class RTDETaskFrameController(mp.Process):
             self.kd = single["kd"].copy()
             self.max_pose = single["max_pose"].copy()
             self.min_pose = single["min_pose"].copy()
+            (
+                self.active_wrench_limits,
+                self.active_compliance_safety_enable,
+                self.active_compliance_desired_wrench,
+                self.active_compliance_adaptive_limit_min,
+                self.active_compliance_adaptive_limit_theta,
+                self.active_compliance_safety_mode,
+            ) = self._resolved_active_compliance_settings(
+                wrench_limits=single["wrench_limits"],
+                compliance_safety_enable=single["compliance_safety_enable"],
+                compliance_desired_wrench=single["compliance_desired_wrench"],
+                compliance_adaptive_limit_min=single["compliance_adaptive_limit_min"],
+                compliance_safety_mode=single["compliance_safety_mode"],
+            )
 
             pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
             q_now = np.array(rtde_r.getActualQ(), dtype=np.float64)
@@ -452,18 +527,65 @@ class RTDETaskFrameController(mp.Process):
 
         return keep_running, active_space, x_cmd, q_cmd
 
+    @staticmethod
+    def _decode_compliance_safety_mode(mode: int | np.ndarray) -> ComplianceSafetyMode:
+        return ComplianceSafetyMode(int(mode))
+
+    def _resolved_active_compliance_settings(
+        self,
+        *,
+        wrench_limits,
+        compliance_safety_enable,
+        compliance_desired_wrench,
+        compliance_adaptive_limit_min,
+        compliance_safety_mode,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, ComplianceSafetyMode]:
+        """Normalize active compliance settings and compute derived adaptive scales."""
+        active_wrench_limits = np.asarray(wrench_limits, dtype=np.float64).copy()
+        active_compliance_safety_enable = np.asarray(compliance_safety_enable, dtype=bool).copy()
+        active_compliance_desired_wrench = np.asarray(compliance_desired_wrench, dtype=np.float64).copy()
+        active_compliance_adaptive_limit_min = np.asarray(compliance_adaptive_limit_min, dtype=np.float64).copy()
+        mode_name = ComplianceSafetyMode(int(mode))
+        active_compliance_adaptive_limit_theta = np.zeros(6, dtype=np.float64)
+
+        for axis in range(6):
+            if not active_compliance_safety_enable[axis]:
+                continue
+            if not np.isfinite(active_wrench_limits[axis]):
+                active_wrench_limits[axis] = 2.0 * active_compliance_desired_wrench[axis]
+            active_compliance_adaptive_limit_theta[axis] = type(self.config).compute_theta(
+                float(active_wrench_limits[axis]),
+                float(active_compliance_desired_wrench[axis]),
+                float(active_compliance_adaptive_limit_min[axis]),
+            )
+
+        return (
+            active_wrench_limits,
+            active_compliance_safety_enable,
+            active_compliance_desired_wrench,
+            active_compliance_adaptive_limit_min,
+            active_compliance_adaptive_limit_theta,
+            mode_name,
+        )
+
     def _reference_limits_enabled(self) -> bool:
-        return self.config.compliance_safety_mode in ("reference_limits", "both")
+        return self.active_compliance_safety_mode in (
+            ComplianceSafetyMode.REFERENCE_LIMITS,
+            ComplianceSafetyMode.BOTH,
+        )
 
     def _adaptive_wrench_limits_enabled(self) -> bool:
-        return self.config.compliance_safety_mode in ("adaptive_wrench_limits", "both")
+        return self.active_compliance_safety_mode in (
+            ComplianceSafetyMode.ADAPTIVE_WRENCH_LIMITS,
+            ComplianceSafetyMode.BOTH,
+        )
 
     def _get_reference_error_limit(self, axis: int) -> float:
         """Return max allowed reference error for a POS axis from soft wrench budget."""
-        if not self.config.compliance_safety_enable[axis]:
+        if not self.active_compliance_safety_enable[axis]:
             return np.inf
 
-        f_soft = float(self.config.wrench_limits[axis])
+        f_soft = float(self.active_wrench_limits[axis])
         if f_soft <= 0.0:
             return 0.0
 
@@ -488,7 +610,7 @@ class RTDETaskFrameController(mp.Process):
         # --- translation ---
         for i in range(3):
             if not (
-                self.config.compliance_safety_enable[i]
+                self.active_compliance_safety_enable[i]
                 and ControlMode(self.control_mode[i]) == ControlMode.POS
                 and DeltaMode(self.delta_mode[i]) == DeltaMode.RELATIVE
             ):
@@ -505,7 +627,7 @@ class RTDETaskFrameController(mp.Process):
         rot_axes = [
             i for i in range(3, 6)
             if (
-                self.config.compliance_safety_enable[i]
+                self.active_compliance_safety_enable[i]
                 and ControlMode(self.control_mode[i]) == ControlMode.POS
                 and DeltaMode(self.delta_mode[i]) == DeltaMode.RELATIVE
             )
@@ -1002,7 +1124,7 @@ class RTDETaskFrameController(mp.Process):
 
         scale_vec = np.array([1.0] * 6)
         for i in range(6):
-            if not self.config.compliance_safety_enable[i]:
+            if not self.active_compliance_safety_enable[i]:
                 continue
 
             f_measured = measured_wrench[i]
@@ -1012,12 +1134,12 @@ class RTDETaskFrameController(mp.Process):
 
             scale_vec[i] = self.exp_scale(
                 abs(f_measured),
-                self.config.wrench_limits[i],
-                self.config.compliance_adaptive_limit_min[i],
-                self.config.compliance_adaptive_limit_theta[i],
+                self.active_wrench_limits[i],
+                self.active_compliance_adaptive_limit_min[i],
+                self.active_compliance_adaptive_limit_theta[i],
             )
 
-        scaled_wrench_limits = scale_vec * np.array(self.config.wrench_limits)
+        scaled_wrench_limits = scale_vec * np.array(self.active_wrench_limits)
 
         # ----- translation axes -----
         for i in range(3):
@@ -1084,7 +1206,7 @@ class RTDETaskFrameController(mp.Process):
         """
         _kp = self.kp[i]
         _kd = self.kd[i]
-        _fmax = self.config.compliance_desired_wrench[i]
+        _fmax = self.active_compliance_desired_wrench[i]
 
         if _fmax <= 0:
             return 0.0, 0.0

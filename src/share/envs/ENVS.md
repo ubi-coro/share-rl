@@ -98,6 +98,8 @@ MP-Nets treat primitive changes as a two-phase lifecycle:
 
 That entry context carries the last processed observation together with the previous primitive's task-frame origin. Primitive configs can use it inside `on_entry` to resolve dynamic targets before the next primitive starts stepping.
 
+When `relative_ee_pos` is enabled, the processed observation rewrites `.ee_pos` into the relative learning view. Primitive-entry math and target-pose transitions currently read the processed pose channels directly.
+
 The runtime publishes these stable info keys on every step/reset:
 
 - `primitive_target_pose`
@@ -110,6 +112,8 @@ The primitive config is a registry with three intended primitive families:
 
 - `static`: legacy behavior; task-frame targets come directly from config.
 - `move_delta`: resolves fixed task-space `POS` axes once on entry from `start_pose + delta`, with `delta_frame` in `world` or `ee_current`. For those fixed axes, `task_frame.target` is ignored at runtime and a zero delta holds the entry pose.
-- `open_loop_trajectory`: resolves the same entry target, then uses its own env subclass to execute a chunked scripted trajectory internally over multiple robot substeps per outer `step()`.
+- `open_loop_trajectory`: owns a single `trajectory` spec with exactly one of `target` or `delta`, a `frame`, and `duration_s`. The config resolves the start/goal poses on entry and samples the current scripted target every substep via `target_pose_at(...)`.
 
-Configs stay declarative: runtime target state lives in the primitive env. `move_delta` updates the env target on entry so downstream action projection and transition checks observe the same target. `open_loop_trajectory` is scripted-only in v1 and exposes completion/progress through the info keys above.
+Configs stay declarative: runtime target state lives in the primitive env. `move_delta` updates the env target on entry so downstream action projection and transition checks observe the same target. `open_loop_trajectory` is scripted-only in v1, publishes its final goal as `primitive_target_pose`, and exposes completion/progress through the info keys above while the env handles stepping.
+
+Task frames may also carry `controller_overrides`. The field stays generic in shared config and serialization code, while each robot wrapper translates the supported keys into concrete controller commands. In this patch, UR consumes wrench/compliance overrides so different primitive states can use different safety and wrench limits.

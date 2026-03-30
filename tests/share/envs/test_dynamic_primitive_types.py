@@ -13,7 +13,9 @@ from lerobot.processor import TransitionKey
 
 from share.debug.mpnet_debug import MPNetDebugConfig, MPNetDebugger
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
+    ManipulationPrimitiveProcessorConfig,
     MoveDeltaPrimitiveConfig,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
     PrimitiveEntryContext,
     ManipulationPrimitiveConfig,
@@ -21,7 +23,10 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import (
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
 from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode, TaskFrame
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
-from share.envs.manipulation_primitive_net.transitions import OnTargetPoseReached
+from share.envs.manipulation_primitive_net.transitions import (
+    DEFAULT_TARGET_POSE_AXES_INFO_KEY,
+    OnTargetPoseReached,
+)
 from share.utils.mock_utils import MockRobot, MockTeleoperator
 
 
@@ -62,7 +67,7 @@ class DummyPrimitiveEnv:
         self.target_pose = {}
         self.target_pose_info_key = None
 
-    def set_target_pose(self, target_pose, info_key):
+    def set_target_pose(self, target_pose, info_key, update_task_frame=True):
         self.target_pose = {name: list(pose) for name, pose in target_pose.items()}
         self.target_pose_info_key = info_key
 
@@ -104,6 +109,32 @@ def _validated_move_delta(delta, delta_frame="world", origin=None) -> MoveDeltaP
         task_frame={"arm": _task_frame(origin=origin)},
         delta={"arm": delta},
         delta_frame={"arm": delta_frame},
+    )
+    config.validate(
+        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+    )
+    return config
+
+
+def _validated_open_loop(
+    *,
+    target=None,
+    delta=None,
+    frame="task",
+    duration_s=1.0,
+    origin=None,
+    fps=10.0,
+) -> OpenLoopTrajectoryPrimitiveConfig:
+    config = OpenLoopTrajectoryPrimitiveConfig(
+        task_frame={"arm": _task_frame(origin=origin)},
+        processor=ManipulationPrimitiveProcessorConfig(fps=fps),
+        trajectory=OpenLoopTrajectorySpec(
+            target={"arm": target} if target is not None else None,
+            delta={"arm": delta} if delta is not None else None,
+            frame={"arm": frame},
+            duration_s={"arm": duration_s},
+        ),
     )
     config.validate(
         robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
@@ -160,6 +191,30 @@ def test_move_delta_primitive_resolves_ee_relative_translation_on_entry():
 
     assert env.target_pose["arm"][0] == pytest.approx(0.0, abs=1e-6)
     assert env.target_pose["arm"][1] == pytest.approx(0.1, abs=1e-6)
+
+
+def test_move_delta_uses_processed_pose_channels_when_relative_view_is_present():
+    config = _validated_move_delta([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], delta_frame="ee_current", origin=[0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+    env = DummyPrimitiveEnv({})
+
+    config.on_entry(
+        env,
+        PrimitiveEntryContext(
+            observation={
+                "arm.x.ee_pos": 0.0,
+                "arm.y.ee_pos": 0.0,
+                "arm.z.ee_pos": 0.0,
+                "arm.rx.ee_pos": 0.0,
+                "arm.ry.ee_pos": 0.0,
+                "arm.rz.ee_pos": 0.0,
+            },
+            task_frame_origin={"arm": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        ),
+    )
+
+    assert env.target_pose["arm"][0] == pytest.approx(0.1, abs=1e-6)
+    assert env.target_pose["arm"][1] == pytest.approx(0.0, abs=1e-6)
+    assert env.target_pose["arm"][2] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_move_delta_zero_delta_holds_entry_pose_instead_of_static_target():
@@ -281,6 +336,30 @@ def test_target_pose_transition_reads_current_pose_from_observation():
     assert outcome.terminated is True
 
 
+def test_target_pose_transition_defaults_to_fixed_pos_axes_from_info():
+    target_transition = OnTargetPoseReached(
+        source="move",
+        target="next",
+        robot_name="arm",
+        tolerance=[0.02] * 6,
+    )
+    outcome = target_transition.evaluate(
+        obs={
+            "arm.x.ee_pos": 0.51,
+            "arm.y.ee_pos": 0.3,
+            "arm.z.ee_pos": 0.0,
+            "arm.rx.ee_pos": 0.4,
+            "arm.ry.ee_pos": 0.0,
+            "arm.rz.ee_pos": 0.0,
+        },
+        info={
+            "primitive_target_pose": {"arm": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]},
+            DEFAULT_TARGET_POSE_AXES_INFO_KEY: {"arm": [0]},
+        },
+    )
+    assert outcome.terminated is True
+
+
 def test_mp_net_reset_uses_pending_entry_context_for_new_primitive():
     move_delta = _validated_move_delta([0.25, 0.0, 0.0, 0.0, 0.0, 0.0], delta_frame="world")
     env = DummyPrimitiveEnv(
@@ -330,19 +409,12 @@ def test_mp_net_reset_uses_pending_entry_context_for_new_primitive():
 
 
 def test_open_loop_trajectory_runs_chunked_substeps_and_reports_progress():
-    config = OpenLoopTrajectoryPrimitiveConfig(
-        task_frame={"arm": _task_frame()},
-        delta={"arm": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0]},
-        duration_substeps=4,
-        substeps_per_step=2,
-    )
-    config.validate(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
-        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
-    )
+    config = _validated_open_loop(delta=[0.4, 0.0, 0.0, 0.0, 0.0, 0.0], frame="world", duration_s=0.4, fps=5.0)
+    robot = MockRobot(name="arm", is_task_frame=True)
+    robot.config.frequency = 10.0
 
     env, _, _ = config.make(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        robot_dict={"arm": robot},
         teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
         cameras={},
     )
@@ -381,20 +453,12 @@ def test_open_loop_trajectory_runs_chunked_substeps_and_reports_progress():
 
 
 def test_open_loop_trajectory_uses_entry_pose_for_fixed_pos_axes():
-    config = OpenLoopTrajectoryPrimitiveConfig(
-        task_frame={"arm": _task_frame()},
-        delta={"arm": [0.0] * 6},
-        duration_substeps=4,
-        substeps_per_step=2,
-    )
-    config.task_frame["arm"].target = [3.0, 4.0, 5.0, -0.4, 0.5, -0.6]
-    config.validate(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
-        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
-    )
+    config = _validated_open_loop(delta=[0.0] * 6, frame="world", duration_s=0.4, fps=5.0)
+    robot = MockRobot(name="arm", is_task_frame=True)
+    robot.config.frequency = 10.0
 
     env, _, _ = config.make(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        robot_dict={"arm": robot},
         teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
         cameras={},
     )
@@ -426,6 +490,59 @@ def test_open_loop_trajectory_uses_entry_pose_for_fixed_pos_axes():
     assert env._target_pose["arm"] == pytest.approx([1.0, 2.0, 3.0, *expected_orientation])
 
 
+def test_open_loop_trajectory_config_owns_current_target_sampling():
+    config = _validated_open_loop(target=[0.4, 0.0, 0.2, 0.0, 0.0, 0.0], frame="task", duration_s=1.0)
+    sampled = config.target_pose_at(
+        alpha=0.25,
+        start_pose={"arm": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        goal_pose={"arm": [0.4, 0.0, 0.2, 0.0, 0.0, 0.0]},
+    )
+    assert sampled["arm"] == pytest.approx([0.1, 0.0, 0.05, 0.0, 0.0, 0.0])
+
+
+def test_open_loop_trajectory_keeps_final_target_info_for_target_pose_transition():
+    config = _validated_open_loop(delta=[0.4, 0.0, 0.0, 0.0, 0.0, 0.0], frame="world", duration_s=0.4, fps=5.0)
+    robot = MockRobot(name="arm", is_task_frame=True)
+    robot.config.frequency = 10.0
+
+    env, _, _ = config.make(
+        robot_dict={"arm": robot},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+        cameras={},
+    )
+    env.robot_dict["arm"].get_observation = lambda: {
+        f"{axis}.ee_pos": float(env.robot_dict["arm"].current_frame.target[index])
+        for index, axis in enumerate(["x", "y", "z", "rx", "ry", "rz"])
+    }
+    config.on_entry(
+        env,
+        PrimitiveEntryContext(
+            observation={
+                "arm.x.ee_pos": 0.0,
+                "arm.y.ee_pos": 0.0,
+                "arm.z.ee_pos": 0.0,
+                "arm.rx.ee_pos": 0.0,
+                "arm.ry.ee_pos": 0.0,
+                "arm.rz.ee_pos": 0.0,
+            },
+            task_frame_origin={"arm": [0.0] * 6},
+        ),
+    )
+
+    final_step = env.step({})
+    final_step = env.step({})
+    transition = OnTargetPoseReached(source="scripted", target="done", robot_name="arm", axes=["x"])
+    outcome = transition.evaluate(
+        obs=final_step[0],
+        info={
+            **final_step[4],
+            DEFAULT_TARGET_POSE_AXES_INFO_KEY: {"arm": [0]},
+        },
+    )
+    assert final_step[4]["primitive_target_pose"]["arm"][0] == pytest.approx(0.4)
+    assert outcome.terminated is True
+
+
 def test_static_primitive_publishes_target_pose_info_on_entry():
     config = ManipulationPrimitiveConfig(task_frame={"arm": _task_frame()})
     config.validate(
@@ -441,19 +558,12 @@ def test_static_primitive_publishes_target_pose_info_on_entry():
 
 
 def test_open_loop_trajectory_info_matches_debugger_target_visualization(tmp_path):
-    config = OpenLoopTrajectoryPrimitiveConfig(
-        task_frame={"arm": _task_frame()},
-        delta={"arm": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0]},
-        duration_substeps=4,
-        substeps_per_step=2,
-    )
-    config.validate(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
-        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
-    )
+    config = _validated_open_loop(delta=[0.4, 0.0, 0.0, 0.0, 0.0, 0.0], frame="world", duration_s=0.4, fps=5.0)
+    robot = MockRobot(name="arm", is_task_frame=True)
+    robot.config.frequency = 10.0
 
     env, _, _ = config.make(
-        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        robot_dict={"arm": robot},
         teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
         cameras={},
     )

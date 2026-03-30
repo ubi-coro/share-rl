@@ -159,6 +159,16 @@ class ManipulationPrimitiveProcessorConfig:
 
 
 @dataclass
+class OpenLoopTrajectorySpec:
+    """Single edit surface for simple scripted open-loop trajectories."""
+
+    target: list[float] | dict[str, list[float]] | None = None
+    delta: list[float] | dict[str, list[float]] | None = None
+    frame: Literal["task", "world", "ee_current"] | dict[str, Literal["task", "world", "ee_current"]] = "task"
+    duration_s: float | dict[str, float] = 1.0
+
+
+@dataclass
 class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     """Shared config and entry hooks for one primitive in an MP-Net."""
     task_frame: TaskFrame | dict[str, TaskFrame] = field(default_factory=TaskFrame)
@@ -683,14 +693,11 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
 
 @ManipulationPrimitiveConfig.register_subclass("open_loop_trajectory")
 @dataclass
-class OpenLoopTrajectoryPrimitiveConfig(MoveDeltaPrimitiveConfig):
-    """Scripted primitive that executes an internal trajectory over substeps."""
+class OpenLoopTrajectoryPrimitiveConfig(ManipulationPrimitiveConfig):
+    """Scripted primitive that samples task-space targets from config-owned logic."""
 
-    duration_substeps: int = 10
-    substeps_per_step: int = 1
-    controller_hz: float | None = None
-    substep_dt_s: float | None = None
-    interruption_policy: Literal["stop_on_events"] = "stop_on_events"
+    trajectory: OpenLoopTrajectorySpec = field(default_factory=OpenLoopTrajectorySpec)
+    publish_target_info: bool | dict[str, bool] = True
 
     def validate(self, robot_dict, teleop_dict):
         """Validate open-loop-specific constraints.
@@ -700,20 +707,42 @@ class OpenLoopTrajectoryPrimitiveConfig(MoveDeltaPrimitiveConfig):
             teleop_dict: Connected teleoperator handles keyed by robot name.
         """
         super().validate(robot_dict, teleop_dict)
-        if self.duration_substeps <= 0:
-            raise ValueError("open_loop_trajectory requires duration_substeps > 0.")
-        if self.substeps_per_step <= 0:
-            raise ValueError("open_loop_trajectory requires substeps_per_step > 0.")
-        if self.controller_hz is None and self.substep_dt_s is None:
-            self.substep_dt_s = 1.0 / self.processor.fps if self.processor.fps > 0 else 0.0
-        elif self.substep_dt_s is None:
-            self.substep_dt_s = 1.0 / self.controller_hz
+        robot_names = list(robot_dict)
+        self.publish_target_info = copy_per_robot(self.publish_target_info, robot_names)
+        self.trajectory.frame = copy_per_robot(self.trajectory.frame, robot_names)
+        self.trajectory.duration_s = copy_per_robot(self.trajectory.duration_s, robot_names)
+        if self.trajectory.target is not None:
+            self.trajectory.target = copy_per_robot(self.trajectory.target, robot_names)
+        if self.trajectory.delta is not None:
+            self.trajectory.delta = copy_per_robot(self.trajectory.delta, robot_names)
 
+        if (self.trajectory.target is None) == (self.trajectory.delta is None):
+            raise ValueError("open_loop_trajectory requires exactly one of trajectory.target or trajectory.delta.")
         if self.policy is not None:
             raise ValueError("open_loop_trajectory primitives are scripted-only and must not configure a policy.")
+
         for name, frame in self.task_frame.items():
+            if frame.space != ControlSpace.TASK:
+                raise ValueError(f"open_loop_trajectory primitives require TASK-space task frames, got '{name}'.")
             if frame.is_adaptive:
                 raise ValueError(f"open_loop_trajectory primitives must be non-adaptive, got learnable axes for '{name}'.")
+            if any(mode != ControlMode.POS for mode in frame.control_mode):
+                raise ValueError(f"open_loop_trajectory primitives currently require POS task-frame axes for '{name}'.")
+
+            if float(self.trajectory.duration_s[name]) <= 0.0:
+                raise ValueError(f"open_loop_trajectory duration_s for '{name}' must be > 0.")
+
+            if self.trajectory.target is not None:
+                if len(self.trajectory.target[name]) != 6:
+                    raise ValueError(f"open_loop_trajectory target for '{name}' must be a 6-vector.")
+                if self.trajectory.frame[name] != "task":
+                    raise ValueError("trajectory.target requires trajectory.frame == 'task'.")
+
+            if self.trajectory.delta is not None:
+                if len(self.trajectory.delta[name]) != 6:
+                    raise ValueError(f"open_loop_trajectory delta for '{name}' must be a 6-vector.")
+                if self.trajectory.frame[name] not in {"world", "ee_current"}:
+                    raise ValueError("trajectory.delta requires trajectory.frame in {'world', 'ee_current'}.")
 
     def make(
         self,
@@ -749,6 +778,64 @@ class OpenLoopTrajectoryPrimitiveConfig(MoveDeltaPrimitiveConfig):
         action_processor = self.make_action_processor(robot_dict, teleop_dict, device)
         return env, env_processor, action_processor
 
+    def resolve_trajectory(
+        self,
+        entry_context: PrimitiveEntryContext | None,
+    ) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+        """Resolve entry pose and final goal pose for one scripted trajectory."""
+        start_pose, goal_pose = super().resolve_targets(entry_context)
+        for name, frame in self.task_frame.items():
+            if self.trajectory.target is not None:
+                goal_pose[name] = [float(v) for v in self.trajectory.target[name]]
+                continue
+
+            start_world = task_pose_to_world_pose(start_pose[name], frame.origin)
+            goal_world = compose_delta_pose(
+                start_pose_world=start_world,
+                delta=[float(v) for v in self.trajectory.delta[name]],
+                frame_name=self.trajectory.frame[name],
+            )
+            goal_pose[name] = world_pose_to_task_pose(goal_world, frame.origin)
+        return start_pose, goal_pose
+
+    def resolve_targets(
+        self,
+        entry_context: PrimitiveEntryContext | None,
+    ) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+        return self.resolve_trajectory(entry_context)
+
+    def target_pose_at(
+        self,
+        alpha: float,
+        start_pose: dict[str, list[float]],
+        goal_pose: dict[str, list[float]],
+    ) -> dict[str, list[float]]:
+        """Sample the scripted task-space target pose for the current progress."""
+        alpha = min(1.0, max(0.0, float(alpha)))
+        return {
+            name: [
+                float(start_pose[name][axis] + alpha * (goal_pose[name][axis] - start_pose[name][axis]))
+                for axis in range(len(goal_pose[name]))
+            ]
+            for name in goal_pose
+        }
+
+    def trajectory_timing(self, robot_dict: dict[str, Robot]) -> tuple[int, int]:
+        """Derive internal substep timing from duration and available control rates."""
+        control_hz_candidates: list[float] = []
+        for robot in robot_dict.values():
+            robot_config = getattr(robot, "config", None)
+            frequency = getattr(robot_config, "frequency", None)
+            if isinstance(frequency, (int, float)) and frequency > 0:
+                control_hz_candidates.append(float(frequency))
+
+        control_hz = max(control_hz_candidates, default=float(self.processor.fps if self.processor.fps > 0 else 1.0))
+        outer_hz = float(self.processor.fps if self.processor.fps > 0 else control_hz)
+        duration_s = max(float(v) for v in self.trajectory.duration_s.values())
+        total_substeps = max(1, int(round(duration_s * control_hz)))
+        substeps_per_step = max(1, int(round(control_hz / outer_hz)))
+        return total_substeps, substeps_per_step
+
     def on_entry(self, env: ManipulationPrimitive, entry_context: PrimitiveEntryContext | None) -> None:
         """Seed one scripted open-loop rollout from the primitive entry context.
 
@@ -757,10 +844,9 @@ class OpenLoopTrajectoryPrimitiveConfig(MoveDeltaPrimitiveConfig):
             entry_context: Optional processed observation and previous origin
                 used to interpret the pose at the primitive boundary.
         """
-        start_pose, target_pose = self.resolve_targets(entry_context)
-        env.set_target_pose(
-            target_pose,
-            info_key=self.target_pose_info_key if any(self.publish_target_info.values()) else None,
-        )
+        start_pose, target_pose = self.resolve_trajectory(entry_context)
+        info_key = self.target_pose_info_key if any(self.publish_target_info.values()) else None
         if isinstance(env, OpenLoopTrajectoryPrimitive):
-            env.configure_trajectory(start_pose=start_pose, target_pose=target_pose)
+            env.configure_trajectory(start_pose=start_pose, target_pose=target_pose, info_key=info_key)
+        else:
+            env.set_target_pose(target_pose, info_key=info_key)

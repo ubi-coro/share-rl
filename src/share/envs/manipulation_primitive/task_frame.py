@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Any
 
 
 class ControlSpace(IntEnum):
@@ -37,10 +39,9 @@ class TaskFrame:
     policy_mode: list[PolicyMode | None] = field(default_factory=lambda: 6 * [None])
     control_mode: list[ControlMode] = field(default_factory=lambda: 6 * [ControlMode.VEL])
     origin: list[float] | None = None
-    kp: list[float] = field(default_factory=lambda: [2500, 2500, 2500, 100, 100, 100])
-    kd: list[float] = field(default_factory=lambda: [960, 960, 320, 6, 6, 6])
     min_pose: list[float] | None = None  # 6-vector: min xyz (m), min extrinsic euler (rad)
     max_pose: list[float] | None = None  # 6-vector: max xyz (m), max extrinsic euler (rad)
+    controller_overrides: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Validate task-frame axis layout and mode compatibility."""
@@ -51,10 +52,6 @@ class TaskFrame:
             raise ValueError("policy_mode must have the same length as target")
         if len(self.control_mode) != width:
             raise ValueError("control_mode must have the same length as target")
-        if self.kp is not None and len(self.kp) != width:
-            raise ValueError("kp must have the same length as target")
-        if self.kd is not None and len(self.kd) != width:
-            raise ValueError("kd must have the same length as target")
         if self.min_pose is None:
             self.min_pose = [float("-inf")] * 6
         if len(self.min_pose) != width:
@@ -196,12 +193,11 @@ class TaskFrame:
             "space": int(self.space),
             "origin": self.origin,
             "target": self.target,
-            "kp": self.kp,
-            "kd": self.kd,
             "policy_mode": [int(policy_mode) if policy_mode is not None else None for policy_mode in self.policy_mode],
             "control_mode": [int(control_mode) for control_mode in self.control_mode],
             "min_target": self.min_pose,
             "max_target": self.max_pose,
+            "controller_overrides": copy.deepcopy(self.controller_overrides),
         }
 
     @classmethod
@@ -213,12 +209,11 @@ class TaskFrame:
             space=ControlSpace(raw["space"]),
             origin=raw.get("origin"),
             target=list(raw["target"]),
-            kp=list(raw["kp"]) if raw.get("kp") is not None else None,
-            kd=list(raw["kd"]) if raw.get("kd") is not None else None,
             policy_mode=[PolicyMode(item) if item is not None else None for item in raw["policy_mode"]],
             control_mode=[ControlMode(item) for item in raw["control_mode"]],
             min_pose=list(min_target) if min_target is not None else None,
             max_pose=list(max_target) if max_target is not None else None,
+            controller_overrides=copy.deepcopy(raw.get("controller_overrides")),
         )
 
     @property

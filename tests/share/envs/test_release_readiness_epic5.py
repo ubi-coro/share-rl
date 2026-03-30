@@ -8,6 +8,8 @@ should be considered candidates for manual deletion later.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -17,12 +19,17 @@ from lerobot.processor.core import TransitionKey
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY
 from lerobot.teleoperators import TeleopEvents
 from share.envs.manipulation_primitive.env_manipulation_primitive import ManipulationPrimitive
-from share.envs.manipulation_primitive.processor_steps import (
+from share.processor.action import (
     InterventionActionProcessorStep,
     MatchTeleopToPolicyActionProcessorStep,
     ToJointActionProcessorStep,
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
+
+TEST_DIR = Path(__file__).resolve().parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(TEST_DIR))
+
 import mock_pipeline_entities as mocks
 
 @dataclass
@@ -85,6 +92,10 @@ def _transition(action, observation=None, info=None, complementary_data=None):
     }
 
 
+def _has_false_intervention_flag(info: dict) -> bool:
+    return any(getattr(key, "value", key) == "is_intervention" and value is False for key, value in info.items())
+
+
 def test_env_reset_returns_obs_info():
     frame = TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6)
     robot = _DummyTaskFrameRobot()
@@ -93,7 +104,9 @@ def test_env_reset_returns_obs_info():
     obs, info = env.reset()
 
     assert isinstance(obs, dict)
-    assert info == {TeleopEvents.IS_INTERVENTION: False}
+    assert _has_false_intervention_flag(info)
+    assert info["primitive_complete"] is False
+    assert info["trajectory_progress"] == 0.0
     assert robot.last_task_frame is frame
     assert env.current_step == 0
 
@@ -108,21 +121,32 @@ def test_env_step_after_reset_smoke():
 
     env.reset()
     obs, reward, terminated, truncated, info = env.step(
-        np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32)
+        {
+            "arm": {
+                "x.ee_vel": 0.1,
+                "y.ee_pos": 0.2,
+                "z.ee_wrench": 0.3,
+                "rx.ee_pos": 0.4,
+                "ry.ee_pos": 0.5,
+                "rz.ee_vel": 0.6,
+            }
+        }
     )
 
     assert isinstance(obs, dict)
     assert reward == 0.0
     assert terminated is False
     assert truncated is False
-    assert info == {TeleopEvents.IS_INTERVENTION: False}
+    assert _has_false_intervention_flag(info)
+    assert info["primitive_complete"] is False
+    assert info["trajectory_progress"] == 0.0
     assert robot.last_action == {
-        "x.vel": pytest.approx(0.1),
-        "y.pos": pytest.approx(0.2),
-        "z.wrench": pytest.approx(0.3),
-        "wx.pos": pytest.approx(0.4),
-        "wy.pos": pytest.approx(0.5),
-        "wz.vel": pytest.approx(0.6),
+        "x.ee_vel": pytest.approx(0.1),
+        "y.ee_pos": pytest.approx(0.2),
+        "z.ee_wrench": pytest.approx(0.3),
+        "rx.ee_pos": pytest.approx(0.4),
+        "ry.ee_pos": pytest.approx(0.5),
+        "rz.ee_vel": pytest.approx(0.6),
     }
 
 
@@ -132,12 +156,14 @@ def test_task_frame_serialization_deserialization_compatibility_for_target_limit
         control_mode=[ControlMode.POS] * 6,
         min_pose=[-1.0] * 6,
         max_pose=[1.0] * 6,
+        controller_overrides={"wrench_limits": [2.0] * 6},
     )
 
     raw = frame.to_dict()
     decoded = TaskFrame.from_dict(raw)
     assert decoded.min_target == [-1.0] * 6
     assert decoded.max_target == [1.0] * 6
+    assert decoded.controller_overrides == {"wrench_limits": [2.0] * 6}
 
     legacy_raw = {
         "space": int(ControlSpace.TASK),
@@ -151,6 +177,7 @@ def test_task_frame_serialization_deserialization_compatibility_for_target_limit
     decoded_legacy = TaskFrame.from_dict(legacy_raw)
     assert decoded_legacy.min_target == [-2.0] * 6
     assert decoded_legacy.max_target == [2.0] * 6
+    assert decoded_legacy.controller_overrides is None
 
 
 @pytest.mark.parametrize(

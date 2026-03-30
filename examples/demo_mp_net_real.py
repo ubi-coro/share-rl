@@ -16,6 +16,7 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import (
     ManipulationPrimitiveConfig,
     ManipulationPrimitiveProcessorConfig,
     MoveDeltaPrimitiveConfig,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode, TaskFrame
@@ -78,10 +79,11 @@ retract_cfg = OpenLoopTrajectoryPrimitiveConfig(
         policy_mode=[None] * 6,
         control_mode=[ControlMode.POS] * 6,
     ),
-    delta=[0.0, -0.05, 0.14, 0.0, 0.0, 0.0],
-    delta_frame="world",
-    duration_substeps=18,
-    substeps_per_step=3,
+    trajectory=OpenLoopTrajectorySpec(
+        delta=[0.0, -0.05, 0.14, 0.0, 0.0, 0.0],
+        frame="world",
+        duration_s=0.6,
+    ),
     processor=ManipulationPrimitiveProcessorConfig(events=EVENTS, gripper=GRIPPER),
 )
 

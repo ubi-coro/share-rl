@@ -208,7 +208,15 @@ def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
     robot.controller = _ReadyController()
     robot.gripper = None
     robot.cameras = {}
-    robot.config = types.SimpleNamespace()
+    robot.config = types.SimpleNamespace(
+        kp=[2500.0] * 3 + [150.0] * 3,
+        kd=[80.0] * 3 + [8.0] * 3,
+        wrench_limits=[30.0] * 6,
+        compliance_safety_mode=controller_module.ComplianceSafetyMode.BOTH,
+        compliance_safety_enable=[False] * 6,
+        compliance_desired_wrench=[5.0] * 6,
+        compliance_adaptive_limit_min=[0.1] * 6,
+    )
     robot.task_frame = controller_module.TaskFrameCommand(
         space=ControlSpace.JOINT,
         target=[0.0] * 6,
@@ -234,5 +242,97 @@ def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
                 target=[0.0] * 6,
                 control_mode=[ControlMode.POS] * 6,
                 policy_mode=[PolicyMode.ABSOLUTE] * 6,
+            )
+        )
+
+
+def test_ur_wrapper_applies_task_frame_controller_overrides():
+    controller_module = _load_controller_module()
+    ur_module = _load_ur_module(controller_module)
+    robot = object.__new__(ur_module.UR)
+    robot.controller = _ReadyController()
+    robot.gripper = None
+    robot.cameras = {}
+    robot.config = types.SimpleNamespace(
+        kp=[2500.0] * 3 + [150.0] * 3,
+        kd=[80.0] * 3 + [8.0] * 3,
+        wrench_limits=[30.0] * 6,
+        compliance_safety_mode=controller_module.ComplianceSafetyMode.BOTH,
+        compliance_safety_enable=[False] * 6,
+        compliance_desired_wrench=[5.0] * 6,
+        compliance_adaptive_limit_min=[0.1] * 6,
+    )
+    robot.task_frame = controller_module.TaskFrameCommand()
+    robot._active_control_space = None
+
+    robot.set_task_frame(
+        TaskFrame(
+            target=[0.0] * 6,
+            control_mode=[ControlMode.POS] * 6,
+            controller_overrides={
+                "kp": [11.0] * 6,
+                "kd": [4.0] * 6,
+                "min_pose": [-0.3] * 6,
+                "max_pose": [0.4] * 6,
+                "wrench_limits": [10.0] * 6,
+                "compliance_safety_mode": controller_module.ComplianceSafetyMode.REFERENCE_LIMITS,
+                "compliance_safety_enable": [True] * 6,
+                "compliance_desired_wrench": [3.0] * 6,
+                "compliance_adaptive_limit_min": [0.2] * 6,
+            },
+        )
+    )
+
+    assert robot.task_frame.controller_overrides["kp"] == [11.0] * 6
+    assert robot.task_frame.controller_overrides["kd"] == [4.0] * 6
+    assert robot.task_frame.controller_overrides["min_pose"] == [-0.3] * 6
+    assert robot.task_frame.controller_overrides["max_pose"] == [0.4] * 6
+    assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
+    assert robot.task_frame.controller_overrides["compliance_safety_mode"] == controller_module.ComplianceSafetyMode.REFERENCE_LIMITS
+    assert robot.task_frame.controller_overrides["compliance_safety_enable"] == [True] * 6
+    assert robot.task_frame.controller_overrides["compliance_desired_wrench"] == [3.0] * 6
+    assert robot.task_frame.controller_overrides["compliance_adaptive_limit_min"] == [0.2] * 6
+
+    queue_dict = robot.task_frame.to_queue_dict()
+    np.testing.assert_allclose(queue_dict["kp"], [11.0] * 6)
+    np.testing.assert_allclose(queue_dict["kd"], [4.0] * 6)
+    np.testing.assert_allclose(queue_dict["min_pose"], [-0.3] * 6)
+    np.testing.assert_allclose(queue_dict["max_pose"], [0.4] * 6)
+    np.testing.assert_allclose(queue_dict["wrench_limits"], [10.0] * 6)
+    np.testing.assert_array_equal(queue_dict["compliance_safety_enable"], [True] * 6)
+    np.testing.assert_allclose(queue_dict["compliance_desired_wrench"], [3.0] * 6)
+    np.testing.assert_allclose(queue_dict["compliance_adaptive_limit_min"], [0.2] * 6)
+    assert int(queue_dict["compliance_safety_mode"]) == int(controller_module.ComplianceSafetyMode.REFERENCE_LIMITS)
+
+    robot.set_task_frame(
+        TaskFrame(
+            target=[0.7] * 6,
+            control_mode=[ControlMode.POS] * 6,
+        )
+    )
+    assert robot.task_frame.target == [0.7] * 6
+    assert robot.task_frame.controller_overrides["kp"] == [11.0] * 6
+    assert robot.task_frame.controller_overrides["kd"] == [4.0] * 6
+    assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
+    assert robot.task_frame.controller_overrides["compliance_safety_mode"] == controller_module.ComplianceSafetyMode.REFERENCE_LIMITS
+
+
+def test_ur_wrapper_rejects_unknown_task_frame_controller_override():
+    controller_module = _load_controller_module()
+    ur_module = _load_ur_module(controller_module)
+    robot = object.__new__(ur_module.UR)
+    robot.controller = _ReadyController()
+    robot.gripper = None
+    robot.cameras = {}
+    robot.config = types.SimpleNamespace()
+    robot.task_frame = controller_module.TaskFrameCommand()
+    robot._active_control_space = None
+
+    with pytest.raises(ValueError, match="Unsupported UR task-frame controller overrides"):
+        robot.set_task_frame(
+            TaskFrame(
+                target=[0.0] * 6,
+                control_mode=[ControlMode.POS] * 6,
+                controller_overrides={"mystery_limit": [1.0] * 6},
             )
         )

@@ -9,6 +9,7 @@ from _mock_mp_net_utils import make_mock_connect
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
     ManipulationPrimitiveConfig,
     MoveDeltaPrimitiveConfig,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, TaskFrame
@@ -48,13 +49,14 @@ transfer_cfg = OpenLoopTrajectoryPrimitiveConfig(
         "giver": _frame([-0.06, 0.00, 0.18, 0.0, 0.0, 0.0]),
         "receiver": _frame([0.06, 0.00, 0.18, 0.0, 0.0, 0.0]),
     },
-    delta={
-        "giver": [-0.08, -0.06, 0.04, 0.0, 0.0, 0.0],
-        "receiver": [0.10, 0.04, 0.08, 0.0, 0.0, 0.0],
-    },
-    delta_frame={"giver": "world", "receiver": "world"},
-    duration_substeps=6,
-    substeps_per_step=2,
+    trajectory=OpenLoopTrajectorySpec(
+        delta={
+            "giver": [-0.08, -0.06, 0.04, 0.0, 0.0, 0.0],
+            "receiver": [0.10, 0.04, 0.08, 0.0, 0.0, 0.0],
+        },
+        frame={"giver": "world", "receiver": "world"},
+        duration_s={"giver": 0.6, "receiver": 0.6},
+    ),
 )
 
 reset_cfg = MoveDeltaPrimitiveConfig(
