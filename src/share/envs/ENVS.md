@@ -109,7 +109,7 @@ The runtime publishes these stable info keys on every step/reset:
 The primitive config is a registry with three intended primitive families:
 
 - `static`: legacy behavior; task-frame targets come directly from config.
-- `move_delta`: resolves a target once on entry from `start_pose + delta`, with `delta_frame` in `world` or `ee_current`.
+- `move_delta`: resolves fixed task-space `POS` axes once on entry from `start_pose + delta`, with `delta_frame` in `world` or `ee_current`. For those fixed axes, `task_frame.target` is ignored at runtime and a zero delta holds the entry pose.
 - `open_loop_trajectory`: resolves the same entry target, then uses its own env subclass to execute a chunked scripted trajectory internally over multiple robot substeps per outer `step()`.
 
 Configs stay declarative: runtime target state lives in the primitive env. `move_delta` updates the env target on entry so downstream action projection and transition checks observe the same target. `open_loop_trajectory` is scripted-only in v1 and exposes completion/progress through the info keys above.

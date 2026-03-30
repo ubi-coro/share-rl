@@ -604,7 +604,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
 @ManipulationPrimitiveConfig.register_subclass("move_delta")
 @dataclass
 class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
-    """Primitive that resolves a task-space target once on entry from a delta."""
+    """Primitive that resolves fixed task-space position axes from an entry-time delta."""
 
     delta: list[float] | dict[str, list[float]] = field(default_factory=lambda: [0.0] * 6)
     delta_frame: Literal["world", "ee_current"] | dict[str, Literal["world", "ee_current"]] = "world"
@@ -655,6 +655,8 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
 
         Returns:
             A pair ``(start_pose, target_pose)`` in this primitive's task frame.
+            Fixed ``POS`` axes resolve from ``entry_pose + delta``; learnable
+            and non-``POS`` axes keep their configured targets.
         """
         start_pose, target_pose = super().resolve_targets(entry_context)
         for name, frame in self.task_frame.items():
@@ -665,29 +667,18 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
                 frame_name=self.delta_frame[name],
             )
             resolved_target = world_pose_to_task_pose(target_world, frame.origin)
-            resolved_axes = self._default_delta_axes(frame, self.delta[name])
             target_pose[name] = [float(v) for v in frame.target]
-            for axis in resolved_axes:
+            for axis in self._fixed_pos_axes(frame):
                 target_pose[name][axis] = float(resolved_target[axis])
-                frame.target[axis] = float(resolved_target[axis])
         return start_pose, target_pose
 
     @staticmethod
-    def _default_delta_axes(frame: TaskFrame, delta: list[float]) -> list[int]:
-        resolved_axes: list[int] = []
-        if any(abs(float(delta[axis])) > 1e-9 for axis in range(3)):
-            resolved_axes.extend(
-                axis
-                for axis in range(3)
-                if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] is None
-            )
-        if any(abs(float(delta[axis])) > 1e-9 for axis in range(3, 6)):
-            resolved_axes.extend(
-                axis
-                for axis in range(3, 6)
-                if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] is None
-            )
-        return resolved_axes
+    def _fixed_pos_axes(frame: TaskFrame) -> list[int]:
+        return [
+            axis
+            for axis in range(len(frame.target))
+            if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] is None
+        ]
 
 
 @ManipulationPrimitiveConfig.register_subclass("open_loop_trajectory")
