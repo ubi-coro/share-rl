@@ -29,7 +29,6 @@ from lerobot.utils.errors import DeviceNotConnectedError, DeviceAlreadyConnected
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, TASK_FRAME_AXIS_NAMES, TaskFrame
 from share.robots.ur.lerobot_robot_ur.config_ur import URConfig
 from share.robots.ur.lerobot_robot_ur.controller import (
-    ComplianceSafetyMode,
     TaskFrameCommand,
     RTDETaskFrameController,
 )
@@ -292,8 +291,8 @@ class UR(Robot):
             "kp": list(self.config.kp),
             "kd": list(self.config.kd),
             "wrench_limits": list(self.config.wrench_limits),
-            "compliance_safety_mode": self.config.compliance_safety_mode,
-            "compliance_safety_enable": list(self.config.compliance_safety_enable),
+            "compliance_adaptive_limit_enable": list(self.config.compliance_adaptive_limit_enable),
+            "compliance_reference_limit_enable": list(self.config.compliance_reference_limit_enable),
             "compliance_desired_wrench": list(self.config.compliance_desired_wrench),
             "compliance_adaptive_limit_min": list(self.config.compliance_adaptive_limit_min),
         }

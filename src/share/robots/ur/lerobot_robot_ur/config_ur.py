@@ -22,7 +22,6 @@ import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.robots import RobotConfig
-from share.robots.ur.lerobot_robot_ur.controller import ComplianceSafetyMode
 
 @RobotConfig.register_subclass("ur")
 @dataclass
@@ -61,8 +60,8 @@ class URConfig(RobotConfig):
     speed_limits: list[float] = field(default_factory = lambda: [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])
 
     # compliance / anti-windup behavior
-    compliance_safety_mode: ComplianceSafetyMode = ComplianceSafetyMode.BOTH
-    compliance_safety_enable: list[bool] = field(default_factory=lambda: [False] * 6)
+    compliance_adaptive_limit_enable: list[bool] = field(default_factory=lambda: [False] * 6)
+    compliance_reference_limit_enable: list[bool] = field(default_factory=lambda: [False] * 6)
     compliance_desired_wrench: list[float] = field(default_factory=lambda: [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])
     compliance_adaptive_limit_theta: Optional[list[float]] = None
     compliance_adaptive_limit_min: list[float] = field(default_factory=lambda: [0.1] * 6)
@@ -79,13 +78,17 @@ class URConfig(RobotConfig):
             raise ValueError("URConfig.kp must be a length-6 list.")
         if len(self.kd) != 6:
             raise ValueError("URConfig.kd must be a length-6 list.")
+        if len(self.compliance_adaptive_limit_enable) != 6:
+            raise ValueError("URConfig.compliance_adaptive_limit_enable must be a length-6 list.")
+        if len(self.compliance_reference_limit_enable) != 6:
+            raise ValueError("URConfig.compliance_reference_limit_enable must be a length-6 list.")
         if self.compliance_adaptive_limit_theta is None:
             if self.verbose:
                 logging.info(f"=== Compute parameters for exponential contact force limit scaling: ===")
 
             self.compliance_adaptive_limit_theta = [0.0] * 6
             for i in range(6):
-                if not self.compliance_safety_enable[i]:
+                if not self.compliance_adaptive_limit_enable[i]:
                     continue
 
                 if self.wrench_limits[i] == float("inf"):

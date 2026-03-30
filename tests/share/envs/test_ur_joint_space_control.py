@@ -212,8 +212,8 @@ def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
         kp=[2500.0] * 3 + [150.0] * 3,
         kd=[80.0] * 3 + [8.0] * 3,
         wrench_limits=[30.0] * 6,
-        compliance_safety_mode=controller_module.ComplianceSafetyMode.BOTH,
-        compliance_safety_enable=[False] * 6,
+        compliance_adaptive_limit_enable=[False] * 6,
+        compliance_reference_limit_enable=[False] * 6,
         compliance_desired_wrench=[5.0] * 6,
         compliance_adaptive_limit_min=[0.1] * 6,
     )
@@ -257,8 +257,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
         kp=[2500.0] * 3 + [150.0] * 3,
         kd=[80.0] * 3 + [8.0] * 3,
         wrench_limits=[30.0] * 6,
-        compliance_safety_mode=controller_module.ComplianceSafetyMode.BOTH,
-        compliance_safety_enable=[False] * 6,
+        compliance_adaptive_limit_enable=[False] * 6,
+        compliance_reference_limit_enable=[False] * 6,
         compliance_desired_wrench=[5.0] * 6,
         compliance_adaptive_limit_min=[0.1] * 6,
     )
@@ -275,8 +275,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
                 "min_pose": [-0.3] * 6,
                 "max_pose": [0.4] * 6,
                 "wrench_limits": [10.0] * 6,
-                "compliance_safety_mode": controller_module.ComplianceSafetyMode.REFERENCE_LIMITS,
-                "compliance_safety_enable": [True] * 6,
+                "compliance_adaptive_limit_enable": [False] * 6,
+                "compliance_reference_limit_enable": [True] * 6,
                 "compliance_desired_wrench": [3.0] * 6,
                 "compliance_adaptive_limit_min": [0.2] * 6,
             },
@@ -288,8 +288,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     assert robot.task_frame.controller_overrides["min_pose"] == [-0.3] * 6
     assert robot.task_frame.controller_overrides["max_pose"] == [0.4] * 6
     assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
-    assert robot.task_frame.controller_overrides["compliance_safety_mode"] == controller_module.ComplianceSafetyMode.REFERENCE_LIMITS
-    assert robot.task_frame.controller_overrides["compliance_safety_enable"] == [True] * 6
+    assert robot.task_frame.controller_overrides["compliance_adaptive_limit_enable"] == [False] * 6
+    assert robot.task_frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
     assert robot.task_frame.controller_overrides["compliance_desired_wrench"] == [3.0] * 6
     assert robot.task_frame.controller_overrides["compliance_adaptive_limit_min"] == [0.2] * 6
 
@@ -299,10 +299,10 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     np.testing.assert_allclose(queue_dict["min_pose"], [-0.3] * 6)
     np.testing.assert_allclose(queue_dict["max_pose"], [0.4] * 6)
     np.testing.assert_allclose(queue_dict["wrench_limits"], [10.0] * 6)
-    np.testing.assert_array_equal(queue_dict["compliance_safety_enable"], [True] * 6)
+    np.testing.assert_array_equal(queue_dict["compliance_adaptive_limit_enable"], [False] * 6)
+    np.testing.assert_array_equal(queue_dict["compliance_reference_limit_enable"], [True] * 6)
     np.testing.assert_allclose(queue_dict["compliance_desired_wrench"], [3.0] * 6)
     np.testing.assert_allclose(queue_dict["compliance_adaptive_limit_min"], [0.2] * 6)
-    assert int(queue_dict["compliance_safety_mode"]) == int(controller_module.ComplianceSafetyMode.REFERENCE_LIMITS)
 
     robot.set_task_frame(
         TaskFrame(
@@ -314,7 +314,7 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     assert robot.task_frame.controller_overrides["kp"] == [11.0] * 6
     assert robot.task_frame.controller_overrides["kd"] == [4.0] * 6
     assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
-    assert robot.task_frame.controller_overrides["compliance_safety_mode"] == controller_module.ComplianceSafetyMode.REFERENCE_LIMITS
+    assert robot.task_frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
 
 
 def test_ur_wrapper_rejects_unknown_task_frame_controller_override():
