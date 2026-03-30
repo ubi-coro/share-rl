@@ -36,8 +36,8 @@ class TaskFrame:
     """Serializable task-frame command shared by policy, processors, and robots."""
     target: list[float] = field(default_factory=lambda: 6 * [0.0])
     space: ControlSpace = ControlSpace.TASK
-    policy_mode: list[PolicyMode | None] = field(default_factory=lambda: 6 * [None])
-    control_mode: list[ControlMode] = field(default_factory=lambda: 6 * [ControlMode.VEL])
+    policy_mode: list[PolicyMode | None] = field(default_factory=lambda: 6 * [PolicyMode.RELATIVE])
+    control_mode: list[ControlMode] = field(default_factory=lambda: 6 * [ControlMode.POS])
     origin: list[float] | None = None
     min_pose: list[float] | None = None  # 6-vector: min xyz (m), min extrinsic euler (rad)
     max_pose: list[float] | None = None  # 6-vector: max xyz (m), max extrinsic euler (rad)
