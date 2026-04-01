@@ -99,7 +99,7 @@ def record_loop(
         if policy is not None:
             # noinspection PyTypeChecker
             action = predict_action(
-                observation=obs,
+                observation={key: obs[key] for key in policy.config.input_features},
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
                 preprocessor=preprocessors[mp_net.active_primitive],
@@ -107,7 +107,7 @@ def record_loop(
                 use_amp=policy.config.use_amp,
                 task=task,
                 robot_type=mp_net.config.type
-            )
+            ).squeeze()
         else:
             # Dummy action, expected to be overwritten by teleop action
             action = torch.tensor([0.0] * mp_net.action_dim, dtype=torch.float32)
@@ -125,7 +125,7 @@ def record_loop(
         sum_reward += float(reward)
 
         # (3) Exit on episode end
-        if info.get(TeleopEvents.INTERVENTION_COMPLETED, False):
+        if info.get(TeleopEvents.INTERVENTION_COMPLETED, False) or info.get(TeleopEvents.STOP_RECORDING, False):
             return info
 
         # (4) Store transition. When interactive, only store frames on interventions
@@ -191,15 +191,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     # make
     mp_net = ManipulationPrimitiveNet(cfg.env)
-    debugger = MPNetDebugger.start(
-        cfg.debug,
-        cfg.env,
-        display_ip=cfg.display_ip,
-        display_port=cfg.display_port,
-        dataset_root=Path(cfg.dataset.root) if cfg.dataset is not None and cfg.dataset.root is not None else None,
-        reuse_existing_rerun=cfg.display_data,
-        session_name="recording-mpnet-debug",
-    )
+    debugger = None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
 
     try:
@@ -237,7 +229,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 else:
                     log_say("Dataset is empty, continue execution", cfg.play_sounds, blocking=True)
     finally:
-        debugger.close()
+        #debugger.close()
         log_say("Stop recording", cfg.play_sounds, blocking=True)
         mp_net.close()
 

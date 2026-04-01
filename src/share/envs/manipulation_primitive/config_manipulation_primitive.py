@@ -173,7 +173,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     """Shared config and entry hooks for one primitive in an MP-Net."""
     task_frame: TaskFrame | dict[str, TaskFrame] = field(default_factory=TaskFrame)
     processor: ManipulationPrimitiveProcessorConfig = field(default_factory=ManipulationPrimitiveProcessorConfig)
-    policy: PreTrainedConfig | None = None
+    policy: PreTrainedConfig | str | None = None
     policy_overwrites: dict = field(default_factory=dict)
     notes: str | None = None
     is_terminal: bool = False
@@ -183,6 +183,12 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     def __post_init__(self):
         self._kinematics_solver = {}
         self._joint_names = {}
+
+        if isinstance(self.policy, str):
+            policy_path = self.policy
+            self.policy = PreTrainedConfig.from_pretrained(pretrained_name_or_path=policy_path)
+            self.policy.pretrained_path = policy_path
+
 
     @property
     def gym_kwargs(self) -> dict:
@@ -366,22 +372,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                 )
             )
 
-        # action relative to starting pose
-        if any_enabled(self.processor.observation.relative_ee_pos):
-            env_pipeline_steps.append(
-                RelativeFrameObservationProcessor(
-                    enable=self.processor.observation.relative_ee_pos
-                )
-            )
-
-        if self.processor.image_preprocessing:
-            env_pipeline_steps.append(
-                ImageCropResizeProcessorStep(
-                    crop_params_dict=self.processor.image_preprocessing.crop_params_dict,
-                    resize_size=self.processor.image_preprocessing.resize_size
-                )
-            )
-
         #env_pipeline_steps.append(
         #    GripperPenaltyProcessorStep(
         #        max_gripper_pos=self.processor.gripper.max_pos,
@@ -409,6 +399,22 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             ),
             DeviceProcessorStep(device=device)
         ])
+
+        # action relative to starting pose
+        if any_enabled(self.processor.observation.relative_ee_pos):
+            env_pipeline_steps.append(
+                RelativeFrameObservationProcessor(
+                    enable=self.processor.observation.relative_ee_pos
+                )
+            )
+
+        if self.processor.image_preprocessing:
+            env_pipeline_steps.append(
+                ImageCropResizeProcessorStep(
+                    crop_params_dict=self.processor.image_preprocessing.crop_params_dict,
+                    resize_size=self.processor.image_preprocessing.resize_size
+                )
+            )
 
         # timing hooks
         if self.processor.hooks.time_env_processor:
@@ -572,6 +578,9 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             if ft.type == FeatureType.VISUAL:
                 key = strip_prefix(key, PREFIXES_TO_STRIP)
                 self.features[f"{OBS_IMAGES}.{key}"] = PolicyFeature(type=FeatureType.VISUAL, shape=ft.shape)
+
+        if not self.features_map:
+            self.features_map = {key: key for key in self.features}
 
     def on_entry(self, env: ManipulationPrimitive, entry_context: PrimitiveEntryContext | None) -> None:
         """Initialize env-owned runtime state when the primitive becomes active.
