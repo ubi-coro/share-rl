@@ -23,7 +23,7 @@ from lerobot.teleoperators import Teleoperator, TeleopEvents
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from share.motors.dynamixel.dynamixel import TrossenDynamixelBus, TrossenNormMode, OperatingMode
-from share.teleoperators.widowx import WidowXConfig
+from share.teleoperators.widowx.lerobot_teleoperator_widowx.config_widowx import WidowXConfig
 
 logger = logging.getLogger(__name__)
 

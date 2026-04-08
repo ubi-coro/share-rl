@@ -1,10 +1,14 @@
 import math
+from enum import Enum
 
 from lerobot.motors.dynamixel import DynamixelMotorsBus, OperatingMode
 from lerobot.motors.motors_bus import MotorNormMode, MotorCalibration
 
 
-class TrossenNormMode(MotorNormMode):
+class TrossenNormMode(str, Enum):
+    RANGE_0_100 = "range_0_100"
+    RANGE_M100_100 = "range_m100_100"
+    DEGREES = "degrees"
     RANGE_0_1 = "range_0_1"
     RADIANS = "radians"
 

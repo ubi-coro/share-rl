@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.processor.core import EnvTransition, TransitionKey
+from lerobot.processor import EnvTransition, TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry, ObservationProcessorStep
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 

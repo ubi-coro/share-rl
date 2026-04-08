@@ -26,7 +26,7 @@ from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from share.motors.dynamixel.dynamixel import TrossenDynamixelBus, TrossenNormMode, OperatingMode
-from share.robots.lerobot_robot_viper.lerobot_robot_viper import ViperXConfig
+from share.robots.viperx.lerobot_robot_viperx.config_viperx import ViperXConfig
 
 logger = logging.getLogger(__name__)
 

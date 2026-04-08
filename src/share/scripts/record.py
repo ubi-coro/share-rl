@@ -17,9 +17,9 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import ACTION, REWARD, DONE
 from lerobot.utils.control_utils import predict_action
+from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
-    get_safe_torch_device,
     init_logging,
     log_say,
 )
@@ -171,9 +171,9 @@ def record_loop(
         dt_loop = time.perf_counter() - start_loop_t
         logging.info(
             f"[{task}] "
-            f"{transition[TransitionKey.OBSERVATION]["main.x.ee_pos"]}, "
-            f"{transition[TransitionKey.OBSERVATION]["main.y.ee_pos"]}, "
-            f"{transition[TransitionKey.OBSERVATION]["main.z.ee_pos"]}"
+            #f"{transition[TransitionKey.OBSERVATION]["main.x.ee_pos"]}, "
+            #f"{transition[TransitionKey.OBSERVATION]["main.y.ee_pos"]}, "
+            #f"{transition[TransitionKey.OBSERVATION]["main.z.ee_pos"]}"
             f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
             f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
         )

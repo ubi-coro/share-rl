@@ -182,13 +182,11 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
 
     def __post_init__(self):
         self._kinematics_solver = {}
-        self._joint_names = {}
 
         if isinstance(self.policy, str):
             policy_path = self.policy
             self.policy = PreTrainedConfig.from_pretrained(pretrained_name_or_path=policy_path)
             self.policy.pretrained_path = policy_path
-
 
     @property
     def gym_kwargs(self) -> dict:
@@ -286,7 +284,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                 task_frame=self.task_frame,
                 kinematics=self._kinematics_solver,
                 use_virtual_reference=self.processor.kinematics.use_virtual_reference,
-                joint_names=self._joint_names,
                 gripper_enable=self.processor.gripper.enable,
             ),
 
@@ -324,7 +321,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     is_task_frame_robot=is_task_frame_robot,
                     task_frame=self.task_frame,
                     kinematics=self._kinematics_solver,
-                    joint_names=self._joint_names,
                     use_virtual_reference=self.processor.kinematics.use_virtual_reference
                 )
             )
@@ -368,7 +364,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             env_pipeline_steps.append(
                 JointsToEEObservation(
                     kinematics=self._kinematics_solver,
-                    motor_names=self._joint_names,
+                    motor_names={name: frame.joint_names for name, frame in self.task_frame.items()}
                 )
             )
 
@@ -460,20 +456,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     setattr(_attr, fn.name, {name: getattr(_attr, fn.name) for name in robot_dict})
             setattr(self.processor, attr, _attr)
 
-        # Set up kinematics solver if inverse kinematics is configured
-        for name, robot in robot_dict.items():
-            if not is_task_frame_robot[name]:
-                assert hasattr(robot, "bus")
-                self._joint_names[name] = list(robot.bus.motors.keys())
-
-                if self.processor.kinematics.enable[name]:
-                    self._kinematics_solver[name] = get_kinematics(
-                        robot_name=robot.name,
-                        urdf_path=self.processor.kinematics.urdf_path[name],
-                        target_frame_name=self.processor.kinematics.target_frame_name[name],
-                        joint_names=self._joint_names[name],
-                    )
-
         # checks per robot
         for name, frame in self.task_frame.items():
             if name not in robot_dict:
@@ -490,6 +472,9 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
 
             # ENV-102: JOINT-space and joint-only robots must only receive POS axis modes.
             if frame.space == ControlSpace.JOINT:
+                # set joint names
+                frame.joint_names = [motor for motor in robot_dict[name].bus.motors if not motor.endswith("_shadow")]
+
                 non_pos_axes = [i for i, mode in enumerate(frame.control_mode) if mode != ControlMode.POS]
                 if non_pos_axes:
                     raise ValueError(
@@ -532,6 +517,16 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                         "Expected an action key like '{GRIPPER_KEY}.pos'."
                     )
 
+        # Set up kinematics solver if inverse kinematics is configured
+        for name, robot in robot_dict.items():
+            if not is_task_frame_robot[name] and self.processor.kinematics.enable[name]:
+                self._kinematics_solver[name] = get_kinematics(
+                    robot_name=robot.name,
+                    urdf_path=self.processor.kinematics.urdf_path[name],
+                    target_frame_name=self.processor.kinematics.target_frame_name[name],
+                    joint_names=self.task_frame[name].joint_names,
+                )
+
     def infer_features(self, robot_dict, cameras):
         """Infer policy-visible feature specs from the configured pipelines.
 
@@ -567,7 +562,9 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         obs_features = pipeline_features[PipelineFeatureType.OBSERVATION]
 
         action_dim = sum(frame.policy_action_dim for frame in self.task_frame.values())
-        action_dim += sum(bool(enable) for enable in self.processor.gripper.enable.values())  # add gripper action dim if enabled
+
+        count_gripper = [is_tf and bool(enable) for (is_tf, enable) in zip(check_task_frame_robot(robot_dict).values(), self.processor.gripper.enable.values())]
+        action_dim += sum(count_gripper)  # add gripper action dim if enabled
 
         # expose state, action and visual features
         self.features = {

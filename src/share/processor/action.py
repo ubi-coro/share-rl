@@ -4,9 +4,9 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from lerobot.types import EnvTransition, TransitionKey
 from scipy.spatial.transform import Rotation
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY, GRIPPER_KEY
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 
@@ -18,7 +18,6 @@ from share.envs.manipulation_primitive.task_frame import (
     TASK_FRAME_AXIS_NAMES
 )
 from share.envs.utils import check_delta_teleoperator
-from share.processor.utils import policy_action_keys_for_robot, flatten_nested_policy_action
 from share.utils.transformation_utils import rotation_from_extrinsic_xyz, rotation_component_keys
 from share.processor.utils import policy_action_keys_for_robot, flatten_nested_policy_action
 from share.teleoperators.utils import TeleopEvents
@@ -79,7 +78,6 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
     teleoperators: dict[str, Any] = field(default_factory=dict)
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
     kinematics: dict[str, Any] = field(default_factory=dict)
-    joint_names: dict[str, list[str]] = field(default_factory=dict)
     use_virtual_reference: dict[str, bool] = field(default_factory=dict)
     gripper_enable: dict[str, bool] = field(default_factory=dict)
 
@@ -128,10 +126,10 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
             base_pose = self._integration_base_pose(name, frame, transition)
             pose_target = [base_pose[i] + deltas[i] for i in range(6)]
             joint_target = solver.inverse_kinematics(pose_target)
-            base_joint_state = self._integration_base_joint_state(name, transition)
+            base_joint_state = self._integration_base_joint_state(name, frame, transition)
             encoded: dict[str, float] = {}
             for axis in frame.learnable_axis_indices:
-                joint_name = self.joint_names[name][axis]
+                joint_name = frame.action_key_for_axis(axis)
                 joint_value = joint_target[joint_name]
                 if frame.policy_mode[axis] == PolicyMode.RELATIVE:
                     joint_value -= float(base_joint_state.get(joint_name, joint_value))
@@ -139,7 +137,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 
             # update virtual
             if any(frame.policy_mode[axis] == PolicyMode.ABSOLUTE for axis in frame.learnable_axis_indices):
-                learnable_joints = [self.joint_names[name][axis] for axis in frame.learnable_axis_indices]
+                learnable_joints = [frame.action_key_for_axis(axis) for axis in frame.learnable_axis_indices]
                 self._virtual_joint_target[name] = {name: joint_target[name] for name in learnable_joints}
 
             return encoded
@@ -162,11 +160,11 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
             self._prev_joint_state[name] = dict(joint_state)
             encoded: dict[str, float] = {}
             for axis in frame.learnable_axis_indices:
-                joint_name = self._joint_name_for_axis(name, axis)
-                joint_value = float(joint_state.get(joint_name, joint_state.get(f"joint_{axis + 1}", 0.0)))
+                joint_name = frame.action_key_for_axis(axis)
+                joint_value = float(joint_state[joint_name])
                 if frame.policy_mode[axis] == PolicyMode.RELATIVE:
                     joint_value -= float(prev_joint_state.get(joint_name, joint_value))
-                encoded[frame.action_key_for_axis(axis)] = joint_value
+                encoded[joint_name] = joint_value
             return encoded
 
         solver = self._require_solver(name)
@@ -235,7 +233,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 
         return list(frame.target)
 
-    def _integration_base_joint_state(self, name: str, transition: EnvTransition) -> dict[str, float]:
+    def _integration_base_joint_state(self, name: str, frame: TaskFrame, transition: EnvTransition) -> dict[str, float]:
         use_virtual = self.use_virtual_reference[name] if isinstance(self.use_virtual_reference, dict) else self.use_virtual_reference
         if use_virtual and name in self._virtual_joint_target:
             return dict(self._virtual_joint_target[name])
@@ -243,7 +241,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION)
         if isinstance(observation, dict):
             joint_state: dict[str, float] = {}
-            for joint_name in self.joint_names.get(name, []):
+            for joint_name in frame.joint_names:
                 key = f"{name}.{joint_name}.pos"
                 if key in observation:
                     joint_state[joint_name] = observation[key]
@@ -272,18 +270,15 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         return [float(v) for v in teleop_action][:6]
 
     @staticmethod
-    def _extract_joint_action(teleop_action: Any) -> dict[str, float]:
-        if isinstance(teleop_action, dict):
-            joint_state: dict[str, float] = {}
-            for key, value in teleop_action.items():
-                if key.endswith(".pos"):
-                    joint_state[key.removesuffix(".pos")] = float(value)
-                elif key.endswith(".q"):
-                    joint_state[key.removesuffix(".q")] = float(value)
-                elif "." not in key:
-                    joint_state[key] = float(value)
-            return joint_state
-        return {f"joint_{i + 1}": float(v) for i, v in enumerate(teleop_action)}
+    def _extract_joint_action(teleop_action: dict) -> dict[str, float]:
+        joint_state: dict[str, float] = {}
+        for key, value in teleop_action.items():
+            if key.endswith(".q"):
+                key = key.removesuffix(".q")
+            if "." not in key:
+                key = f"{key}.pos"
+            joint_state[key] = float(value)
+        return joint_state
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -567,7 +562,6 @@ class ToJointActionProcessorStep(ProcessorStep):
     is_task_frame_robot: dict[str, bool] = field(default_factory=dict)
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
     kinematics: dict[str, Any] = field(default_factory=dict)
-    joint_names: dict[str, list[str]] = field(default_factory=dict)
     use_virtual_reference: bool | dict[str, bool] = True
 
     _virtual_task_pose: dict[str, list[float]] = field(default_factory=dict, init=False)
@@ -608,7 +602,7 @@ class ToJointActionProcessorStep(ProcessorStep):
                 raise ValueError(f"IK failed for '{name}': {exc}") from exc
 
             robot_joint_action: dict[str, float] = {}
-            for joint_name in self.joint_names.get(name, []):
+            for joint_name in frame.joint_names:
                 if joint_name not in ik_solution:
                     raise ValueError(f"IK solution for '{name}' missing joint '{joint_name}'")
                 robot_joint_action[f"{joint_name}.pos"] = float(ik_solution[joint_name])

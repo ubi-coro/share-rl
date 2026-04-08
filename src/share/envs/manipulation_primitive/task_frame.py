@@ -46,6 +46,7 @@ class TaskFrame:
     min_pose: list[float] | None = None  # 6-vector: min xyz (m), min extrinsic XYZ Euler angles (rad)
     max_pose: list[float] | None = None  # 6-vector: max xyz (m), max extrinsic XYZ Euler angles (rad)
     controller_overrides: dict[str, Any] | None = None
+    joint_names: list[str] | None = None
 
     def __post_init__(self) -> None:
         """Validate task-frame axis layout and mode compatibility."""
@@ -57,11 +58,11 @@ class TaskFrame:
         if len(self.control_mode) != width:
             raise ValueError("control_mode must have the same length as target")
         if self.min_pose is None:
-            self.min_pose = [float("-inf")] * 6
+            self.min_pose = [float("-inf")] * width
         if len(self.min_pose) != width:
             raise ValueError("min_pose must have the same length as target")
         if self.max_pose is None:
-            self.max_pose = [float("inf")] * 6
+            self.max_pose = [float("inf")] * width
         if len(self.max_pose) != width:
             raise ValueError("max_pose must have the same length as target")
 
@@ -72,8 +73,13 @@ class TaskFrame:
                 self.origin = 6 * [0.0]
             if len(self.origin) != 6:
                 raise ValueError("origin must be a 6 vector (xyz + extrinsic XYZ Euler roll/pitch/yaw in rad)")
-        elif self.origin is not None:
-            raise ValueError("origin must be None when space == JOINT")
+        elif self.space == ControlSpace.TASK:
+            if self.origin is not None:
+                raise ValueError("origin must be None when space == JOINT")
+            if self.joint_names is None:
+                self.joint_names = [f"joint_{axis}" for axis in range(width)]
+            if len(self.joint_names) != width:
+                raise ValueError("joint_names must have the same length as target")
         
         for i in range(width):
             if self.policy_mode[i] is None:
@@ -142,7 +148,7 @@ class TaskFrame:
     def action_key_for_axis(self, axis: int) -> str:
         """Return the low-level action key for one axis of this task frame."""
         if self.space == ControlSpace.JOINT:
-            return f"joint_{axis + 1}.pos"
+            return f"{self.joint_names[axis]}.pos"
 
         axis_name = TASK_FRAME_AXIS_NAMES[axis]
         suffix = {
@@ -184,7 +190,7 @@ class TaskFrame:
     def action_feature_keys(self) -> dict[str, type]:
         """Return the keyed low-level action schema implied by this task frame."""
         if self.space == ControlSpace.JOINT:
-            return {f"joint_{i + 1}.pos": float for i in range(len(self.target))}
+            return {f"{joint_name}.pos": float for joint_name in self.joint_names}
 
         feature_keys: dict[str, type] = {}
         for axis in range(len(self.target)):
