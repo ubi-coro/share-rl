@@ -25,6 +25,9 @@ DELTA_ROTATION_ACTION_NAMES = {
     "rx.vel",
     "ry.vel",
     "rz.vel",
+    "wx.vel",
+    "wy.vel",
+    "wz.vel",
 }
 DELTA_AUXILIARY_ACTION_NAMES = {
     GRIPPER_KEY,
@@ -211,4 +214,3 @@ def compare(lhs: float, rhs: float, operator: str) -> bool:
     if operator == "ne":
         return lhs != rhs
     raise ValueError(f"Unsupported comparison operator '{operator}'.")
-

@@ -26,7 +26,13 @@ from lerobot.cameras import make_cameras_from_configs
 from lerobot.processor.hil_processor import GRIPPER_KEY
 from lerobot.robots import Robot
 from lerobot.utils.errors import DeviceNotConnectedError, DeviceAlreadyConnectedError
-from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, TASK_FRAME_AXIS_NAMES, TaskFrame
+from share.envs.manipulation_primitive.task_frame import (
+    ControlMode,
+    ControlSpace,
+    StiffnessMode,
+    TASK_FRAME_AXIS_NAMES,
+    TaskFrame,
+)
 from share.robots.ur.lerobot_robot_ur.config_ur import URConfig
 from share.robots.ur.lerobot_robot_ur.controller import (
     TaskFrameCommand,
@@ -56,7 +62,10 @@ class UR(Robot):
         self.config = config
         self.robot_type = self.name
         self.id = config.id
-        self.task_frame = TaskFrameCommand(controller_overrides=self._default_controller_overrides())
+        self.task_frame = TaskFrameCommand(
+            stiffness_mode=StiffnessMode(config.default_stiffness_mode),
+            controller_overrides=self._default_controller_overrides(),
+        )
 
         self.shm = SharedMemoryManager()
         self.shm.start()
@@ -81,7 +90,6 @@ class UR(Robot):
         # runtime vars
         self.logs = {}
         self.last_robot_action = TaskFrameCommand()
-        self._active_control_space: ControlSpace | None = None
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -233,12 +241,12 @@ class UR(Robot):
 
         action_space = self._space_from_action(action)
         if action_space is not None:
-            self._ensure_control_space(action_space)
             if self.task_frame.space != action_space:
                 self.task_frame.space = action_space
                 self.task_frame.origin = None if action_space == ControlSpace.JOINT else [0.0] * 6
                 if action_space == ControlSpace.JOINT:
                     self.task_frame.control_mode = [ControlMode.POS] * len(self.task_frame.target)
+                    self.task_frame.joint_names = list(self.joint_names)
 
         if self.task_frame.space == ControlSpace.JOINT:
             for i in range(len(self.joint_names)):
@@ -274,8 +282,6 @@ class UR(Robot):
 
     def set_task_frame(self, new_task_frame: TaskFrameCommand | TaskFrame):
         new_task_frame = self._task_frame_command_from_frame(new_task_frame)
-
-        self._ensure_control_space(new_task_frame.space)
         self.task_frame = new_task_frame
 
     def _task_frame_command_from_frame(self, frame: TaskFrameCommand | TaskFrame) -> TaskFrameCommand:
@@ -283,6 +289,10 @@ class UR(Robot):
             command = TaskFrameCommand(**asdict(frame))
         else:
             command = TaskFrameCommand(**asdict(frame))
+        if command.stiffness_mode is None:
+            command.stiffness_mode = StiffnessMode(self.config.default_stiffness_mode)
+        if command.space == ControlSpace.JOINT and command.joint_names is None:
+            command.joint_names = list(self.joint_names)
         command.controller_overrides = self._merged_controller_overrides(command.controller_overrides)
         return command
 
@@ -295,6 +305,8 @@ class UR(Robot):
             "compliance_reference_limit_enable": list(self.config.compliance_reference_limit_enable),
             "compliance_desired_wrench": list(self.config.compliance_desired_wrench),
             "compliance_adaptive_limit_min": list(self.config.compliance_adaptive_limit_min),
+            "servo_lookahead_time": float(self.config.servo_lookahead_time),
+            "servo_gain": float(self.config.servo_gain),
         }
 
     def _merged_controller_overrides(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
@@ -306,18 +318,6 @@ class UR(Robot):
             return merged
         merged.update(overrides)
         return merged
-
-    def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
-        """Lock the robot wrapper to its first commanded control space."""
-        resolved = ControlSpace(int(space))
-        if self._active_control_space is None:
-            self._active_control_space = resolved
-            return resolved
-        if resolved != self._active_control_space:
-            raise ValueError(
-                "UR robot does not support switching between task-space and joint-space control"
-            )
-        return resolved
 
     @staticmethod
     def _space_from_action(action: dict[str, Any]) -> ControlSpace | None:

@@ -14,5 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_gello import GelloConfig
+from .config_gello import GelloConfig, GelloURConfig, GelloViperXConfig, GellohaConfig
 from .gello import Gello

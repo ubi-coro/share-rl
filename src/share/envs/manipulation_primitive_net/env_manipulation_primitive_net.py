@@ -251,7 +251,10 @@ class ManipulationPrimitiveNet(gym.Env):
     @staticmethod
     def _default_target_pose_axes(primitive: Any) -> dict[str, list[int]]:
         default_axes: dict[str, list[int]] = {}
-        for name, frame in primitive.task_frame.items():
+        task_frame = getattr(primitive, "task_frame", None)
+        if not isinstance(task_frame, dict):
+            return default_axes
+        for name, frame in task_frame.items():
             axes = [
                 axis
                 for axis in range(len(frame.target))

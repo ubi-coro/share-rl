@@ -457,6 +457,17 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     setattr(_attr, fn.name, {name: getattr(_attr, fn.name) for name in robot_dict})
             setattr(self.processor, attr, _attr)
 
+        # Set up kinematics solvers early so validation can require them.
+        for name, robot in robot_dict.items():
+            if self.processor.kinematics.enable[name]:
+                self._kinematics_solver[name] = get_kinematics(
+                    robot_name=robot.name,
+                    robot_model=getattr(getattr(robot, "config", None), "model", None),
+                    urdf_path=self.processor.kinematics.urdf_path[name],
+                    target_frame_name=self.processor.kinematics.target_frame_name[name],
+                    joint_names=self.task_frame[name].joint_names,
+                )
+
         # checks per robot
         for name, frame in self.task_frame.items():
             if name not in robot_dict:
@@ -522,16 +533,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                         f"Gripper processing enabled for robot '{name}' but no gripper action feature found. "
                         "Expected an action key like '{GRIPPER_KEY}.pos'."
                     )
-
-        # Set up kinematics solver if inverse kinematics is configured
-        for name, robot in robot_dict.items():
-            if not is_task_frame_robot[name] and self.processor.kinematics.enable[name]:
-                self._kinematics_solver[name] = get_kinematics(
-                    robot_name=robot.name,
-                    urdf_path=self.processor.kinematics.urdf_path[name],
-                    target_frame_name=self.processor.kinematics.target_frame_name[name],
-                    joint_names=self.task_frame[name].joint_names,
-                )
 
     def infer_features(self, robot_dict, cameras):
         """Infer policy-visible feature specs from the configured pipelines.

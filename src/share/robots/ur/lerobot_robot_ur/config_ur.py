@@ -22,6 +22,7 @@ import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.robots import RobotConfig
+from share.envs.manipulation_primitive.task_frame import StiffnessMode
 
 @RobotConfig.register_subclass("ur")
 @dataclass
@@ -50,6 +51,9 @@ class URConfig(RobotConfig):
     shm_manager: Optional[SharedMemoryManager] = None
     ft_filter_cutoff_hz: Optional[float] = None  # Hz, EMA low-pass cutoff for f/t sensor
     force_mode_gain_scaling: float = 1.0
+    default_stiffness_mode: StiffnessMode = StiffnessMode.COMPLIANT
+    servo_lookahead_time: float = 0.1
+    servo_gain: float = 300.0
     kp: list[float] = field(default_factory=lambda: [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])
     kd: list[float] = field(default_factory=lambda: [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])
 
@@ -82,6 +86,10 @@ class URConfig(RobotConfig):
             raise ValueError("URConfig.compliance_adaptive_limit_enable must be a length-6 list.")
         if len(self.compliance_reference_limit_enable) != 6:
             raise ValueError("URConfig.compliance_reference_limit_enable must be a length-6 list.")
+        if not 0.03 <= float(self.servo_lookahead_time) <= 0.2:
+            raise ValueError("URConfig.servo_lookahead_time must be within [0.03, 0.2].")
+        if not 100.0 <= float(self.servo_gain) <= 2000.0:
+            raise ValueError("URConfig.servo_gain must be within [100, 2000].")
         if self.compliance_adaptive_limit_theta is None:
             if self.verbose:
                 logging.info(f"=== Compute parameters for exponential contact force limit scaling: ===")

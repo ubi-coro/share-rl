@@ -118,6 +118,9 @@ def compose_delta_pose(
             *[float(v) for v in euler_xyz_from_rotation(target_rot)],
         ]
 
+    if frame_name == "ee_current":
+        frame_name = "ee"
+
     if frame_name != "ee":
         raise ValueError(f"Unsupported delta frame '{frame_name}'.")
 

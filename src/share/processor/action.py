@@ -4,11 +4,11 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from lerobot.types import EnvTransition, TransitionKey
 from scipy.spatial.transform import Rotation
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY, GRIPPER_KEY
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
+from lerobot.processor import TransitionKey
 
 from share.envs.manipulation_primitive.task_frame import (
     ControlMode,
@@ -125,8 +125,8 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
             solver = self._require_solver(name)
             base_pose = self._integration_base_pose(name, frame, transition)
             pose_target = [base_pose[i] + deltas[i] for i in range(6)]
-            joint_target = solver.inverse_kinematics(pose_target)
             base_joint_state = self._integration_base_joint_state(name, frame, transition)
+            joint_target = solver.inverse_kinematics(base_joint_state, pose_target)
             encoded: dict[str, float] = {}
             for axis in frame.learnable_axis_indices:
                 joint_name = frame.action_key_for_axis(axis)
@@ -599,7 +599,11 @@ class ToJointActionProcessorStep(ProcessorStep):
                 raise ValueError(f"Missing kinematics solver for joint-only robot '{name}'")
 
             try:
-                ik_solution = solver.inverse_kinematics(bounded_target)
+                current_joint_state = self._current_joint_state(name, frame, transition)
+                if current_joint_state:
+                    ik_solution = solver.inverse_kinematics(current_joint_state, bounded_target)
+                else:
+                    ik_solution = solver.inverse_kinematics(bounded_target)
             except Exception as exc:  # pragma: no cover - exercised with mock solver in unit tests
                 raise ValueError(f"IK failed for '{name}': {exc}") from exc
 
@@ -661,6 +665,19 @@ class ToJointActionProcessorStep(ProcessorStep):
                 return obs_pose
 
         return list(frame.target)
+
+    @staticmethod
+    def _current_joint_state(name: str, frame: TaskFrame, transition: EnvTransition) -> dict[str, float]:
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if not isinstance(observation, dict):
+            return {}
+
+        joint_state: dict[str, float] = {}
+        for joint_name in frame.joint_names:
+            key = f"{name}.{joint_name}.pos"
+            if key in observation:
+                joint_state[joint_name] = float(observation[key])
+        return joint_state
 
     @staticmethod
     def _clamp_target(frame: TaskFrame, target: list[float]) -> list[float]:

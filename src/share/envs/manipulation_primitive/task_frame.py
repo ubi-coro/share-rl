@@ -29,6 +29,13 @@ class ControlMode(IntEnum):
     FORCE = 2
 
 
+class StiffnessMode(IntEnum):
+    """How strongly the low-level controller should track the commanded target."""
+
+    STIFF = 0
+    COMPLIANT = 1
+
+
 TASK_FRAME_AXIS_NAMES = ["x", "y", "z", "rx", "ry", "rz"]
 
 @dataclass(slots=True)
@@ -45,6 +52,7 @@ class TaskFrame:
     origin: list[float] | None = None
     min_pose: list[float] | None = None  # 6-vector: min xyz (m), min extrinsic XYZ Euler angles (rad)
     max_pose: list[float] | None = None  # 6-vector: max xyz (m), max extrinsic XYZ Euler angles (rad)
+    stiffness_mode: StiffnessMode | None = None
     controller_overrides: dict[str, Any] | None = None
     joint_names: list[str] | None = None
 
@@ -73,11 +81,11 @@ class TaskFrame:
                 self.origin = 6 * [0.0]
             if len(self.origin) != 6:
                 raise ValueError("origin must be a 6 vector (xyz + extrinsic XYZ Euler roll/pitch/yaw in rad)")
-        elif self.space == ControlSpace.TASK:
+        elif self.space == ControlSpace.JOINT:
             if self.origin is not None:
                 raise ValueError("origin must be None when space == JOINT")
             if self.joint_names is None:
-                self.joint_names = [f"joint_{axis}" for axis in range(width)]
+                self.joint_names = [f"joint_{axis + 1}" for axis in range(width)]
             if len(self.joint_names) != width:
                 raise ValueError("joint_names must have the same length as target")
         
@@ -207,7 +215,9 @@ class TaskFrame:
             "control_mode": [int(control_mode) for control_mode in self.control_mode],
             "min_target": self.min_pose,
             "max_target": self.max_pose,
+            "stiffness_mode": None if self.stiffness_mode is None else int(self.stiffness_mode),
             "controller_overrides": copy.deepcopy(self.controller_overrides),
+            "joint_names": None if self.joint_names is None else list(self.joint_names),
         }
 
     @classmethod
@@ -223,7 +233,13 @@ class TaskFrame:
             control_mode=[ControlMode(item) for item in raw["control_mode"]],
             min_pose=list(min_target) if min_target is not None else None,
             max_pose=list(max_target) if max_target is not None else None,
+            stiffness_mode=(
+                StiffnessMode(raw["stiffness_mode"])
+                if raw.get("stiffness_mode") is not None
+                else None
+            ),
             controller_overrides=copy.deepcopy(raw.get("controller_overrides")),
+            joint_names=list(raw["joint_names"]) if raw.get("joint_names") is not None else None,
         )
 
     @property

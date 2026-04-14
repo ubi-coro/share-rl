@@ -17,6 +17,7 @@ dependencies = [
   "lerobot>=0.5",
   "scipy>=1.11.0,<2.0.0",
   "ur_rtde==1.6.2",
+  "ur_ikfast @ git+https://github.com/cambel/ur_ikfast.git",
 ]
 
 [tool.setuptools.packages.find]

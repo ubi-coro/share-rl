@@ -10,7 +10,7 @@ Real example
   - a static home primitive
   - a world-frame move-delta approach
   - an adaptive inspection primitive
-  - a scripted open-loop retract
+  - a scripted open-loop retract authored through ``trajectory=OpenLoopTrajectorySpec(...)``
 
 Mock examples
 -------------
@@ -28,6 +28,7 @@ What these examples are meant to teach
 --------------------------------------
 
 - how to wire transitions between static, move-delta, and open-loop primitives
-- how task-frame targets can be specified entirely from config
+- how dynamic primitives resolve entry-time targets from processed observation
+- how open-loop primitives keep final target info while sampling per-step setpoints from config
 - how multi-robot primitive dictionaries look in practice
 - how to build mock demos that are illustrative without depending on hardware

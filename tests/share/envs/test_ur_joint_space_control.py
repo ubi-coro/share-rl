@@ -29,6 +29,7 @@ task_frame_module = _load_task_frame_module()
 ControlMode = task_frame_module.ControlMode
 ControlSpace = task_frame_module.ControlSpace
 PolicyMode = task_frame_module.PolicyMode
+StiffnessMode = task_frame_module.StiffnessMode
 TaskFrame = task_frame_module.TaskFrame
 
 
@@ -140,6 +141,21 @@ class _ReadyController:
         self.commands.append(cmd)
 
 
+def _robot_config():
+    return types.SimpleNamespace(
+        kp=[2500.0] * 3 + [150.0] * 3,
+        kd=[80.0] * 3 + [8.0] * 3,
+        wrench_limits=[30.0] * 6,
+        compliance_adaptive_limit_enable=[False] * 6,
+        compliance_reference_limit_enable=[False] * 6,
+        compliance_desired_wrench=[5.0] * 6,
+        compliance_adaptive_limit_min=[0.1] * 6,
+        default_stiffness_mode=StiffnessMode.COMPLIANT,
+        servo_lookahead_time=0.1,
+        servo_gain=300.0,
+    )
+
+
 def test_task_frame_command_joint_space_maps_joint_position_keys():
     controller_module = _load_controller_module()
     command = controller_module.TaskFrameCommand(
@@ -172,10 +188,25 @@ def test_task_frame_command_converts_origin_rpy_to_internal_rotvec():
     np.testing.assert_allclose(queued["origin"][3:6], expected_rotvec)
 
 
-def test_controller_rejects_task_to_joint_switches():
+def test_task_frame_round_trips_stiffness_mode_and_joint_names():
+    frame = TaskFrame(
+        space=ControlSpace.JOINT,
+        target=[0.0] * 6,
+        control_mode=[ControlMode.POS] * 6,
+        policy_mode=[PolicyMode.ABSOLUTE] * 6,
+        stiffness_mode=StiffnessMode.STIFF,
+        joint_names=[f"joint_{i + 1}" for i in range(6)],
+    )
+
+    decoded = TaskFrame.from_dict(frame.to_dict())
+    assert decoded.stiffness_mode == StiffnessMode.STIFF
+    assert decoded.joint_names == [f"joint_{i + 1}" for i in range(6)]
+
+
+def test_controller_allows_task_to_joint_switches():
     controller_module = _load_controller_module()
     controller = object.__new__(controller_module.RTDETaskFrameController)
-    controller._active_space = None
+    controller.config = types.SimpleNamespace(default_stiffness_mode=StiffnessMode.COMPLIANT)
     controller._last_cmd = controller_module.TaskFrameCommand()
     controller.robot_cmd_queue = _Queue()
 
@@ -186,12 +217,30 @@ def test_controller_rejects_task_to_joint_switches():
             policy_mode=[PolicyMode.ABSOLUTE] * 6,
         )
     )
+    controller.send_cmd(
+        controller_module.TaskFrameCommand(
+            space=ControlSpace.JOINT,
+            control_mode=[ControlMode.POS] * 6,
+            policy_mode=[PolicyMode.ABSOLUTE] * 6,
+        )
+    )
 
-    with pytest.raises(ValueError, match="switching between task-space and joint-space"):
+    assert len(controller.robot_cmd_queue.items) == 2
+
+
+def test_controller_rejects_stiff_task_space_wrench_axes():
+    controller_module = _load_controller_module()
+    controller = object.__new__(controller_module.RTDETaskFrameController)
+    controller.config = types.SimpleNamespace(default_stiffness_mode=StiffnessMode.COMPLIANT)
+    controller._last_cmd = controller_module.TaskFrameCommand()
+    controller.robot_cmd_queue = _Queue()
+
+    with pytest.raises(ValueError, match="stiff task-space control does not support WRENCH"):
         controller.send_cmd(
             controller_module.TaskFrameCommand(
-                space=ControlSpace.JOINT,
-                control_mode=[ControlMode.POS] * 6,
+                space=ControlSpace.TASK,
+                stiffness_mode=StiffnessMode.STIFF,
+                control_mode=[ControlMode.WRENCH] + [ControlMode.POS] * 5,
                 policy_mode=[PolicyMode.ABSOLUTE] * 6,
             )
         )
@@ -222,17 +271,47 @@ def test_controller_joint_impedance_uses_direct_torque_interface():
     assert rtde_c.calls == [(torque.tolist(), True)]
 
 
+def test_controller_servo_helpers_use_rtde_servo_interfaces():
+    controller_module = _load_controller_module()
+    controller = object.__new__(controller_module.RTDETaskFrameController)
+    controller.config = types.SimpleNamespace(frequency=500.0)
+    controller.servo_lookahead_time = 0.08
+    controller.servo_gain = 450.0
+
+    class ServoOnly:
+        def __init__(self):
+            self.task_calls = []
+            self.joint_calls = []
+
+        def servoL(self, *args):
+            self.task_calls.append(args)
+
+        def servoJ(self, *args):
+            self.joint_calls.append(args)
+
+    rtde_c = ServoOnly()
+    controller._send_task_servo(rtde_c, np.arange(6, dtype=np.float64))
+    controller._send_joint_servo(rtde_c, np.arange(6, dtype=np.float64))
+
+    assert rtde_c.task_calls[0][0] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    assert rtde_c.task_calls[0][-2:] == (0.08, 450.0)
+    assert rtde_c.joint_calls[0][0] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    assert rtde_c.joint_calls[0][-2:] == (0.08, 450.0)
+
+
 def test_controller_reexpresses_virtual_target_when_task_frame_origin_changes():
     controller_module = _load_controller_module()
     controller = object.__new__(controller_module.RTDETaskFrameController)
-    controller._active_space = None
+    controller.config = types.SimpleNamespace(default_stiffness_mode=StiffnessMode.COMPLIANT, frequency=500.0)
     controller.origin = np.zeros(6, dtype=np.float64)
     controller.control_mode = np.array([int(ControlMode.POS)] * 6, dtype=np.int64)
     controller.delta_mode = np.array([int(PolicyMode.ABSOLUTE)] * 6, dtype=np.int64)
     controller.force_on = True
+    controller.active_stiffness_mode = StiffnessMode.COMPLIANT
     controller._resolve_compliance_settings = lambda **kwargs: None
     controller.read_current_state = lambda rtde_r: {"ActualTCPPose": np.zeros(6, dtype=np.float64)}
     controller._enter_task_force_mode = lambda rtde_c: None
+    controller._stop_active_mode = lambda rtde_c, active_mode: None
 
     class _Receive:
         @staticmethod
@@ -247,45 +326,36 @@ def test_controller_reexpresses_virtual_target_when_task_frame_origin_changes():
     )
     msgs = _batched_queue_dict(command.to_queue_dict())
 
-    keep_running, active_space, x_cmd, _ = controller._apply_pending_commands(
+    keep_running, active_mode, x_cmd, _ = controller._apply_pending_commands(
         msgs=msgs,
         n_cmd=1,
         rtde_c=object(),
         rtde_r=_Receive(),
-        active_space=None,
+        active_mode=controller_module.ActiveCommandMode.TASK_COMPLIANT,
         x_cmd=np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
         q_cmd=np.zeros(6, dtype=np.float64),
     )
 
     assert keep_running is True
-    assert active_space == ControlSpace.TASK
+    assert active_mode == controller_module.ActiveCommandMode.TASK_COMPLIANT
     np.testing.assert_allclose(x_cmd[:3], [0.0, -1.0, 0.0], atol=1e-6)
     np.testing.assert_allclose(x_cmd[3:6], [0.0, 0.0, -np.pi / 2.0], atol=1e-6)
 
 
-def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
+def test_ur_wrapper_switches_between_joint_and_task_space():
     controller_module = _load_controller_module()
     ur_module = _load_ur_module(controller_module)
     robot = object.__new__(ur_module.URV2)
     robot.controller = _ReadyController()
     robot.gripper = None
     robot.cameras = {}
-    robot.config = types.SimpleNamespace(
-        kp=[2500.0] * 3 + [150.0] * 3,
-        kd=[80.0] * 3 + [8.0] * 3,
-        wrench_limits=[30.0] * 6,
-        compliance_adaptive_limit_enable=[False] * 6,
-        compliance_reference_limit_enable=[False] * 6,
-        compliance_desired_wrench=[5.0] * 6,
-        compliance_adaptive_limit_min=[0.1] * 6,
-    )
+    robot.config = _robot_config()
     robot.task_frame = controller_module.TaskFrameCommand(
         space=ControlSpace.JOINT,
         target=[0.0] * 6,
         control_mode=[ControlMode.POS] * 6,
         policy_mode=[PolicyMode.RELATIVE] * 6,
     )
-    robot._active_control_space = None
 
     robot.set_task_frame(robot.task_frame)
     robot.send_action({"joint_1.pos": 0.1, "joint_2.pos": -0.2})
@@ -294,18 +364,20 @@ def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
     assert sent.space == ControlSpace.JOINT
     assert sent.target[:2] == [0.1, -0.2]
 
-    with pytest.raises(ValueError, match="switching between task-space and joint-space"):
-        robot.send_action({"x.ee_pos": 0.05})
+    robot.send_action({"x.ee_pos": 0.05})
+    sent = robot.controller.commands[-1]
+    assert sent.space == ControlSpace.TASK
+    assert sent.target[0] == 0.05
 
-    with pytest.raises(ValueError, match="switching between task-space and joint-space"):
-        robot.set_task_frame(
-            TaskFrame(
-                space=ControlSpace.TASK,
-                target=[0.0] * 6,
-                control_mode=[ControlMode.POS] * 6,
-                policy_mode=[PolicyMode.ABSOLUTE] * 6,
-            )
+    robot.set_task_frame(
+        TaskFrame(
+            space=ControlSpace.TASK,
+            target=[0.0] * 6,
+            control_mode=[ControlMode.POS] * 6,
+            policy_mode=[PolicyMode.ABSOLUTE] * 6,
         )
+    )
+    assert robot.task_frame.space == ControlSpace.TASK
 
 
 def test_ur_wrapper_applies_task_frame_controller_overrides():
@@ -315,22 +387,14 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     robot.controller = _ReadyController()
     robot.gripper = None
     robot.cameras = {}
-    robot.config = types.SimpleNamespace(
-        kp=[2500.0] * 3 + [150.0] * 3,
-        kd=[80.0] * 3 + [8.0] * 3,
-        wrench_limits=[30.0] * 6,
-        compliance_adaptive_limit_enable=[False] * 6,
-        compliance_reference_limit_enable=[False] * 6,
-        compliance_desired_wrench=[5.0] * 6,
-        compliance_adaptive_limit_min=[0.1] * 6,
-    )
+    robot.config = _robot_config()
     robot.task_frame = controller_module.TaskFrameCommand()
-    robot._active_control_space = None
 
     robot.set_task_frame(
         TaskFrame(
             target=[0.0] * 6,
             control_mode=[ControlMode.POS] * 6,
+            stiffness_mode=StiffnessMode.STIFF,
             controller_overrides={
                 "kp": [11.0] * 6,
                 "kd": [4.0] * 6,
@@ -341,6 +405,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
                 "compliance_reference_limit_enable": [True] * 6,
                 "compliance_desired_wrench": [3.0] * 6,
                 "compliance_adaptive_limit_min": [0.2] * 6,
+                "servo_lookahead_time": 0.12,
+                "servo_gain": 350.0,
             },
         )
     )
@@ -354,6 +420,9 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     assert robot.task_frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
     assert robot.task_frame.controller_overrides["compliance_desired_wrench"] == [3.0] * 6
     assert robot.task_frame.controller_overrides["compliance_adaptive_limit_min"] == [0.2] * 6
+    assert robot.task_frame.controller_overrides["servo_lookahead_time"] == 0.12
+    assert robot.task_frame.controller_overrides["servo_gain"] == 350.0
+    assert robot.task_frame.stiffness_mode == StiffnessMode.STIFF
 
     queue_dict = robot.task_frame.to_queue_dict()
     np.testing.assert_allclose(queue_dict["kp"], [11.0] * 6)
@@ -365,6 +434,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     np.testing.assert_array_equal(queue_dict["compliance_reference_limit_enable"], [True] * 6)
     np.testing.assert_allclose(queue_dict["compliance_desired_wrench"], [3.0] * 6)
     np.testing.assert_allclose(queue_dict["compliance_adaptive_limit_min"], [0.2] * 6)
+    np.testing.assert_allclose(queue_dict["servo_lookahead_time"], 0.12)
+    np.testing.assert_allclose(queue_dict["servo_gain"], 350.0)
 
     robot.set_task_frame(
         TaskFrame(
@@ -377,6 +448,7 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     assert robot.task_frame.controller_overrides["kd"] == [4.0] * 6
     assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
     assert robot.task_frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
+    assert robot.task_frame.stiffness_mode == StiffnessMode.COMPLIANT
 
 
 def test_ur_wrapper_rejects_unknown_task_frame_controller_override():
@@ -386,9 +458,8 @@ def test_ur_wrapper_rejects_unknown_task_frame_controller_override():
     robot.controller = _ReadyController()
     robot.gripper = None
     robot.cameras = {}
-    robot.config = types.SimpleNamespace()
+    robot.config = _robot_config()
     robot.task_frame = controller_module.TaskFrameCommand()
-    robot._active_control_space = None
 
     with pytest.raises(ValueError, match="Unsupported UR task-frame controller overrides"):
         robot.set_task_frame(

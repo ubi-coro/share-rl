@@ -315,7 +315,11 @@ def _get_or_create_mock_rtde_state(hostname: str, frequency: float | None = None
             state = {
                 "pose": np.zeros(6, dtype=np.float64),
                 "vel": np.zeros(6, dtype=np.float64),
+                "q": np.zeros(6, dtype=np.float64),
+                "qd": np.zeros(6, dtype=np.float64),
                 "commanded_wrench": np.zeros(6, dtype=np.float64),
+                "commanded_torque": np.zeros(6, dtype=np.float64),
+                "joint_target": np.zeros(6, dtype=np.float64),
                 "measured_wrench": np.zeros(6, dtype=np.float64),
                 "ft_bias": np.zeros(6, dtype=np.float64),
                 "task_frame": np.zeros(6, dtype=np.float64),
@@ -334,6 +338,11 @@ def _get_or_create_mock_rtde_state(hostname: str, frequency: float | None = None
         elif frequency is not None:
             state["frequency"] = float(frequency)
         return state
+
+
+def _sync_mock_pose_from_joints(state: dict) -> None:
+    state["pose"][:3] = 0.01 * state["q"][:3]
+    state["pose"][3:6] = 0.01 * state["q"][3:6]
 
 
 def _advance_mock_rtde_state(state: dict) -> None:
@@ -365,6 +374,17 @@ def _advance_mock_rtde_state(state: dict) -> None:
         state["pose"][3:6] = (
             R.from_rotvec(state["vel"][3:6] * dt) * R.from_rotvec(state["pose"][3:6])
         ).as_rotvec()
+
+        if state["mode"] == "joint_servo":
+            q_error = state["joint_target"] - state["q"]
+            state["qd"] = np.clip(12.0 * q_error, -2.0, 2.0)
+            state["q"] += state["qd"] * dt
+            _sync_mock_pose_from_joints(state)
+        elif state["mode"] == "joint_torque":
+            joint_acc = 0.25 * state["commanded_torque"] - 0.8 * state["qd"]
+            state["qd"] += joint_acc * dt
+            state["q"] += state["qd"] * dt
+            _sync_mock_pose_from_joints(state)
 
         alpha = np.clip(12.0 * dt, 0.0, 1.0)
         state["measured_wrench"] += alpha * (applied_wrench - state["measured_wrench"])
@@ -413,12 +433,15 @@ class MockRTDEControlInterface:
         _advance_mock_rtde_state(self._state)
         with self._state["lock"]:
             joints = np.asarray(joints, dtype=np.float64)
+            self._state["q"] = joints.copy()
+            self._state["qd"][:] = 0.0
             self._state["pose"][3:6] = 0.0
             self._state["vel"][:] = 0.0
             self._state["commanded_wrench"][:] = 0.0
+            self._state["commanded_torque"][:] = 0.0
             self._state["measured_wrench"][:] = 0.0
             self._state["mode"] = "idle"
-            self._state["pose"][:3] = 0.01 * joints[:3]
+            _sync_mock_pose_from_joints(self._state)
         time.sleep(0.02)
         return True
 
@@ -428,8 +451,19 @@ class MockRTDEControlInterface:
             self._state["pose"] = np.asarray(pose, dtype=np.float64)
             self._state["vel"][:] = 0.0
             self._state["commanded_wrench"][:] = 0.0
+            self._state["commanded_torque"][:] = 0.0
             self._state["measured_wrench"][:] = 0.0
-            self._state["mode"] = "idle"
+            self._state["mode"] = "task_servo"
+        return True
+
+    def servoJ(self, joints, speed, acceleration, dt, lookahead_time, gain):
+        _advance_mock_rtde_state(self._state)
+        with self._state["lock"]:
+            self._state["joint_target"] = np.asarray(joints, dtype=np.float64)
+            self._state["commanded_wrench"][:] = 0.0
+            self._state["commanded_torque"][:] = 0.0
+            self._state["measured_wrench"][:] = 0.0
+            self._state["mode"] = "joint_servo"
         return True
 
     def speedL(self, speed6, acc, dt):
@@ -475,6 +509,18 @@ class MockRTDEControlInterface:
             self._state["mode"] = "force"
         return True
 
+    def directTorque(self, torque_cmd, friction_comp):
+        _advance_mock_rtde_state(self._state)
+        with self._state["lock"]:
+            self._state["commanded_torque"] = np.asarray(torque_cmd, dtype=np.float64)
+            self._state["commanded_wrench"][:] = 0.0
+            self._state["measured_wrench"][:] = 0.0
+            self._state["mode"] = "joint_torque"
+        return True
+
+    def torqueCommand(self, torque_cmd, friction_comp):
+        return self.directTorque(torque_cmd, friction_comp)
+
     def zeroFtSensor(self):
         _advance_mock_rtde_state(self._state)
         with self._state["lock"]:
@@ -485,6 +531,7 @@ class MockRTDEControlInterface:
         with self._state["lock"]:
             self._state["mode"] = "idle"
             self._state["commanded_wrench"][:] = 0.0
+            self._state["commanded_torque"][:] = 0.0
 
     def speedStop(self):
         with self._state["lock"]:
@@ -493,6 +540,8 @@ class MockRTDEControlInterface:
     def servoStop(self):
         with self._state["lock"]:
             self._state["vel"][:] = 0.0
+            self._state["qd"][:] = 0.0
+            self._state["mode"] = "idle"
 
     def stopScript(self):
         self.forceModeStop()
@@ -524,10 +573,14 @@ class MockRTDEReceiveInterface:
             return (self._state["measured_wrench"] - self._state["ft_bias"]).copy()
 
     def getActualQ(self):
-        return np.zeros(6, dtype=np.float64)
+        _advance_mock_rtde_state(self._state)
+        with self._state["lock"]:
+            return self._state["q"].copy()
 
     def getActualQd(self):
-        return np.zeros(6, dtype=np.float64)
+        _advance_mock_rtde_state(self._state)
+        with self._state["lock"]:
+            return self._state["qd"].copy()
 
     def disconnect(self):
         pass

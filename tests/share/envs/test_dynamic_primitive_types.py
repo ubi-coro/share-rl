@@ -284,9 +284,11 @@ def test_move_delta_only_resolves_fixed_pos_axes_from_entry_delta():
         ),
     )
 
-    assert env.target_pose["arm"] == pytest.approx(
-        [1.25, 5.0, 7.0, expected_orientation[0] + 0.05, expected_orientation[1] + 0.1, expected_orientation[2] - 0.15]
-    )
+    expected_rotation = (
+        Rotation.from_euler("xyz", [0.05, 0.1, -0.15], degrees=False)
+        * Rotation.from_euler("xyz", expected_orientation, degrees=False)
+    ).as_euler("xyz", degrees=False)
+    assert env.target_pose["arm"] == pytest.approx([1.25, 5.0, 7.0, *expected_rotation])
 
 
 def test_move_delta_resolves_partial_fixed_rotation_axes_independently():

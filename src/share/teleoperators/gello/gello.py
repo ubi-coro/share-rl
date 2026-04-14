@@ -15,19 +15,19 @@
 # limitations under the License.
 
 import logging
+import math
 import time
 
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors import MotorCalibration
 from lerobot.motors.dynamixel import (
     DriveMode,
     DynamixelMotorsBus,
     OperatingMode,
 )
+from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-from ..teleoperator import Teleoperator
-from .config_gello import GelloConfig
-from ...robots.viperx.viperx import gripper_to_linear
+from .config_gello import GelloConfig, GELLO_OUTPUTS_ARE_NATIVE_RADIANS
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ class Gello(Teleoperator):
     def __init__(self, config: GelloConfig):
         super().__init__(config)
         self.config = config
+        self._output_motor_names = self.config.output_motor_names()
         self.bus = DynamixelMotorsBus(
             port=self.config.port,
             motors=self.config.motors
@@ -50,7 +51,7 @@ class Gello(Teleoperator):
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {f"{motor}.pos": float for motor in self.bus.motors}
+        return {f"{motor}.pos": float for motor in self._output_motor_names.values()}
 
     @property
     def feedback_features(self) -> dict[str, type]:
@@ -128,8 +129,12 @@ class Gello(Teleoperator):
 
         start = time.perf_counter()
         action = self.bus.sync_read("Present_Position")
-        action = {f"{motor}.pos": val for motor, val in action.items()}
-        action["finger.pos"] = action.pop("gripper.pos")
+        if not GELLO_OUTPUTS_ARE_NATIVE_RADIANS:
+            action = {motor: math.radians(value) for motor, value in action.items()}
+        action = {
+            f"{self._output_motor_names[motor]}.pos": value
+            for motor, value in action.items()
+        }
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action

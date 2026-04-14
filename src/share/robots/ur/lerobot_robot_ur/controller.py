@@ -12,7 +12,13 @@ from typing import Any, ClassVar
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
+from share.envs.manipulation_primitive.task_frame import (
+    ControlMode,
+    ControlSpace,
+    PolicyMode,
+    StiffnessMode,
+    TaskFrame,
+)
 from share.utils.shared_memory import SharedMemoryRingBuffer, SharedMemoryQueue, Empty
 
 
@@ -27,6 +33,13 @@ class Command(enum.IntEnum):
     OPEN = 2
     CLOSE = 3
     ZERO_FT = 4
+
+
+class ActiveCommandMode(enum.IntEnum):
+    TASK_COMPLIANT = 0
+    JOINT_COMPLIANT = 1
+    TASK_STIFF = 2
+    JOINT_STIFF = 3
 
 
 @dataclass
@@ -48,6 +61,8 @@ class TaskFrameCommand(TaskFrame):
         "compliance_adaptive_limit_enable",
         "compliance_desired_wrench",
         "compliance_adaptive_limit_min",
+        "servo_lookahead_time",
+        "servo_gain",
     }
 
     @property
@@ -69,12 +84,14 @@ class TaskFrameCommand(TaskFrame):
         try:
             d["cmd"] = self.cmd.value
             d.pop("policy_mode", None)
+            d.pop("joint_names", None)
             d["space"] = np.asarray(self.space).astype(np.int8)
             d["control_mode"] = np.array([int(m) if m is not None else -1 for m in self.control_mode])
             d["policy_mode"] = np.array([int(m) if m is not None else -1 for m in self.policy_mode])
             d["delta_mode"] = np.array([int(m) if m is not None else -1 for m in self.delta_mode])
+            d["stiffness_mode"] = -1 if self.stiffness_mode is None else int(self.stiffness_mode)
             d["target"] = np.asarray(self.target).astype(np.float64)
-            d["origin"] = np.asarray(self.origin).astype(np.float64)
+            d["origin"] = np.zeros(6, dtype=np.float64) if self.origin is None else np.asarray(self.origin).astype(np.float64)
             d["origin"][3:6] = R.from_euler("xyz", d["origin"][3:6], degrees=False).as_rotvec()
             d["max_pose"] = np.asarray(raw_overrides.get("max_pose", self.max_pose)).astype(np.float64)
             d["min_pose"] = np.asarray(raw_overrides.get("min_pose", self.min_pose)).astype(np.float64)
@@ -85,6 +102,8 @@ class TaskFrameCommand(TaskFrame):
             d["compliance_reference_limit_enable"] = np.asarray(raw_overrides.get("compliance_reference_limit_enable", [False] * 6)).astype(np.bool_)
             d["compliance_desired_wrench"] = np.asarray(raw_overrides.get("compliance_desired_wrench", [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])).astype(np.float64)
             d["compliance_adaptive_limit_min"] = np.asarray(raw_overrides.get("compliance_adaptive_limit_min", [0.1] * 6)).astype(np.float64)
+            d["servo_lookahead_time"] = np.asarray(raw_overrides.get("servo_lookahead_time", 0.1)).astype(np.float64)
+            d["servo_gain"] = np.asarray(raw_overrides.get("servo_gain", 300.0)).astype(np.float64)
         except Exception as e:
             raise ValueError(f"TaskFrameCommand seems to be missing fields: {e}")
         return d
@@ -171,6 +190,7 @@ class RTDETaskFrameController(mp.Process):
         self.config = config
         self.ready_event = mp.Event()  # “ready” event to signal when the loop has started successfully
         self.force_on = False  # are we currently in forceMode?
+        self.active_stiffness_mode = StiffnessMode(self.config.default_stiffness_mode)
         self._receive_keys = [
             'ActualTCPPose',
             'ActualTCPSpeed',
@@ -188,7 +208,7 @@ class RTDETaskFrameController(mp.Process):
 
         # 2) Build the ring buffer for streaming back pose/vel/force
         if self.config.mock:
-            raise ValueError("UR does not support mocks")
+            from share.utils.mock_utils import MockRTDEReceiveInterface as RTDEReceiveInterface
         else:
             from rtde_receive import RTDEReceiveInterface
         rtde_r = RTDEReceiveInterface(hostname=config.robot_ip)
@@ -209,6 +229,7 @@ class RTDETaskFrameController(mp.Process):
 
         # 3) Controller state: last TaskFrameCommand, task‐frame state, gains, etc.
         self._last_cmd = TaskFrameCommand(
+            stiffness_mode=StiffnessMode(self.config.default_stiffness_mode),
             controller_overrides={
                 "kp": np.array(self.config.kp, dtype=np.float64),
                 "kd": np.array(self.config.kd, dtype=np.float64),
@@ -217,6 +238,8 @@ class RTDETaskFrameController(mp.Process):
                 "compliance_reference_limit_enable": np.array(self.config.compliance_reference_limit_enable, dtype=bool),
                 "compliance_desired_wrench": np.array(self.config.compliance_desired_wrench, dtype=np.float64),
                 "compliance_adaptive_limit_min": np.array(self.config.compliance_adaptive_limit_min, dtype=np.float64),
+                "servo_lookahead_time": float(self.config.servo_lookahead_time),
+                "servo_gain": float(self.config.servo_gain),
             },
         )
         self.origin = self._last_cmd.origin
@@ -226,7 +249,6 @@ class RTDETaskFrameController(mp.Process):
         self.max_pose = self._last_cmd.max_pose
         self.min_pose = self._last_cmd.min_pose
         self._resolve_compliance_settings(**self._last_cmd.controller_overrides)
-        self._active_space: ControlSpace | None = None
 
     # =========== launch & shutdown =============
     def connect(self):
@@ -293,7 +315,11 @@ class RTDETaskFrameController(mp.Process):
         Args:
             cmd (TaskFrameCommand): Partial or full command to apply.
         """
-        self._ensure_control_space(cmd.space)
+        self._validate_command_modes(
+            space=ControlSpace(int(cmd.space)),
+            stiffness_mode=self._resolve_stiffness_mode(cmd.stiffness_mode),
+            control_mode=np.asarray(cmd.control_mode),
+        )
         self._last_cmd = cmd
         self.robot_cmd_queue.put(cmd.to_queue_dict())
 
@@ -301,17 +327,56 @@ class RTDETaskFrameController(mp.Process):
     def task_frame(self) -> TaskFrameCommand:
         return replace(self._last_cmd)
 
-    def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
-        """Lock the controller to its first commanded control space."""
-        resolved = ControlSpace(int(space))
-        if self._active_space is None:
-            self._active_space = resolved
-            return resolved
-        if resolved != self._active_space:
-            raise ValueError(
-                "UR controller does not support switching between task-space and joint-space control"
-            )
-        return resolved
+    def _resolve_stiffness_mode(self, value: StiffnessMode | int | None) -> StiffnessMode:
+        if value is None or int(value) < 0:
+            return StiffnessMode(self.config.default_stiffness_mode)
+        return StiffnessMode(int(value))
+
+    @staticmethod
+    def _command_mode_for(space: ControlSpace, stiffness_mode: StiffnessMode) -> ActiveCommandMode:
+        if space == ControlSpace.TASK and stiffness_mode == StiffnessMode.COMPLIANT:
+            return ActiveCommandMode.TASK_COMPLIANT
+        if space == ControlSpace.JOINT and stiffness_mode == StiffnessMode.COMPLIANT:
+            return ActiveCommandMode.JOINT_COMPLIANT
+        if space == ControlSpace.TASK and stiffness_mode == StiffnessMode.STIFF:
+            return ActiveCommandMode.TASK_STIFF
+        return ActiveCommandMode.JOINT_STIFF
+
+    @staticmethod
+    def _validate_command_modes(
+        *,
+        space: ControlSpace,
+        stiffness_mode: StiffnessMode,
+        control_mode: np.ndarray,
+    ) -> None:
+        if space == ControlSpace.JOINT and np.any(control_mode != ControlMode.POS):
+            raise ValueError("UR joint-space control only supports POS axes")
+        if (
+            space == ControlSpace.TASK
+            and stiffness_mode == StiffnessMode.STIFF
+            and np.any(control_mode == ControlMode.WRENCH)
+        ):
+            raise ValueError("UR stiff task-space control does not support WRENCH axes")
+
+    def _stop_active_mode(self, rtde_c, active_mode: ActiveCommandMode | None) -> None:
+        if active_mode is None:
+            return
+        if active_mode == ActiveCommandMode.TASK_COMPLIANT:
+            if hasattr(rtde_c, "forceModeStop"):
+                rtde_c.forceModeStop()
+            self.force_on = False
+            return
+        if active_mode in {ActiveCommandMode.TASK_STIFF, ActiveCommandMode.JOINT_STIFF}:
+            if hasattr(rtde_c, "servoStop"):
+                rtde_c.servoStop()
+            elif hasattr(rtde_c, "speedStop"):
+                rtde_c.speedStop()
+            return
+        if active_mode == ActiveCommandMode.JOINT_COMPLIANT:
+            try:
+                self._send_joint_torque(rtde_c, np.zeros(6, dtype=np.float64))
+            except Exception:
+                pass
 
     def _compute_joint_torque(
         self,
@@ -334,6 +399,18 @@ class RTDETaskFrameController(mp.Process):
             rtde_c.torqueCommand(torque, True)
         else:
             raise AttributeError("RTDEControlInterface does not expose directTorque/torqueCommand")
+
+    def _send_joint_servo(self, rtde_c, q_cmd: np.ndarray) -> None:
+        if not hasattr(rtde_c, "servoJ"):
+            raise AttributeError("RTDEControlInterface does not expose servoJ")
+        rtde_c.servoJ(
+            np.asarray(q_cmd, dtype=np.float64).tolist(),
+            0.5,
+            0.5,
+            1.0 / self.config.frequency,
+            float(self.servo_lookahead_time),
+            float(self.servo_gain),
+        )
 
     def _compute_task_wrench(
         self,
@@ -385,6 +462,18 @@ class RTDETaskFrameController(mp.Process):
         )
         self.force_on = True
 
+    def _send_task_servo(self, rtde_c, pose_cmd: np.ndarray) -> None:
+        if not hasattr(rtde_c, "servoL"):
+            raise AttributeError("RTDEControlInterface does not expose servoL")
+        rtde_c.servoL(
+            np.asarray(pose_cmd, dtype=np.float64).tolist(),
+            0.5,
+            0.5,
+            1.0 / self.config.frequency,
+            float(self.servo_lookahead_time),
+            float(self.servo_gain),
+        )
+
     def _enter_task_force_mode(self, rtde_c) -> None:
         """Start forceMode once for task-space control."""
         rtde_c.forceModeSetGainScaling(self.config.force_mode_gain_scaling)
@@ -420,14 +509,14 @@ class RTDETaskFrameController(mp.Process):
         n_cmd: int,
         rtde_c,
         rtde_r,
-        active_space: ControlSpace | None,
+        active_mode: ActiveCommandMode | None,
         x_cmd: np.ndarray,
         q_cmd: np.ndarray,
-    ) -> tuple[bool, ControlSpace | None, np.ndarray, np.ndarray]:
+    ) -> tuple[bool, ActiveCommandMode | None, np.ndarray, np.ndarray]:
         """Apply queued commands and update controller state and virtual targets."""
         keep_running = True
         if msgs is None:
-            return keep_running, active_space, x_cmd, q_cmd
+            return keep_running, active_mode, x_cmd, q_cmd
 
         for i in range(n_cmd):
             single = {k: msgs[k][i] for k in msgs}
@@ -444,17 +533,32 @@ class RTDETaskFrameController(mp.Process):
                 keep_running = False
                 break
 
-            new_space = self._ensure_control_space(single["space"])
-            if active_space is None:
-                active_space = new_space
-            elif new_space != active_space:
-                raise ValueError(
-                    "UR controller does not support switching between task-space and joint-space control"
-                )
-
             previous_origin = np.asarray(self.origin, dtype=np.float64).copy()
+            new_space = ControlSpace(int(single["space"]))
+            new_stiffness_mode = self._resolve_stiffness_mode(int(single["stiffness_mode"]))
+            new_control_mode = single["control_mode"]
+            self._validate_command_modes(
+                space=new_space,
+                stiffness_mode=new_stiffness_mode,
+                control_mode=new_control_mode,
+            )
+            new_mode = self._command_mode_for(new_space, new_stiffness_mode)
+
+            pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
+            q_now = np.array(rtde_r.getActualQ(), dtype=np.float64)
+
+            previous_mode = active_mode
+            if previous_mode != new_mode:
+                self._stop_active_mode(rtde_c, previous_mode)
+                active_mode = new_mode
+                x_cmd = pose_F.copy()
+                q_cmd = q_now.copy()
+
             new_origin = np.asarray(single["origin"], dtype=np.float64).copy()
-            if new_space == ControlSpace.TASK and not np.allclose(previous_origin, new_origin):
+            if (
+                new_mode in {ActiveCommandMode.TASK_COMPLIANT, ActiveCommandMode.TASK_STIFF}
+                and not np.allclose(previous_origin, new_origin)
+            ):
                 x_cmd = self._transform_task_pose_between_frames(
                     pose=x_cmd,
                     source_origin=previous_origin,
@@ -466,14 +570,8 @@ class RTDETaskFrameController(mp.Process):
             self.max_pose = single["max_pose"].copy()
             self.min_pose = single["min_pose"].copy()
             self._resolve_compliance_settings(**single)
-
-            pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
-            q_now = np.array(rtde_r.getActualQ(), dtype=np.float64)
-            new_control_mode = single["control_mode"]
             new_delta_mode = single["delta_mode"]
-
-            if new_space == ControlSpace.JOINT and np.any(new_control_mode != ControlMode.POS):
-                raise ValueError("UR joint-space control only supports POS axes")
+            self.active_stiffness_mode = new_stiffness_mode
 
             for axis in range(6):
                 became_relative_pos = (
@@ -490,10 +588,10 @@ class RTDETaskFrameController(mp.Process):
 
             self.control_mode = new_control_mode.copy()
             self.delta_mode = new_delta_mode.copy()
-            if new_space == ControlSpace.TASK and not self.force_on:
+            if active_mode == ActiveCommandMode.TASK_COMPLIANT and not self.force_on:
                 self._enter_task_force_mode(rtde_c)
 
-        return keep_running, active_space, x_cmd, q_cmd
+        return keep_running, active_mode, x_cmd, q_cmd
 
     def _resolve_compliance_settings(
         self,
@@ -504,6 +602,8 @@ class RTDETaskFrameController(mp.Process):
         compliance_reference_limit_enable,
         compliance_desired_wrench,
         compliance_adaptive_limit_min,
+        servo_lookahead_time,
+        servo_gain,
         **kwargs
     ):
         """Normalize active compliance settings and compute derived adaptive scales."""
@@ -514,6 +614,8 @@ class RTDETaskFrameController(mp.Process):
         self.compliance_adaptive_limit_enable = np.asarray(compliance_adaptive_limit_enable, dtype=bool).copy()
         self.compliance_reference_limit_enable = np.asarray(compliance_reference_limit_enable, dtype=bool).copy()
         self.compliance_adaptive_limit_min = np.asarray(compliance_adaptive_limit_min, dtype=np.float64).copy()
+        self.servo_lookahead_time = float(servo_lookahead_time)
+        self.servo_gain = float(servo_gain)
         self.compliance_adaptive_limit_theta = np.zeros(6, dtype=np.float64)
 
         for axis in range(6):
@@ -659,7 +761,10 @@ class RTDETaskFrameController(mp.Process):
 
         # 2) Start RTDEControl & RTDEReceive
         if self.config.mock:
-            raise ValueError("UR does not support mocks")
+            from share.utils.mock_utils import (
+                MockRTDEControlInterface as RTDEControlInterface,
+                MockRTDEReceiveInterface as RTDEReceiveInterface,
+            )
         else:
             from rtde_control import RTDEControlInterface
             from rtde_receive import RTDEReceiveInterface
@@ -696,7 +801,7 @@ class RTDETaskFrameController(mp.Process):
             pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
             x_cmd = pose_F.copy()  # [x, y, z, Rx, Ry, Rz] in task
             q_cmd = np.array(rtde_r.getActualQ(), dtype=np.float64)
-            active_space: ControlSpace | None = None
+            active_mode: ActiveCommandMode | None = None
 
             # 4.2) Mark the loop as “ready” from the first successful iteration
             iter_idx = 0
@@ -745,12 +850,12 @@ class RTDETaskFrameController(mp.Process):
                 sec_wins["queue_get"].add(time.monotonic() - t0)
 
                 t0 = time.monotonic()
-                keep_running, active_space, x_cmd, q_cmd = self._apply_pending_commands(
+                keep_running, active_mode, x_cmd, q_cmd = self._apply_pending_commands(
                     msgs=msgs,
                     n_cmd=n_cmd,
                     rtde_c=rtde_c,
                     rtde_r=rtde_r,
-                    active_space=active_space,
+                    active_mode=active_mode,
                     x_cmd=x_cmd,
                     q_cmd=q_cmd,
                 )
@@ -793,7 +898,7 @@ class RTDETaskFrameController(mp.Process):
 
                 # ---------------- section: virt_update ----------------
                 t0 = time.monotonic()
-                if active_space == ControlSpace.TASK:
+                if active_mode in {ActiveCommandMode.TASK_COMPLIANT, ActiveCommandMode.TASK_STIFF}:
                     # --- translation ---
                     for i in range(3):
                         control_mode_i = ControlMode(self.control_mode[i])
@@ -806,8 +911,8 @@ class RTDETaskFrameController(mp.Process):
                             v_cmd = float(self.target[i])
                             x_cmd[i] += v_cmd * dt
 
-                        elif control_mode_i == ControlMode.VEL or control_mode_i == ControlMode.WRENCH:
-                            pass
+                        elif control_mode_i == ControlMode.VEL and active_mode == ActiveCommandMode.TASK_STIFF:
+                            x_cmd[i] += float(self.target[i]) * dt
 
                     # --- rotation ---
                     mask_abs_pos = np.array(
@@ -841,11 +946,24 @@ class RTDETaskFrameController(mp.Process):
                         R_cmd = dR_move * R_cmd
                         x_cmd[3:6] = R_cmd.as_rotvec()
 
+                    if active_mode == ActiveCommandMode.TASK_STIFF:
+                        mask_vel = np.array(
+                            [ControlMode(self.control_mode[i]) == ControlMode.VEL for i in range(3, 6)],
+                            dtype=bool,
+                        )
+                        if np.any(mask_vel):
+                            omega = np.zeros(3, dtype=float)
+                            omega[mask_vel] = np.array(self.target[3:6], dtype=float)[mask_vel]
+                            R_cmd = R.from_rotvec(x_cmd[3:6])
+                            dR_move = R.from_rotvec(omega * dt)
+                            x_cmd[3:6] = (dR_move * R_cmd).as_rotvec()
+
                     # first enforce task-space pose bounds
                     x_cmd = self.clip_pose(x_cmd)
                     # then anti-windup: clamp stored virtual target error relative to actual pose
-                    x_cmd = self._clamp_virtual_target_error_task(x_cmd, pose_F)
-                elif active_space == ControlSpace.JOINT:
+                    if active_mode == ActiveCommandMode.TASK_COMPLIANT:
+                        x_cmd = self._clamp_virtual_target_error_task(x_cmd, pose_F)
+                elif active_mode in {ActiveCommandMode.JOINT_COMPLIANT, ActiveCommandMode.JOINT_STIFF}:
                     for i in range(len(q_cmd)):
                         if DeltaMode(self.delta_mode[i]) == DeltaMode.ABSOLUTE:
                             q_cmd[i] = float(self.target[i])
@@ -857,14 +975,14 @@ class RTDETaskFrameController(mp.Process):
                 t0 = time.monotonic()
                 wrench_F = np.zeros(6, dtype=np.float64)
                 torque_cmd = np.zeros(6, dtype=np.float64)
-                if active_space == ControlSpace.TASK:
+                if active_mode == ActiveCommandMode.TASK_COMPLIANT:
                     wrench_F = self._compute_task_wrench(
                         x_cmd=x_cmd,
                         pose_F=pose_F,
                         v_F=v_F,
                         measured_wrench_F=measured_wrench_F,
                     )
-                elif active_space == ControlSpace.JOINT:
+                elif active_mode == ActiveCommandMode.JOINT_COMPLIANT:
                     torque_cmd = self._compute_joint_torque(
                         q_cmd=q_cmd,
                         q_actual=q_actual,
@@ -874,10 +992,14 @@ class RTDETaskFrameController(mp.Process):
 
                 # ---------------- section: forcemode ----------------
                 t0 = time.monotonic()
-                if active_space == ControlSpace.TASK:
+                if active_mode == ActiveCommandMode.TASK_COMPLIANT:
                     self._send_task_wrench(rtde_c, wrench_F)
-                elif active_space == ControlSpace.JOINT:
+                elif active_mode == ActiveCommandMode.JOINT_COMPLIANT:
                     self._send_joint_torque(rtde_c, torque_cmd)
+                elif active_mode == ActiveCommandMode.TASK_STIFF:
+                    self._send_task_servo(rtde_c, x_cmd)
+                elif active_mode == ActiveCommandMode.JOINT_STIFF:
+                    self._send_joint_servo(rtde_c, q_cmd)
                 sec_wins["forcemode"].add(time.monotonic() - t0)
 
                 # compute time (everything before wait)
@@ -947,8 +1069,7 @@ class RTDETaskFrameController(mp.Process):
         finally:
             # cleanup: exit force‐mode, disconnect RTDE
             try:
-                if self.force_on:
-                    rtde_c.forceModeStop()
+                self._stop_active_mode(rtde_c, active_mode if "active_mode" in locals() else None)
             except Exception:
                 pass
             try:

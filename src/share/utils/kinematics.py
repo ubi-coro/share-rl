@@ -16,18 +16,84 @@ import logging
 import numpy as np
 import modern_robotics as mr
 from lerobot.model.kinematics import RobotKinematics
+from scipy.spatial.transform import Rotation as R
+
+
+SUPPORTED_UR_IKFAST_MODELS = {"ur3", "ur3e", "ur5", "ur5e", "ur10", "ur10e"}
 
 
 def get_kinematics(
         robot_name: str,
         urdf_path: str,
         target_frame_name: str = "gripper_frame_link",
-        joint_names: list[str] | None = None
+        joint_names: list[str] | None = None,
+        robot_model: str | None = None,
     ) -> RobotKinematics:
+    if robot_name == "ur" and robot_model in SUPPORTED_UR_IKFAST_MODELS:
+        return URIKFastKinematics(robot_model=robot_model, joint_names=joint_names)
     if robot_name in MRKinematics.ROBOT_DESC:
         return MRKinematics(robot_name)
     else:
         return RobotKinematics(urdf_path, target_frame_name, joint_names)
+
+
+class URIKFastKinematics:
+    """UR FK/IK adapter backed by the external ``ur_ikfast`` package."""
+
+    def __init__(self, robot_model: str, joint_names: list[str] | None = None):
+        try:
+            from ur_ikfast.ur_kinematics import URKinematics
+        except ImportError as exc:  # pragma: no cover - depends on local environment
+            raise ImportError(
+                "UR IKFast support requires the 'ur_ikfast' package. "
+                "Install the UR extras documented in src/share/robots/ur/README.md."
+            ) from exc
+
+        self.robot_model = robot_model
+        self.joint_names = list(joint_names or [f"joint_{axis + 1}" for axis in range(6)])
+        self._solver = URKinematics(robot_model)
+
+    def forward_kinematics(self, joint_positions: dict[str, float] | list[float] | np.ndarray) -> list[float]:
+        joints = self._ordered_joint_vector(joint_positions)
+        pose_quat = np.asarray(self._solver.forward(joints, rotation_type="quaternion"), dtype=np.float64)
+        rotvec = R.from_quat(pose_quat[3:7]).as_rotvec()
+        return np.concatenate((pose_quat[:3], rotvec)).tolist()
+
+    def inverse_kinematics(
+        self,
+        pose_or_current_joint_pos: dict[str, float] | list[float] | np.ndarray,
+        desired_ee_pose: list[float] | np.ndarray | None = None,
+        **_: dict,
+    ) -> dict[str, float]:
+        if desired_ee_pose is None:
+            q_guess = np.zeros(len(self.joint_names), dtype=np.float64)
+            desired_pose = pose_or_current_joint_pos
+        else:
+            q_guess = self._ordered_joint_vector(pose_or_current_joint_pos)
+            desired_pose = desired_ee_pose
+
+        pose_quat = self._pose_to_quaternion(desired_pose)
+        solution = self._solver.inverse(pose_quat, q_guess=q_guess)
+        if solution is None:
+            solution = q_guess
+        return {
+            joint_name: float(solution[index])
+            for index, joint_name in enumerate(self.joint_names)
+        }
+
+    def _ordered_joint_vector(
+        self,
+        joint_positions: dict[str, float] | list[float] | np.ndarray,
+    ) -> np.ndarray:
+        if isinstance(joint_positions, dict):
+            return np.asarray([joint_positions[name] for name in self.joint_names], dtype=np.float64)
+        return np.asarray(joint_positions, dtype=np.float64)
+
+    @staticmethod
+    def _pose_to_quaternion(pose: list[float] | np.ndarray) -> np.ndarray:
+        pose = np.asarray(pose, dtype=np.float64)
+        quat = R.from_rotvec(pose[3:6]).as_quat()
+        return np.concatenate((pose[:3], quat))
 
 
 class MRKinematics(RobotKinematics):
