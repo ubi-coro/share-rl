@@ -263,6 +263,35 @@ def test_controller_reexpresses_virtual_target_when_task_frame_origin_changes():
     np.testing.assert_allclose(x_cmd[3:6], [0.0, 0.0, -np.pi / 2.0], atol=1e-6)
 
 
+def test_controller_partial_rotation_updates_in_rpy_and_keeps_absolute_axes_locked():
+    controller_module = _load_controller_module()
+    controller = object.__new__(controller_module.RTDETaskFrameController)
+    controller.control_mode = np.array([int(ControlMode.POS)] * 6, dtype=np.int64)
+    controller.delta_mode = np.array(
+        [
+            int(PolicyMode.ABSOLUTE),
+            int(PolicyMode.ABSOLUTE),
+            int(PolicyMode.ABSOLUTE),
+            int(PolicyMode.ABSOLUTE),
+            int(PolicyMode.RELATIVE),
+            int(PolicyMode.ABSOLUTE),
+        ],
+        dtype=np.int64,
+    )
+    controller.target = np.array([0.0, 0.0, 0.0, 0.4, 0.2, -0.3], dtype=np.float64)
+
+    start_rpy = np.array([0.1, -0.2, 0.25], dtype=np.float64)
+    updated_rotvec = controller._integrate_virtual_target_rotation(
+        controller_module.R.from_euler("xyz", start_rpy, degrees=False).as_rotvec(),
+        dt=0.5,
+    )
+
+    updated_rpy = controller_module.wrap_to_pi(
+        controller_module.R.from_rotvec(updated_rotvec).as_euler("xyz", degrees=False)
+    )
+    np.testing.assert_allclose(updated_rpy, [0.4, -0.1, -0.3], atol=1e-6)
+
+
 def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
     controller_module = _load_controller_module()
     ur_module = _load_ur_module(controller_module)

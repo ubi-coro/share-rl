@@ -223,7 +223,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if info.get(TeleopEvents.RERECORD_EPISODE, False):
                     log_say("Re-record episode", cfg.play_sounds, blocking=True)
                     dataset.clear_episode_buffer()
-                elif dataset.episode_buffer["size"] > 0:
+                elif dataset.writer.episode_buffer["size"] > 0:
                     log_say("Save episode", cfg.play_sounds, blocking=False)
                     dataset.save_episode()
                 else:

@@ -16,6 +16,9 @@
 import logging
 import shutil
 
+logger = logging.getLogger(__name__)
+
+
 class MultiVideoEncodingManager:
     """
     Context manager that ensures proper video encoding and data cleanup even if exceptions occur.
@@ -38,46 +41,29 @@ class MultiVideoEncodingManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Handle any remaining episodes that haven't been batch encoded
         for dataset in self.datasets.values():
-            if dataset.episodes_since_last_encoding > 0:
-                if exc_type is not None:
-                    logging.info("Exception occurred. Encoding remaining episodes before exit...")
-                else:
-                    logging.info("Recording stopped. Encoding remaining episodes...")
 
-                start_ep = dataset.num_episodes - dataset.episodes_since_last_encoding
-                end_ep = dataset.num_episodes
-                logging.info(
-                    f"Encoding remaining {dataset.episodes_since_last_encoding} episodes, "
-                    f"from episode {start_ep} to {end_ep - 1}"
-                )
-                dataset._batch_save_episode_video(start_ep, end_ep)
+            writer = dataset.writer
+            if writer is not None:
+                if exc_type is not None and writer._streaming_encoder is not None:
+                    writer.cancel_pending_videos()
 
-            # Finalize the dataset to properly close all writers
-            dataset.finalize()
+                # finalize() handles flush_pending_videos + parquet + metadata
+                dataset.finalize()
 
-            # Clean up episode images if recording was interrupted
-            if exc_type is not None:
-                interrupted_episode_index = dataset.num_episodes
-                for key in dataset.meta.video_keys:
-                    img_dir = dataset._get_image_file_path(
-                        episode_index=interrupted_episode_index, image_key=key, frame_index=0
-                    ).parent
-                    if img_dir.exists():
-                        logging.debug(
-                            f"Cleaning up interrupted episode images for episode {interrupted_episode_index}, camera {key}"
-                        )
-                        shutil.rmtree(img_dir)
+                # Clean up episode images if recording was interrupted (only for non-streaming mode)
+                if exc_type is not None and writer._streaming_encoder is None:
+                    writer.cleanup_interrupted_episode(dataset.num_episodes)
+            else:
+                dataset.finalize()
 
             # Clean up any remaining images directory if it's empty
             img_dir = dataset.root / "images"
-            # Check for any remaining PNG files
-            png_files = list(img_dir.rglob("*.png"))
-            if len(png_files) == 0:
-                # Only remove the images directory if no PNG files remain
-                if img_dir.exists():
+            if img_dir.exists():
+                png_files = list(img_dir.rglob("*.png"))
+                if len(png_files) == 0:
                     shutil.rmtree(img_dir)
-                    logging.debug("Cleaned up empty images directory")
-            else:
-                logging.debug(f"Images directory is not empty, containing {len(png_files)} PNG files")
+                    logger.debug("Cleaned up empty images directory")
+                else:
+                    logger.debug(f"Images directory is not empty, containing {len(png_files)} PNG files")
 
         return False  # Don't suppress the original exception
