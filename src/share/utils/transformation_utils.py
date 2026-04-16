@@ -1,4 +1,9 @@
+import collections
+import enum
+import math
+import numpy as np
 from typing import Any
+from dataclasses import dataclass
 
 from scipy.spatial.transform import Rotation
 
@@ -11,7 +16,147 @@ ROTATION_AXIS_ALIASES: dict[str, tuple[str, str]] = {
     "rz": ("rz", "wz"),
 }
 
+TAU = 2.0 * math.pi
 
+
+class RotationIntervalMode(enum.IntEnum):
+    """Encoded interpretation for one rotational bound interval."""
+
+    LINEAR = 0
+    CCW_ARC = 1
+
+    @classmethod
+    def from_name(cls, value: str) -> "RotationIntervalMode":
+        normalized = str(value).strip().lower()
+        if normalized == "linear":
+            return cls.LINEAR
+        if normalized == "ccw_arc":
+            return cls.CCW_ARC
+        raise ValueError(f"Unsupported rotation interval mode '{value}'.")
+
+    def to_name(self) -> str:
+        if self is type(self).CCW_ARC:
+            return "ccw_arc"
+        return "linear"
+
+
+def seconds_to_ms(value: float) -> float:
+    """Convert seconds to milliseconds for debug logging."""
+
+    return 1000.0 * float(value)
+
+
+@dataclass(slots=True)
+class RollingPerfWindow:
+    """Fixed-size rolling timing window with percentile summaries."""
+
+    buf: collections.deque
+
+    @classmethod
+    def create(cls, maxlen: int) -> "RollingPerfWindow":
+        return cls(buf=collections.deque(maxlen=maxlen))
+
+    def add(self, duration_s: float) -> None:
+        self.buf.append(float(duration_s))
+
+    def stats(self) -> dict[str, float] | None:
+        if not self.buf:
+            return None
+        samples = np.fromiter(self.buf, dtype=np.float64)
+        return {
+            "n": int(samples.size),
+            "mean": float(samples.mean()),
+            "std": float(samples.std()),
+            "p50": float(np.percentile(samples, 50)),
+            "p90": float(np.percentile(samples, 90)),
+            "p99": float(np.percentile(samples, 99)),
+            "max": float(samples.max()),
+            "min": float(samples.min()),
+        }
+
+
+def wrap_to_pi(angle: float | np.ndarray) -> float | np.ndarray:
+    """Wrap angle(s) to (-pi, pi], mapping -pi to +pi for consistency."""
+    out = (np.asarray(angle) + math.pi) % TAU - math.pi
+    out = np.asarray(out)
+    out[np.isclose(out, -math.pi)] = math.pi
+    if np.isscalar(angle):
+        return float(out.item())
+    return out
+
+
+def ccw_distance(a: float, b: float) -> float:
+    """Counterclockwise distance from a to b on S1, in [0, 2pi)."""
+    return float((b - a) % TAU)
+
+
+def circular_distance(a: float, b: float) -> float:
+    """Shortest unsigned angular distance on S1, in [0, pi]."""
+    d = abs(float(wrap_to_pi(b - a)))
+    return min(d, TAU - d)
+
+
+def is_in_ccw_arc(x: float, start: float, end: float, eps: float = 1e-12) -> bool:
+    """Whether x lies on the allowed counterclockwise arc [start -> end]."""
+    return ccw_distance(start, x) <= ccw_distance(start, end) + eps
+
+
+def clip_angle_to_ccw_arc(x: float, start: float, end: float) -> float:
+    """Project x to the nearest point on the allowed CCW arc [start -> end]."""
+    x = float(wrap_to_pi(x))
+    start = float(wrap_to_pi(start))
+    end = float(wrap_to_pi(end))
+
+    if is_in_ccw_arc(x, start, end):
+        return x
+
+    d_start = circular_distance(x, start)
+    d_end = circular_distance(x, end)
+    return start if d_start <= d_end else end
+
+
+def penetration_to_ccw_arc(x: float, start: float, end: float) -> float:
+    """Shortest angular distance from x to the allowed CCW arc [start -> end]."""
+    x = float(wrap_to_pi(x))
+    start = float(wrap_to_pi(start))
+    end = float(wrap_to_pi(end))
+
+    if is_in_ccw_arc(x, start, end):
+        return 0.0
+    return min(circular_distance(x, start), circular_distance(x, end))
+
+
+def signed_error_to_nearest_arc_endpoint(x: float, start: float, end: float) -> float:
+    """Signed shortest angular correction from x to the nearest allowed endpoint.
+
+    Positive means increase the angle, negative means decrease it.
+    Returns 0 if x already lies in the allowed arc.
+    """
+    x = float(wrap_to_pi(x))
+    start = float(wrap_to_pi(start))
+    end = float(wrap_to_pi(end))
+
+    if is_in_ccw_arc(x, start, end):
+        return 0.0
+
+    d_start = circular_distance(x, start)
+    d_end = circular_distance(x, end)
+    target = start if d_start <= d_end else end
+    return float(wrap_to_pi(target - x))
+
+
+def unwrap_angle_near_reference(angle: float, reference: float) -> float:
+    """Unwrap angle to the representation nearest to reference."""
+    angle = float(angle)
+    reference = float(reference)
+    while angle - reference > math.pi:
+        angle -= TAU
+    while angle - reference < -math.pi:
+        angle += TAU
+    return angle
+
+
+# rotation handling
 def rotation_from_extrinsic_xyz(rx: float, ry: float, rz: float) -> Rotation:
     """Build a rotation from extrinsic XYZ angles using explicit axis composition."""
 
@@ -33,6 +178,53 @@ def euler_xyz_from_rotvec(rotvec: list[float]) -> list[float]:
     """Convert a rotation vector into user-facing XYZ roll-pitch-yaw angles."""
 
     return euler_xyz_from_rotation(Rotation.from_rotvec(rotvec))
+
+
+def rotvec_to_euler_xyz(rotvec: list[float] | np.ndarray) -> np.ndarray:
+    """Convert a rotation vector into XYZ Euler angles as a NumPy array."""
+
+    return Rotation.from_rotvec(rotvec).as_euler("xyz", degrees=False)
+
+
+def euler_xyz_to_rotvec(euler_xyz: list[float] | np.ndarray) -> np.ndarray:
+    """Convert XYZ Euler angles into a rotation vector."""
+
+    return Rotation.from_euler("xyz", euler_xyz, degrees=False).as_rotvec()
+
+
+def homogeneous_to_sixvec(transform: np.ndarray) -> list[float]:
+    """Convert a 4x4 homogeneous transform into ``[x, y, z, rx, ry, rz]``."""
+
+    transform = np.asarray(transform, dtype=float)
+    if transform.shape != (4, 4):
+        raise ValueError("Input must be a 4x4 matrix.")
+
+    translation = transform[:3, 3]
+    rotation_vector = Rotation.from_matrix(transform[:3, :3]).as_rotvec()
+    return list(np.concatenate((translation, rotation_vector)))
+
+
+def sixvec_to_homogeneous(six_vec: list[float] | np.ndarray) -> np.ndarray:
+    """Convert ``[x, y, z, rx, ry, rz]`` into a 4x4 homogeneous transform."""
+
+    six = np.asarray(six_vec, dtype=float)
+    if six.shape != (6,):
+        raise ValueError(f"Expected 6-vector, got shape {six.shape}")
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = Rotation.from_rotvec(six[3:]).as_matrix()
+    transform[:3, 3] = six[:3]
+    return transform
+
+
+def exp_scale(f_meas: float, f_thresh: float, s_min: float = 0.2, theta: float = 0.1) -> float:
+    """Exponentially scale a magnitude toward ``s_min`` as measurement increases.
+
+    ``f_thresh`` is kept for API compatibility with existing controller call sites.
+    """
+
+    del f_thresh
+    return float(s_min + (1 - s_min) * np.exp(-f_meas / theta))
 
 
 def task_pose_to_world_pose(pose: list[float], origin: list[float] | None) -> list[float]:
@@ -131,6 +323,7 @@ def compose_delta_pose(
     ]
 
 
+# getting information (keys, poses) from observations
 def rotation_component_keys(frame: "TaskFrame", absolute_rot_axes: list[int]) -> list[str]:
     if len(absolute_rot_axes) == 1:
         axis_name = frame.action_key_for_axis(absolute_rot_axes[0]).removesuffix(".pos")

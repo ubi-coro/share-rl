@@ -1,4 +1,3 @@
-import collections
 import math
 import gc
 import os
@@ -14,7 +13,19 @@ from scipy.spatial.transform import Rotation as R
 
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
 from share.utils.shared_memory import SharedMemoryRingBuffer, SharedMemoryQueue, Empty
-
+from share.utils.transformation_utils import (
+    clip_angle_to_ccw_arc,
+    euler_xyz_to_rotvec,
+    exp_scale,
+    homogeneous_to_sixvec,
+    RollingPerfWindow,
+    RotationIntervalMode,
+    rotvec_to_euler_xyz,
+    seconds_to_ms,
+    signed_error_to_nearest_arc_endpoint,
+    sixvec_to_homogeneous,
+    wrap_to_pi,
+)
 
 # ---------------------------------------------------------------------------
 # Internal enums
@@ -48,6 +59,7 @@ class TaskFrameCommand(TaskFrame):
         "compliance_adaptive_limit_enable",
         "compliance_desired_wrench",
         "compliance_adaptive_limit_min",
+        "rotation_interval_modes"
     }
 
     @property
@@ -62,6 +74,7 @@ class TaskFrameCommand(TaskFrame):
         roll-pitch-yaw [rad] and converted to an internal rotation vector.
         """
         d = asdict(self)
+        d.pop("joint_names")
         raw_overrides = d.pop("controller_overrides", None) or {}
         unknown = set(raw_overrides) - self.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
         if unknown:
@@ -78,6 +91,13 @@ class TaskFrameCommand(TaskFrame):
             d["origin"][3:6] = R.from_euler("xyz", d["origin"][3:6], degrees=False).as_rotvec()
             d["max_pose"] = np.asarray(raw_overrides.get("max_pose", self.max_pose)).astype(np.float64)
             d["min_pose"] = np.asarray(raw_overrides.get("min_pose", self.min_pose)).astype(np.float64)
+            d["rotation_interval_modes"] = np.array(
+                [
+                    int(RotationIntervalMode.from_name(str(mode)))
+                    for mode in raw_overrides.get("rotation_interval_modes", ["linear"] * 6)
+                ],
+                dtype=np.int8,
+            )
             d["kp"] = np.asarray(raw_overrides.get("kp", [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])).astype(np.float64)
             d["kd"] = np.asarray(raw_overrides.get("kd", [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])).astype(np.float64)
             d["wrench_limits"] = np.asarray(raw_overrides.get("wrench_limits", [30.0, 30.0, 30.0, 3.0, 3.0, 3.0])).astype(np.float64)
@@ -87,6 +107,7 @@ class TaskFrameCommand(TaskFrame):
             d["compliance_adaptive_limit_min"] = np.asarray(raw_overrides.get("compliance_adaptive_limit_min", [0.1] * 6)).astype(np.float64)
         except Exception as e:
             raise ValueError(f"TaskFrameCommand seems to be missing fields: {e}")
+
         return d
 
     def to_robot_action(self):
@@ -107,33 +128,6 @@ class TaskFrameCommand(TaskFrame):
                 action_dict[f"{ax}.ee_wrench"] = self.target[i]
         return action_dict
     
-
-# --- timing helpers ---
-def _ms(x): return 1000.0 * float(x)
-
-class _PerfWin:
-    def __init__(self, maxlen):
-        self.maxlen = maxlen
-        self.buf = collections.deque(maxlen=maxlen)
-
-    def add(self, d):
-        self.buf.append(d)
-
-    def stats(self):
-        if not self.buf:
-            return None
-        a = np.fromiter(self.buf, dtype=np.float64)
-        return {
-            "n": int(a.size),
-            "mean": float(a.mean()),
-            "std": float(a.std()),
-            "p50": float(np.percentile(a, 50)),
-            "p90": float(np.percentile(a, 90)),
-            "p99": float(np.percentile(a, 99)),
-            "max": float(a.max()),
-            "min": float(a.min()),
-        }
-
 
 class RTDETaskFrameController(mp.Process):
     """RTDE task-frame controller with per-axis modes and 6D impedance.
@@ -217,6 +211,7 @@ class RTDETaskFrameController(mp.Process):
                 "compliance_reference_limit_enable": np.array(self.config.compliance_reference_limit_enable, dtype=bool),
                 "compliance_desired_wrench": np.array(self.config.compliance_desired_wrench, dtype=np.float64),
                 "compliance_adaptive_limit_min": np.array(self.config.compliance_adaptive_limit_min, dtype=np.float64),
+                "rotation_interval_modes": ["linear"] * 6
             },
         )
         self.origin = self._last_cmd.origin
@@ -300,6 +295,413 @@ class RTDETaskFrameController(mp.Process):
     @property
     def task_frame(self) -> TaskFrameCommand:
         return replace(self._last_cmd)
+
+    def zero_ft(self):
+        """Re-zero the force-torque sensor in the control loop."""
+        # We only need the cmd field for ZERO_FT, everything else can be None
+        zero_cmd = replace(self._last_cmd)
+        zero_cmd.cmd = Command.ZERO_FT
+        self.robot_cmd_queue.put(zero_cmd.to_queue_dict())
+
+    # =========== get robot state from ring buffer ============
+    def get_robot_state(self, k=None, out=None):
+        """Get the latest (or last k) robot state sample(s).
+
+        Args:
+            k (int, optional): If `None`, return the latest sample. If an integer,
+                return the last `k` samples.
+            out (dict, optional): Optional preallocated output buffer.
+
+        Returns:
+            dict or tuple[dict,...]: State dict(s) including:
+                - ``'ActualTCPPose'`` (6, ) task-frame pose (x,y,z, rx,ry,rz)
+                - ``'ActualTCPSpeed'`` (6, ) task-frame twist
+                - ``'ActualTCPForce'`` (6, ) task-frame wrench
+                - any additional keys requested via `config.receive_keys`
+                - ``'SetTCPForce'`` (6, ) last commanded wrench in the task frame
+                - ``'timestamp'`` (float)
+        """
+        if k is None:
+            return self.robot_out_rb.get(out=out)
+        else:
+            return self.robot_out_rb.get_last_k(k=k, out=out)
+
+    def get_all_robot_states(self):
+        """Return all buffered robot states currently stored in the ring buffer.
+        Returns:
+            list[dict]: Chronologically ordered state samples.
+        """
+        return self.robot_out_rb.get_all()
+
+    # ========= main loop in process ============
+    def run(self):
+        """Run the RTDE control loop until a stop command or transport failure.
+
+        The loop follows one fixed order on every iteration: apply pending
+        commands, read the latest robot state, update the virtual reference,
+        compute the commanded wrench/torque, send it, and then wait for the
+        next control period. Rotational task-space targets remain user-facing
+        XYZ Euler angles at the interface and are converted internally only
+        where the controller needs SO(3) operations.
+        """
+        self._configure_realtime()
+        robot_ip = self.config.robot_ip
+        dt = 1.0 / self.config.frequency
+        rtde_c, rtde_r = self._connect_rtde_interfaces()
+        ft_alpha = self._force_filter_alpha(dt)
+        wrench_F = np.zeros(6, dtype=np.float64)
+        measured_wrench_F = np.zeros(6, dtype=np.float64)
+
+        try:
+            if self.config.verbose:
+                print(f"[RTDETaskFrameController] Connecting to {robot_ip}...")
+
+            self._configure_robot_session(rtde_c)
+
+            pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
+            x_cmd = pose_F.copy()
+            q_cmd = np.array(rtde_r.getActualQ(), dtype=np.float64)
+            active_space: ControlSpace | None = None
+            keep_running = True
+            iter_idx = 0
+            perf = self._init_perf_tracking(dt)
+
+            while keep_running:
+                t_loop_start = rtde_c.initPeriod()
+                t_iter0 = time.monotonic()
+                dt_loop = t_iter0 - perf["t_prev"]
+                perf["t_prev"] = t_iter0
+                perf["dt_win"].add(dt_loop)
+
+                section_start = time.monotonic()
+                msgs, n_cmd = self._get_pending_commands()
+                perf["sec_wins"]["queue_get"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                keep_running, active_space, x_cmd, q_cmd = self._apply_pending_commands(
+                    msgs=msgs,
+                    n_cmd=n_cmd,
+                    rtde_c=rtde_c,
+                    rtde_r=rtde_r,
+                    active_space=active_space,
+                    x_cmd=x_cmd,
+                    q_cmd=q_cmd,
+                )
+                perf["sec_wins"]["cmd_apply"].add(time.monotonic() - section_start)
+                if not keep_running:
+                    break
+
+                section_start = time.monotonic()
+                current_state = self.read_current_state(rtde_r)
+                pose_F = current_state["ActualTCPPose"]
+                v_F = current_state["ActualTCPSpeed"]
+                measured_wrench_F = self._update_filtered_wrench(
+                    current_state["ActualTCPForce"], measured_wrench_F, ft_alpha
+                )
+                perf["sec_wins"]["read_state"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                q_actual, qd_actual = self._populate_current_state(
+                    rtde_r=rtde_r,
+                    current_state=current_state,
+                    measured_wrench_F=measured_wrench_F,
+                    wrench_F=wrench_F,
+                )
+                perf["sec_wins"]["recv_extra"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                self.robot_out_rb.put(current_state)
+                perf["sec_wins"]["rb_put"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                x_cmd, q_cmd = self._update_virtual_targets(
+                    active_space=active_space,
+                    x_cmd=x_cmd,
+                    q_cmd=q_cmd,
+                    pose_F=pose_F,
+                    dt=dt,
+                )
+                perf["sec_wins"]["virt_update"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                wrench_F, torque_cmd = self._compute_output_command(
+                    active_space=active_space,
+                    x_cmd=x_cmd,
+                    q_cmd=q_cmd,
+                    pose_F=pose_F,
+                    v_F=v_F,
+                    measured_wrench_F=measured_wrench_F,
+                    q_actual=q_actual,
+                    qd_actual=qd_actual,
+                )
+                perf["sec_wins"]["wrench"].add(time.monotonic() - section_start)
+
+                section_start = time.monotonic()
+                self._send_output_command(active_space, rtde_c, wrench_F, torque_cmd)
+                perf["sec_wins"]["forcemode"].add(time.monotonic() - section_start)
+
+                compute_time = time.monotonic() - t_iter0
+                perf["compute_win"].add(compute_time)
+
+                section_start = time.monotonic()
+                rtde_c.waitPeriod(t_loop_start)
+                perf["sec_wins"]["waitPeriod"].add(time.monotonic() - section_start)
+
+                iter_idx += 1
+                self._maybe_log_timing(
+                    perf=perf,
+                    iter_idx=iter_idx,
+                    dt_loop=dt_loop,
+                    compute_time=compute_time,
+                    n_cmd=n_cmd,
+                    t_iter0=t_iter0,
+                )
+
+                if not self.ready_event.is_set():
+                    self.ready_event.set()
+        finally:
+            self._cleanup_rtde(rtde_c, rtde_r)
+            self.ready_event.set()
+            if self.config.verbose:
+                print(f"[RTDETaskFrameController] Disconnected from robot {robot_ip}")
+
+    def _configure_realtime(self) -> None:
+        """Enable the optional soft real-time scheduler settings for the child process."""
+        if not self.config.soft_real_time:
+            return
+        os.sched_setaffinity(0, {self.config.rt_core})
+        os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(20))
+
+    def _connect_rtde_interfaces(self):
+        """Create RTDE control/receive interfaces for the configured UR robot."""
+        if self.config.mock:
+            raise ValueError("UR does not support mocks")
+
+        from rtde_control import RTDEControlInterface
+        from rtde_receive import RTDEReceiveInterface
+
+        frequency = self.config.frequency
+        return (
+            RTDEControlInterface(self.config.robot_ip, frequency),
+            RTDEReceiveInterface(self.config.robot_ip),
+        )
+
+    def _configure_robot_session(self, rtde_c) -> None:
+        """Apply one-time TCP and payload configuration after connecting."""
+        if self.config.tcp_offset_pose is not None:
+            rtde_c.setTcp(self.config.tcp_offset_pose)
+
+        if self.config.payload_mass is None:
+            return
+
+        if self.config.payload_cog is not None:
+            assert rtde_c.setPayload(self.config.payload_mass, self.config.payload_cog)
+        else:
+            assert rtde_c.setPayload(self.config.payload_mass)
+
+    def _force_filter_alpha(self, dt: float) -> float | None:
+        """Return the low-pass coefficient for the measured wrench filter."""
+        if self.config.ft_filter_cutoff_hz is None:
+            return None
+
+        cutoff_hz = float(self.config.ft_filter_cutoff_hz)
+        tau = 1.0 / (2.0 * np.pi * max(cutoff_hz, 1e-6))
+        return dt / (tau + dt)
+
+    def _init_perf_tracking(self, dt: float) -> dict[str, Any]:
+        """Create rolling windows and thresholds for optional verbose timing logs."""
+        win_secs = 2.0
+        win_len = int(win_secs * self.config.frequency)
+        sec_names = [
+            "queue_get", "cmd_apply", "read_state", "recv_extra",
+            "rb_put", "virt_update", "wrench", "forcemode", "waitPeriod",
+        ]
+        t_prev = time.monotonic()
+        return {
+            "dt_nom": dt,
+            "dt_win": RollingPerfWindow.create(win_len),
+            "compute_win": RollingPerfWindow.create(win_len),
+            "sec_names": sec_names,
+            "sec_wins": {name: RollingPerfWindow.create(win_len) for name in sec_names},
+            "t_prev": t_prev,
+            "log_interval": 5.0,
+            "next_log_time": t_prev + 5.0,
+            "spike_abs_s": max(0.002, 3.0 * dt),
+            "spike_rel": 3.0,
+            "spike_compute_s": max(0.0015, 2.0 * dt),
+        }
+
+    def _update_filtered_wrench(
+        self,
+        raw_wrench: np.ndarray,
+        measured_wrench_F: np.ndarray,
+        ft_alpha: float | None,
+    ) -> np.ndarray:
+        """Update the filtered task-frame wrench estimate."""
+        if ft_alpha is None:
+            return np.asarray(raw_wrench, dtype=np.float64)
+        return measured_wrench_F + ft_alpha * (raw_wrench - measured_wrench_F)
+
+    def _populate_current_state(
+        self,
+        *,
+        rtde_r,
+        current_state: dict[str, np.ndarray],
+        measured_wrench_F: np.ndarray,
+        wrench_F: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Fill extra receive keys, publish filtered wrench, and return joint state arrays."""
+        for key in self._receive_keys:
+            if key not in current_state:
+                current_state[key] = np.array(getattr(rtde_r, "get" + key)())
+
+        current_state["ActualTCPForceFiltered"] = np.array(measured_wrench_F)
+        current_state["SetTCPForce"] = np.array(wrench_F)
+        current_state["timestamp"] = time.time()
+        q_actual = np.asarray(current_state["ActualQ"], dtype=np.float64)
+        qd_actual = np.asarray(current_state["ActualQd"], dtype=np.float64)
+        return q_actual, qd_actual
+
+    def _update_virtual_targets(
+        self,
+        *,
+        active_space: ControlSpace | None,
+        x_cmd: np.ndarray,
+        q_cmd: np.ndarray,
+        pose_F: np.ndarray,
+        dt: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Advance the stored virtual target for the active control space."""
+        if active_space == ControlSpace.TASK:
+            for i in range(3):
+                control_mode_i = ControlMode(self.control_mode[i])
+                delta_mode_i = DeltaMode(self.delta_mode[i])
+                if control_mode_i == ControlMode.POS and delta_mode_i == DeltaMode.ABSOLUTE:
+                    x_cmd[i] = self.target[i]
+                elif control_mode_i == ControlMode.POS and delta_mode_i == DeltaMode.RELATIVE:
+                    x_cmd[i] += float(self.target[i]) * dt
+
+            x_cmd[3:6] = self._integrate_virtual_target_rotation(x_cmd[3:6], dt)
+            x_cmd = self.clip_pose(x_cmd)
+            x_cmd = self._clamp_virtual_target_error_task(x_cmd, pose_F)
+            return x_cmd, q_cmd
+
+        if active_space == ControlSpace.JOINT:
+            for i in range(len(q_cmd)):
+                if DeltaMode(self.delta_mode[i]) == DeltaMode.ABSOLUTE:
+                    q_cmd[i] = float(self.target[i])
+                else:
+                    q_cmd[i] += float(self.target[i]) * dt
+
+        return x_cmd, q_cmd
+
+    def _compute_output_command(
+        self,
+        *,
+        active_space: ControlSpace | None,
+        x_cmd: np.ndarray,
+        q_cmd: np.ndarray,
+        pose_F: np.ndarray,
+        v_F: np.ndarray,
+        measured_wrench_F: np.ndarray,
+        q_actual: np.ndarray,
+        qd_actual: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the wrench or torque command for the active control space."""
+        wrench_F = np.zeros(6, dtype=np.float64)
+        torque_cmd = np.zeros(6, dtype=np.float64)
+        if active_space == ControlSpace.TASK:
+            wrench_F = self._compute_task_wrench(
+                x_cmd=x_cmd,
+                pose_F=pose_F,
+                v_F=v_F,
+                measured_wrench_F=measured_wrench_F,
+            )
+        elif active_space == ControlSpace.JOINT:
+            torque_cmd = self._compute_joint_torque(
+                q_cmd=q_cmd,
+                q_actual=q_actual,
+                qd_actual=qd_actual,
+            )
+        return wrench_F, torque_cmd
+
+    def _send_output_command(
+        self,
+        active_space: ControlSpace | None,
+        rtde_c,
+        wrench_F: np.ndarray,
+        torque_cmd: np.ndarray,
+    ) -> None:
+        """Send the already-computed output command through the appropriate RTDE API."""
+        if active_space == ControlSpace.TASK:
+            self._send_task_wrench(rtde_c, wrench_F)
+        elif active_space == ControlSpace.JOINT:
+            self._send_joint_torque(rtde_c, torque_cmd)
+
+    def _maybe_log_timing(
+        self,
+        *,
+        perf: dict[str, Any],
+        iter_idx: int,
+        dt_loop: float,
+        compute_time: float,
+        n_cmd: int,
+        t_iter0: float,
+    ) -> None:
+        """Emit optional rolling timing summaries and spike diagnostics."""
+        if self.config.verbose and t_iter0 >= perf["next_log_time"] and perf["dt_win"].buf:
+            self._log_perf_summary(perf)
+            perf["next_log_time"] = t_iter0 + perf["log_interval"]
+
+        is_dt_spike = (dt_loop > perf["spike_abs_s"]) or (dt_loop > perf["spike_rel"] * perf["dt_nom"])
+        is_compute_spike = compute_time > perf["spike_compute_s"]
+        if self.config.verbose and (is_dt_spike or is_compute_spike):
+            self._log_perf_spike(perf, iter_idx, dt_loop, compute_time, n_cmd)
+
+    def _log_perf_summary(self, perf: dict[str, Any]) -> None:
+        """Print a short rolling summary of loop timing and hottest sections."""
+        dt_stats = perf["dt_win"].stats()
+        compute_stats = perf["compute_win"].stats()
+        sec_lines = []
+        for name in perf["sec_names"]:
+            stats = perf["sec_wins"][name].stats()
+            if stats is None:
+                continue
+            sec_lines.append((name, stats["p99"], stats["max"]))
+        sec_lines.sort(key=lambda item: item[1], reverse=True)
+        top = "  ".join(
+            f"{name}:p99={seconds_to_ms(p99):.2f} max={seconds_to_ms(mx):.2f}"
+            for name, p99, mx in sec_lines[:5]
+        )
+        print(
+            f"[RTDETaskFrameController] dt_loop(ms) p50={seconds_to_ms(dt_stats['p50']):.2f} "
+            f"p90={seconds_to_ms(dt_stats['p90']):.2f} p99={seconds_to_ms(dt_stats['p99']):.2f} "
+            f"max={seconds_to_ms(dt_stats['max']):.2f} | compute(ms) p50={seconds_to_ms(compute_stats['p50']):.2f} "
+            f"p99={seconds_to_ms(compute_stats['p99']):.2f} max={seconds_to_ms(compute_stats['max']):.2f} | top: {top}"
+        )
+
+    def _log_perf_spike(
+        self,
+        perf: dict[str, Any],
+        iter_idx: int,
+        dt_loop: float,
+        compute_time: float,
+        n_cmd: int,
+    ) -> None:
+        """Print one detailed spike diagnostic when a loop iteration overruns badly."""
+        last_secs = {
+            name: (perf["sec_wins"][name].buf[-1] if perf["sec_wins"][name].buf else float("nan"))
+            for name in perf["sec_names"]
+        }
+        culprit = max(last_secs.items(), key=lambda item: (0.0 if math.isnan(item[1]) else item[1]))
+        print(
+            f"[RTDETaskFrameController][SPIKE] iter={iter_idx} "
+            f"dt_loop={seconds_to_ms(dt_loop):.2f}ms (dt={seconds_to_ms(perf['dt_nom']):.2f}ms) "
+            f"compute={seconds_to_ms(compute_time):.2f}ms n_cmd={n_cmd} "
+            f"culprit={culprit[0]}:{seconds_to_ms(culprit[1]):.2f}ms secs(ms)="
+            + " ".join(f"{name}={seconds_to_ms(last_secs[name]):.2f}" for name in perf["sec_names"])
+            + f" gc_count={gc.get_count()}"
+        )
 
     def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
         """Lock the controller to its first commanded control space."""
@@ -406,13 +808,13 @@ class RTDETaskFrameController(mp.Process):
         target_origin: np.ndarray,
     ) -> np.ndarray:
         """Re-express one internal task-frame pose in a different task frame."""
-        T_world_source = cls.sixvec_to_homogeneous(source_origin)
-        T_source_pose = cls.sixvec_to_homogeneous(pose)
+        T_world_source = sixvec_to_homogeneous(source_origin)
+        T_source_pose = sixvec_to_homogeneous(pose)
         T_world_pose = T_world_source @ T_source_pose
 
-        T_world_target = cls.sixvec_to_homogeneous(target_origin)
+        T_world_target = sixvec_to_homogeneous(target_origin)
         T_target_pose = np.linalg.inv(T_world_target) @ T_world_pose
-        return np.asarray(cls.homogenous_to_sixvec(T_target_pose), dtype=np.float64)
+        return np.asarray(homogeneous_to_sixvec(T_target_pose), dtype=np.float64)
 
     def _apply_pending_commands(
         self,
@@ -504,6 +906,7 @@ class RTDETaskFrameController(mp.Process):
         compliance_reference_limit_enable,
         compliance_desired_wrench,
         compliance_adaptive_limit_min,
+        rotation_interval_modes,
         **kwargs
     ):
         """Normalize active compliance settings and compute derived adaptive scales."""
@@ -515,6 +918,7 @@ class RTDETaskFrameController(mp.Process):
         self.compliance_reference_limit_enable = np.asarray(compliance_reference_limit_enable, dtype=bool).copy()
         self.compliance_adaptive_limit_min = np.asarray(compliance_adaptive_limit_min, dtype=np.float64).copy()
         self.compliance_adaptive_limit_theta = np.zeros(6, dtype=np.float64)
+        self.rotation_interval_modes = rotation_interval_modes
 
         for axis in range(6):
             if not self.compliance_adaptive_limit_enable[axis]:
@@ -541,6 +945,52 @@ class RTDETaskFrameController(mp.Process):
             return np.inf
 
         return f_soft / kp
+
+    def _integrate_virtual_target_rotation(self, rotvec_cmd: np.ndarray, dt: float) -> np.ndarray:
+        """Update rotational virtual targets in either free SO(3) or constrained XYZ RPY semantics."""
+        out = np.asarray(rotvec_cmd, dtype=np.float64).copy()
+        target_rpy = np.asarray(self.target[3:6], dtype=np.float64)
+        mask_abs_pos = np.array(
+            [
+                ControlMode(self.control_mode[i]) == ControlMode.POS
+                and DeltaMode(self.delta_mode[i]) == DeltaMode.ABSOLUTE
+                for i in range(3, 6)
+            ],
+            dtype=bool,
+        )
+        mask_delta_pos = np.array(
+            [
+                ControlMode(self.control_mode[i]) == ControlMode.POS
+                and DeltaMode(self.delta_mode[i]) == DeltaMode.RELATIVE
+                for i in range(3, 6)
+            ],
+            dtype=bool,
+        )
+
+        if np.any(mask_delta_pos):
+            if np.all(mask_delta_pos) and not np.any(mask_abs_pos):
+                # Fully relative 3-axis rotation can follow free SO(3) integration.
+                omega = np.zeros(3, dtype=np.float64)
+                omega[mask_delta_pos] = target_rpy[mask_delta_pos]
+                return (R.from_rotvec(omega * dt) * R.from_rotvec(out)).as_rotvec()
+
+            # Mixed/partial rotational targets use the controller's constrained
+            # XYZ Euler chart so absolute axes stay locked while relative axes
+            # integrate in the same semantics exposed at the task-frame API.
+            rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
+            if np.any(mask_abs_pos):
+                rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
+            rpy_cmd[mask_delta_pos] = wrap_to_pi(
+                rpy_cmd[mask_delta_pos] + target_rpy[mask_delta_pos] * dt
+            )
+            return euler_xyz_to_rotvec(rpy_cmd)
+
+        if np.any(mask_abs_pos):
+            rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
+            rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
+            return euler_xyz_to_rotvec(rpy_cmd)
+
+        return out
 
     def _clamp_virtual_target_error_task(self, x_cmd: np.ndarray, pose_F: np.ndarray) -> np.ndarray:
         """Clamp stored task-space virtual target error relative to current pose.
@@ -580,10 +1030,10 @@ class RTDETaskFrameController(mp.Process):
             )
         ]
         if rot_axes:
-            cmd_rpy = self.wrap_to_pi(self._rotvec_to_rpy(out[3:6]).astype(np.float64))
-            pose_rpy = self.wrap_to_pi(self._rotvec_to_rpy(pose_F[3:6]).astype(np.float64))
+            cmd_rpy = wrap_to_pi(rotvec_to_euler_xyz(out[3:6]).astype(np.float64))
+            pose_rpy = wrap_to_pi(rotvec_to_euler_xyz(pose_F[3:6]).astype(np.float64))
 
-            rpy_err = self.wrap_to_pi(cmd_rpy - pose_rpy)
+            rpy_err = wrap_to_pi(cmd_rpy - pose_rpy)
             for axis in rot_axes:
                 j = axis - 3
                 e_max = self._get_reference_error_limit(axis)
@@ -591,382 +1041,42 @@ class RTDETaskFrameController(mp.Process):
                     continue
                 rpy_err[j] = np.clip(rpy_err[j], -e_max, e_max)
 
-            out[3:6] = self._rpy_to_rotvec(self.wrap_to_pi(pose_rpy + rpy_err))
+            out[3:6] = euler_xyz_to_rotvec(wrap_to_pi(pose_rpy + rpy_err))
 
         return out
 
-    def zero_ft(self):
-        """Re-zero the force-torque sensor in the control loop."""
-        # We only need the cmd field for ZERO_FT, everything else can be None
-        zero_cmd = replace(self._last_cmd)
-        zero_cmd.cmd = Command.ZERO_FT
-        self.robot_cmd_queue.put(zero_cmd.to_queue_dict())
+    def _rotation_interval_mode(self, axis: int) -> str:
+        """Return the configured rotational bound interpretation for one axis."""
+        return RotationIntervalMode(int(self.rotation_interval_modes[axis])).to_name()
 
-    # =========== get robot state from ring buffer ============
-    def get_robot_state(self, k=None, out=None):
-        """Get the latest (or last k) robot state sample(s).
+    def _clip_rotational_axis(self, angle: float, axis: int) -> float:
+        """Clip one wrapped RPY angle according to its configured interval mode."""
+        lo = float(self.min_pose[axis])
+        hi = float(self.max_pose[axis])
+        if self._rotation_interval_mode(axis) == "ccw_arc":
+            return float(clip_angle_to_ccw_arc(angle, lo, hi))
+        return float(np.clip(angle, lo, hi))
 
-        Args:
-            k (int, optional): If `None`, return the latest sample. If an integer,
-                return the last `k` samples.
-            out (dict, optional): Optional preallocated output buffer.
 
-        Returns:
-            dict or tuple[dict,...]: State dict(s) including:
-                - ``'ActualTCPPose'`` (6, ) task-frame pose (x,y,z, rx,ry,rz)
-                - ``'ActualTCPSpeed'`` (6, ) task-frame twist
-                - ``'ActualTCPForce'`` (6, ) task-frame wrench
-                - any additional keys requested via `config.receive_keys`
-                - ``'SetTCPForce'`` (6, ) last commanded wrench in the task frame
-                - ``'timestamp'`` (float)
-        """
-        if k is None:
-            return self.robot_out_rb.get(out=out)
-        else:
-            return self.robot_out_rb.get_last_k(k=k, out=out)
-
-    def get_all_robot_states(self):
-        """Return all buffered robot states currently stored in the ring buffer.
-        Returns:
-            list[dict]: Chronologically ordered state samples.
-        """
-        return self.robot_out_rb.get_all()
-
-    # ========= main loop in process ============
-    def run(self):
-        """Control-loop entry point (child process).
-
-        Steps:
-            1) Configure RT scheduling (optional) and connect RTDE.
-            2) Initialize `forceMode` and virtual targets.
-            3) Loop at `config.frequency`:
-               - Drain and apply queued `TaskFrameCommand`s
-               - Read current state and write it to the ring buffer
-               - Update the virtual task-frame pose
-               - Compute per-axis wrench from mode/targets/gains
-               - Clamp wrench using pose bounds and contact-aware scaling
-               - Apply wrench via `forceMode`
-            4) On shutdown, stop force mode and disconnect cleanly.
-
-        Absolute rotational pose targets are interpreted as XYZ roll-pitch-yaw
-        angles [rad] at the interface and converted internally to rotation vectors.
-        """
-        # 1) Enable soft real‐time (optional)
-        if self.config.soft_real_time:
-            os.sched_setaffinity(0, {self.config.rt_core})
-            os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(20))
-            # no need for psutil().nice(-priority) if not root
-
-        # 2) Start RTDEControl & RTDEReceive
-        if self.config.mock:
-            raise ValueError("UR does not support mocks")
-        else:
-            from rtde_control import RTDEControlInterface
-            from rtde_receive import RTDEReceiveInterface
-
-        robot_ip = self.config.robot_ip
-        frequency = self.config.frequency
-        dt = 1.0 / frequency
-        rtde_c = RTDEControlInterface(robot_ip, frequency)
-        rtde_r = RTDEReceiveInterface(robot_ip)
-        wrench_F = [0.0] * 6
-        measured_wrench_F = np.zeros(6, dtype=np.float64)
-
-        if self.config.ft_filter_cutoff_hz is None:
-            ft_alpha = None
-        else:
-            fc = float(self.config.ft_filter_cutoff_hz)
-            tau = 1.0 / (2.0 * np.pi * max(fc, 1e-6))
-            ft_alpha = dt / (tau + dt)
-
+    def _cleanup_rtde(self, rtde_c, rtde_r) -> None:
+        """Best-effort shutdown of RTDE force mode, script, and connections."""
         try:
-            if self.config.verbose:
-                print(f"[RTDETFFController] Connecting to {robot_ip}…")
-
-            # 3) Set TCP offset & payload (if provided)
-            if self.config.tcp_offset_pose is not None:
-                rtde_c.setTcp(self.config.tcp_offset_pose)
-            if self.config.payload_mass is not None:
-                if self.config.payload_cog is not None:
-                    assert rtde_c.setPayload(self.config.payload_mass, self.config.payload_cog)
-                else:
-                    assert rtde_c.setPayload(self.config.payload_mass)
-
-            # 4) Initialize controller targets from the current robot state
-            pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
-            x_cmd = pose_F.copy()  # [x, y, z, Rx, Ry, Rz] in task
-            q_cmd = np.array(rtde_r.getActualQ(), dtype=np.float64)
-            active_space: ControlSpace | None = None
-
-            # 4.2) Mark the loop as “ready” from the first successful iteration
-            iter_idx = 0
-            keep_running = True
-
-            # 4.4) Prepare for jitter logging
-            
-            # --- config-ish knobs ---
-            log_interval = 0.5
-            win_secs = 2.0
-            win_len = int(win_secs * self.config.frequency)
-
-            # spike thresholds (tune)
-            dt_nom = dt
-            spike_abs_s = max(0.002, 3.0 * dt_nom)  # absolute dt_loop spike
-            spike_rel = 3.0  # dt_loop > spike_rel * dt
-            spike_compute_s = max(0.0015, 2.0 * dt_nom)  # compute-time spike (pre-wait)
-
-            # windows for metrics
-            dt_win = _PerfWin(win_len)
-            compute_win = _PerfWin(win_len)
-
-            # per-section windows
-            sec_names = [
-                "queue_get", "cmd_apply", "read_state", "recv_extra",
-                "rb_put", "virt_update", "wrench", "forcemode", "waitPeriod"
-            ]
-            sec_wins = {k: _PerfWin(win_len) for k in sec_names}
-            t_prev = time.monotonic()
-            log_interval = 5.0
-            next_log_time = t_prev + log_interval
-
-            # 5) Start main control loop
-            while keep_running:
-                t_loop_start = rtde_c.initPeriod()
-                t_iter0 = time.monotonic()
-
-                # start-to-start loop dt (jitter)
-                dt_loop = t_iter0 - t_prev
-                t_prev = t_iter0
-                dt_win.add(dt_loop)
-
-                # ---------------- section: queue_get ----------------
-                t0 = time.monotonic()
-                msgs, n_cmd = self._get_pending_commands()
-                sec_wins["queue_get"].add(time.monotonic() - t0)
-
-                t0 = time.monotonic()
-                keep_running, active_space, x_cmd, q_cmd = self._apply_pending_commands(
-                    msgs=msgs,
-                    n_cmd=n_cmd,
-                    rtde_c=rtde_c,
-                    rtde_r=rtde_r,
-                    active_space=active_space,
-                    x_cmd=x_cmd,
-                    q_cmd=q_cmd,
-                )
-                sec_wins["cmd_apply"].add(time.monotonic() - t0)
-
-                if not keep_running:
-                    break
-
-                # ---------------- section: read_state ----------------
-                t0 = time.monotonic()
-                current_state = self.read_current_state(rtde_r)
-                pose_F = current_state["ActualTCPPose"]
-                v_F = current_state["ActualTCPSpeed"]
-    
-                # filtered wrench
-                if ft_alpha is None:
-                    measured_wrench_F = current_state["ActualTCPForce"]
-                else:
-                    measured_wrench_F += ft_alpha * (current_state["ActualTCPForce"] - measured_wrench_F)
-                sec_wins["read_state"].add(time.monotonic() - t0)
-
-                # ---------------- section: recv_extra ----------------
-                t0 = time.monotonic()
-                for key in self._receive_keys:
-                    if key not in current_state:
-                        current_state[key] = np.array(getattr(rtde_r, 'get' + key)())
-                current_state["ActualTCPForceFiltered"] = np.array(measured_wrench_F)
-                current_state["SetTCPForce"] = np.array(wrench_F)
-                current_state['timestamp'] = time.time()
-
-                # read joint states
-                q_actual = np.asarray(current_state["ActualQ"], dtype=np.float64)
-                qd_actual = np.asarray(current_state["ActualQd"], dtype=np.float64)
-                sec_wins["recv_extra"].add(time.monotonic() - t0)
-
-                # ---------------- section: rb_put ----------------
-                t0 = time.monotonic()
-                self.robot_out_rb.put(current_state)
-                sec_wins["rb_put"].add(time.monotonic() - t0)
-
-                # ---------------- section: virt_update ----------------
-                t0 = time.monotonic()
-                if active_space == ControlSpace.TASK:
-                    # --- translation ---
-                    for i in range(3):
-                        control_mode_i = ControlMode(self.control_mode[i])
-                        delta_mode_i = DeltaMode(self.delta_mode[i])
-
-                        if control_mode_i == ControlMode.POS and delta_mode_i == DeltaMode.ABSOLUTE:
-                            x_cmd[i] = self.target[i]
-
-                        elif control_mode_i == ControlMode.POS and delta_mode_i == DeltaMode.RELATIVE:
-                            v_cmd = float(self.target[i])
-                            x_cmd[i] += v_cmd * dt
-
-                        elif control_mode_i == ControlMode.VEL or control_mode_i == ControlMode.WRENCH:
-                            pass
-
-                    # --- rotation ---
-                    mask_abs_pos = np.array(
-                        [
-                            ControlMode(self.control_mode[i]) == ControlMode.POS
-                            and DeltaMode(self.delta_mode[i]) == DeltaMode.ABSOLUTE
-                            for i in range(3, 6)
-                        ],
-                        dtype=bool,
-                    )
-                    if np.any(mask_abs_pos):
-                        rpy_cmd = self._rotvec_to_rpy(x_cmd[3:6])
-                        target_rpy = np.asarray(self.target[3:6], dtype=float)
-                        rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
-                        x_cmd[3:6] = self._rpy_to_rotvec(rpy_cmd)
-
-                    # SO(3) integration for angular velocity
-                    mask_delta_pos = np.array(
-                        [
-                            ControlMode(self.control_mode[i]) == ControlMode.POS
-                            and DeltaMode(self.delta_mode[i]) == DeltaMode.RELATIVE
-                            for i in range(3, 6)
-                        ],
-                        dtype=bool,
-                    )
-                    if np.any(mask_delta_pos):
-                        omega = np.zeros(3, dtype=float)
-                        omega[mask_delta_pos] = np.array(self.target[3:6], dtype=float)[mask_delta_pos]
-                        R_cmd = R.from_rotvec(x_cmd[3:6])
-                        dR_move = R.from_rotvec(omega * dt)
-                        R_cmd = dR_move * R_cmd
-                        x_cmd[3:6] = R_cmd.as_rotvec()
-
-                    # first enforce task-space pose bounds
-                    x_cmd = self.clip_pose(x_cmd)
-                    # then anti-windup: clamp stored virtual target error relative to actual pose
-                    x_cmd = self._clamp_virtual_target_error_task(x_cmd, pose_F)
-                elif active_space == ControlSpace.JOINT:
-                    for i in range(len(q_cmd)):
-                        if DeltaMode(self.delta_mode[i]) == DeltaMode.ABSOLUTE:
-                            q_cmd[i] = float(self.target[i])
-                        else:
-                            q_cmd[i] += float(self.target[i]) * dt
-                sec_wins["virt_update"].add(time.monotonic() - t0)
-
-                # ---------------- section: wrench ----------------
-                t0 = time.monotonic()
-                wrench_F = np.zeros(6, dtype=np.float64)
-                torque_cmd = np.zeros(6, dtype=np.float64)
-                if active_space == ControlSpace.TASK:
-                    wrench_F = self._compute_task_wrench(
-                        x_cmd=x_cmd,
-                        pose_F=pose_F,
-                        v_F=v_F,
-                        measured_wrench_F=measured_wrench_F,
-                    )
-                elif active_space == ControlSpace.JOINT:
-                    torque_cmd = self._compute_joint_torque(
-                        q_cmd=q_cmd,
-                        q_actual=q_actual,
-                        qd_actual=qd_actual,
-                    )
-                sec_wins["wrench"].add(time.monotonic() - t0)
-
-                # ---------------- section: forcemode ----------------
-                t0 = time.monotonic()
-                if active_space == ControlSpace.TASK:
-                    self._send_task_wrench(rtde_c, wrench_F)
-                elif active_space == ControlSpace.JOINT:
-                    self._send_joint_torque(rtde_c, torque_cmd)
-                sec_wins["forcemode"].add(time.monotonic() - t0)
-
-                # compute time (everything before wait)
-                t_pre_wait = time.monotonic()
-                compute_time = t_pre_wait - t_iter0
-                compute_win.add(compute_time)
-
-                # ---------------- section: waitPeriod ----------------
-                t0 = time.monotonic()
-                rtde_c.waitPeriod(t_loop_start)
-                sec_wins["waitPeriod"].add(time.monotonic() - t0)
-
-                if self.config.verbose and t_iter0 >= next_log_time and dt_win.buf:
-                    dt_s = dt_win.stats()
-                    ct_s = compute_win.stats()
-
-                    # rank sections by p99 or max
-                    sec_lines = []
-                    for k in sec_names:
-                        s = sec_wins[k].stats()
-                        if s is None:
-                            continue
-                        sec_lines.append((k, s["p99"], s["max"], s["mean"]))
-                    sec_lines.sort(key=lambda x: x[1], reverse=True)
-
-                    top = sec_lines[:5]
-                    top_str = "  ".join([f"{k}:p99={_ms(p99):.2f} max={_ms(mx):.2f}" for k, p99, mx, _ in top])
-
-                    print(
-                        f"[RTDETaskFrameController] dt_loop(ms) p50={_ms(dt_s['p50']):.2f} p90={_ms(dt_s['p90']):.2f} "
-                        f"p99={_ms(dt_s['p99']):.2f} max={_ms(dt_s['max']):.2f} | "
-                        f"compute(ms) p50={_ms(ct_s['p50']):.2f} p99={_ms(ct_s['p99']):.2f} max={_ms(ct_s['max']):.2f} | "
-                        f"top: {top_str}"
-                    )
-                    next_log_time = t_iter0 + log_interval
-
-                # regulate loop frequency
-                rtde_c.waitPeriod(t_loop_start)
-                iter_idx += 1
-
-                is_dt_spike = (dt_loop > spike_abs_s) or (dt_loop > spike_rel * dt_nom)
-                is_compute_spike = (compute_time > spike_compute_s)
-
-                if self.config.verbose and (is_dt_spike or is_compute_spike):
-                    # snapshot last section durations (use the most recent appended values)
-                    last_secs = {k: (sec_wins[k].buf[-1] if sec_wins[k].buf else float("nan")) for k in sec_names}
-                    # find culprit
-                    culprit = max(last_secs.items(), key=lambda kv: (0.0 if math.isnan(kv[1]) else kv[1]))
-
-                    gc_counts = gc.get_count()
-                    # if you want more: gc.get_stats() is heavier; only do it on spike.
-                    # gc_stats = gc.get_stats()
-
-                    print(
-                        f"[RTDETaskFrameController][SPIKE] iter={iter_idx} "
-                        f"dt_loop={_ms(dt_loop):.2f}ms (dt={_ms(dt_nom):.2f}ms) "
-                        f"compute={_ms(compute_time):.2f}ms n_cmd={n_cmd} "
-                        f"culprit={culprit[0]}:{_ms(culprit[1]):.2f}ms "
-                        f"secs(ms)="
-                        + " ".join([f"{k}={_ms(last_secs[k]):.2f}" for k in sec_names])
-                        + f" gc_count={gc_counts}"
-                    )
-
-                if not self.ready_event.is_set():
-                    self.ready_event.set()
-                # end of while keep_running
-        finally:
-            # cleanup: exit force‐mode, disconnect RTDE
-            try:
-                if self.force_on:
-                    rtde_c.forceModeStop()
-            except Exception:
-                pass
-            try:
-                rtde_c.stopScript()
-            except Exception:
-                pass
-            try:
-                rtde_c.disconnect()
-            except Exception:
-                pass
-            try:
-                rtde_r.disconnect()
-            except Exception:
-                pass
-
-            self.ready_event.set()
-            if self.config.verbose:
-                print(f"[RTDETaskFrameController] Disconnected from robot {robot_ip}")
+            if self.force_on:
+                rtde_c.forceModeStop()
+        except Exception:
+            pass
+        try:
+            rtde_c.stopScript()
+        except Exception:
+            pass
+        try:
+            rtde_c.disconnect()
+        except Exception:
+            pass
+        try:
+            rtde_r.disconnect()
+        except Exception:
+            pass
 
     def read_current_state(self, rtde_r):
         """Read world state from RTDE and express pose/twist/wrench in the task frame.
@@ -978,7 +1088,7 @@ class RTDETaskFrameController(mp.Process):
             dict: ``{'ActualTCPPose','ActualTCPSpeed','ActualTCPForce'}`` in task frame.
         """
         # 1) get the world→frame 4×4
-        T = np.linalg.inv(self.sixvec_to_homogeneous(self.origin))
+        T = np.linalg.inv(sixvec_to_homogeneous(self.origin))
         R_fw = T[:3, :3]        # rotation: world → frame
         t_fw = T[:3,  3]        # translation: world origin in frame coords
 
@@ -1029,13 +1139,11 @@ class RTDETaskFrameController(mp.Process):
         }
 
     def clip_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Clamp translation per-axis and rotation in RPY space; return rot-vector.
+        """Clamp translation per-axis and rotation in RPY space.
 
-        Args:
-            pose (np.ndarray): 6-vector (x,y,z, rx,ry,rz) in task frame.
-
-        Returns:
-            np.ndarray: Bounded pose as rotation-vector representation.
+        Translation is clipped directly.
+        Rotation is clipped per axis either as a standard numeric interval
+        ("linear") or as a wrapped CCW arc on S1 ("ccw_arc").
         """
         out = pose.copy()
 
@@ -1046,15 +1154,14 @@ class RTDETaskFrameController(mp.Process):
             np.array(self.max_pose[:3])
         )
 
-        # --- rotation (do clamp in Euler) ---
-        rpy = self._rotvec_to_rpy(out[3:6])
-        rpy = np.clip(
-            rpy,
-            np.array(self.min_pose[3:6]),
-            np.array(self.max_pose[3:6])
-        )
-        out[3:6] = self._rpy_to_rotvec(rpy)
+        # --- rotation ---
+        rpy = rotvec_to_euler_xyz(out[3:6]).astype(np.float64)
+        rpy = wrap_to_pi(rpy)
 
+        for j, axis in enumerate(range(3, 6)):
+            rpy[j] = self._clip_rotational_axis(float(rpy[j]), axis)
+
+        out[3:6] = euler_xyz_to_rotvec(rpy)
         return out
 
     def apply_wrench_bounds(self, pose: np.ndarray, desired_wrench: np.ndarray, measured_wrench: np.ndarray):
@@ -1079,7 +1186,7 @@ class RTDETaskFrameController(mp.Process):
             if np.sign(desired_wrench[i]) == np.sign(f_measured):
                 f_measured = 0.0
 
-            scale_vec[i] = self.exp_scale(
+            scale_vec[i] = exp_scale(
                 abs(f_measured),
                 self.wrench_limits[i],
                 self.compliance_adaptive_limit_min[i],
@@ -1108,43 +1215,43 @@ class RTDETaskFrameController(mp.Process):
                 penetration = self.min_pose[i] - pose[i]  # > 0
                 desired_wrench[i] += +self.kp[i] * penetration
 
-        # ----- rotation axes (convert to Euler first) -----
-        # Operate in Euler to measure penetration; torques are Nm.
-        rpy = self._rotvec_to_rpy(pose[3:6]).astype(np.float64)
-
-        # Optional: wrap angles & bounds to [-pi, pi] if you use bounded RPY ranges
-        rpy = self.wrap_to_pi(rpy)
+        # ----- rotation axes (operate in wrapped RPY coordinates) -----
+        rpy = wrap_to_pi(rotvec_to_euler_xyz(pose[3:6]).astype(np.float64))
         min_rpy = np.array(self.min_pose[3:6], dtype=np.float64)
         max_rpy = np.array(self.max_pose[3:6], dtype=np.float64)
 
         for j, i in enumerate(range(3, 6)):
             desired_wrench[i] = np.clip(desired_wrench[i], -scaled_wrench_limits[i], scaled_wrench_limits[i])
 
-            # upper bound violation
-            if rpy[j] > max_rpy[j]:
-                if desired_wrench[i] > 0.0:  # outward (increasing angle)
-                    desired_wrench[i] = 0.0
-                penetration = rpy[j] - max_rpy[j]  # > 0 (rad)
-                desired_wrench[i] += -self.kp[i] * penetration  # Nm
+            if self._rotation_interval_mode(i) == "ccw_arc":
+                correction = signed_error_to_nearest_arc_endpoint(
+                    float(rpy[j]),
+                    float(min_rpy[j]),
+                    float(max_rpy[j]),
+                )
+                penetration = abs(correction)
 
-            # lower bound violation
-            elif rpy[j] < min_rpy[j]:
-                if desired_wrench[i] < 0.0:  # outward (decreasing angle)
-                    desired_wrench[i] = 0.0
-                penetration = min_rpy[j] - rpy[j]  # > 0 (rad)
-                desired_wrench[i] += +self.kp[i] * penetration  # Nm
+                if penetration > 0.0:
+                    # If commanded torque points away from the nearest allowed endpoint,
+                    # suppress it before adding restoring torque.
+                    if desired_wrench[i] * correction < 0.0:
+                        desired_wrench[i] = 0.0
+                    desired_wrench[i] += self.kp[i] * correction
+
+            else:
+                if rpy[j] > max_rpy[j]:
+                    if desired_wrench[i] > 0.0:
+                        desired_wrench[i] = 0.0
+                    penetration = rpy[j] - max_rpy[j]
+                    desired_wrench[i] += -self.kp[i] * penetration
+
+                elif rpy[j] < min_rpy[j]:
+                    if desired_wrench[i] < 0.0:
+                        desired_wrench[i] = 0.0
+                    penetration = min_rpy[j] - rpy[j]
+                    desired_wrench[i] += +self.kp[i] * penetration
 
             desired_wrench[i] = np.clip(desired_wrench[i], -scaled_wrench_limits[i], scaled_wrench_limits[i])
-
-        if self.config.debug:
-            axis = self.config.debug_axis
-            print(
-                f"[{['X', 'Y', 'Z', 'A', 'B', 'C'][axis]}-Axis]  "
-                f"{'Crtl':<6}: {desired_wrench[axis]:10.3f}   "
-                f"{'Meas':<6}: {measured_wrench[axis]:10.3f}   "
-                f"{'a':<6}: {scale_vec[axis]:10.3f}   "
-                f"{'a * F_max':<10}: {scaled_wrench_limits[axis]:10.3f}"
-            )
 
     def clip_reference_errors(self, e: float, edot: float, i: int) -> tuple[float, float]:
         """
@@ -1153,7 +1260,7 @@ class RTDETaskFrameController(mp.Process):
         """
         _kp = self.kp[i]
         _kd = self.kd[i]
-        _fmax = self.active_compliance_desired_wrench[i]
+        _fmax = self.compliance_desired_wrench[i]
 
         if _fmax <= 0:
             return 0.0, 0.0
@@ -1163,100 +1270,6 @@ class RTDETaskFrameController(mp.Process):
         if _kd > 0:
             edot = float(np.clip(edot, -_fmax / _kd, _fmax / _kd))
         return e, edot
-
-    @staticmethod
-    def homogenous_to_sixvec(T):
-        """4×4 homogeneous transform → 6-vector [tx,ty,tz, rx,ry,rz].
-
-        Args:
-            T (np.ndarray): Homogeneous matrix (4,4).
-
-        Returns:
-            list[float]: Translation + rotation-vector.
-
-        Raises:
-            ValueError: If input is not (4,4).
-        """
-        if T.shape != (4, 4):
-            raise ValueError("Input must be a 4x4 matrix.")
-
-        # 1) Extract the translation component
-        t = T[:3, 3]  # (tx, ty, tz)
-
-        # 2) Extract the 3×3 rotation sub‐matrix
-        R_mat = T[:3, :3]
-
-        # 3) Convert rotation matrix → rotation vector (axis * angle)
-        rot = R.from_matrix(R_mat)
-        rot_vec = rot.as_rotvec()  # (rx, ry, rz)
-
-        # 4) Concatenate translation and rotation vector into a single 6-vector
-        six_vec = np.concatenate((t, rot_vec))
-        return list(six_vec)
-
-    @staticmethod
-    def sixvec_to_homogeneous(six_vec):
-        """6-vector [tx,ty,tz, rx,ry,rz] → 4×4 homogeneous transform.
-
-        Args:
-            six_vec (array-like): First 3 translation, last 3 rotation-vector.
-
-        Returns:
-            np.ndarray: Homogeneous transform (4,4).
-
-        Raises:
-            ValueError: If input shape is not (6,).
-        """
-        six = np.asarray(six_vec, dtype=float)
-        if six.shape != (6,):
-            raise ValueError(f"Expected 6-vector, got shape {six.shape}")
-
-        # translation
-        t = six[:3]
-
-        # rotation matrix from axis-angle
-        rot_vec = six[3:]
-        R_mat = R.from_rotvec(rot_vec).as_matrix()
-
-        # build homogeneous matrix
-        T = np.eye(4, dtype=float)
-        T[:3, :3] = R_mat
-        T[:3, 3] = t
-        return T
-
-    @staticmethod
-    def exp_scale(f_meas, f_thresh, s_min=0.2, theta=0.1):
-        """Exponential scaling from contact force to [s_min, 1].
-
-        Args:
-            f_meas (float): Measured absolute force/moment (≥0).
-            f_thresh (float): Nominal limit (unused here; for symmetry with caller).
-            s_min (float, optional): Lower bound of scaling ∈ (0,1].
-            theta (float, optional): Decay constant; larger → slower decay.
-
-        Returns:
-            float: Scale factor in [s_min, 1].
-        """
-        return s_min + (1 - s_min) * np.exp(-f_meas / theta)
-
-    @staticmethod
-    def wrap_to_pi(angles: np.ndarray) -> np.ndarray:
-        """Wrap angles [rad] elementwise to (-pi, pi]."""
-        out = (angles + np.pi) % (2 * np.pi) - np.pi
-        # map -pi to +pi for consistency if desired:
-        out[np.isclose(out, -np.pi)] = np.pi
-        return out
-
-    @staticmethod
-    def _rotvec_to_rpy(rv: np.ndarray) -> np.ndarray:
-        """Rotation-vector → roll-pitch-yaw (xyz order, radians)."""
-        return R.from_rotvec(rv).as_euler('xyz', degrees=False)
-
-    @staticmethod
-    def _rpy_to_rotvec(rpy: np.ndarray) -> np.ndarray:
-        """Roll-pitch-yaw (xyz, radians) → rotation-vector (axis-angle)."""
-        return R.from_euler('xyz', rpy, degrees=False).as_rotvec()
-
 
 def _validate_config(config: 'URConfig') -> 'URConfig':
     """Normalize and validate controller configuration.

@@ -34,15 +34,13 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 repo_id = f"{cfg.dataset.repo_id}-{name}"
 
                 if cfg.resume:
-                    datasets[name] = LeRobotDataset(
+                    datasets[name] = LeRobotDataset.resume(
                         repo_id,
                         root=root,
                         batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                         vcodec=cfg.dataset.vcodec,
-                    )
-                    datasets[name].start_image_writer(
-                        num_processes=cfg.dataset.num_image_writer_processes,
-                        num_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras
+                        image_writer_processes=cfg.dataset.num_image_writer_processes,
+                        image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
                     )
 
                 else:

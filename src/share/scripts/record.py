@@ -171,12 +171,10 @@ def record_loop(
         dt_loop = time.perf_counter() - start_loop_t
         logging.info(
             f"[{task}] "
-            #f"{transition[TransitionKey.OBSERVATION]["main.x.ee_pos"]}, "
-            #f"{transition[TransitionKey.OBSERVATION]["main.y.ee_pos"]}, "
-            #f"{transition[TransitionKey.OBSERVATION]["main.z.ee_pos"]}"
             f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
             f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
         )
+
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
@@ -223,8 +221,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if info.get(TeleopEvents.RERECORD_EPISODE, False):
                     log_say("Re-record episode", cfg.play_sounds, blocking=True)
                     dataset.clear_episode_buffer()
-                elif dataset.episode_buffer["size"] > 0:
-                    log_say("Save episode", cfg.play_sounds, blocking=False)
+                elif dataset.writer.episode_buffer["size"] > 0:
+                    log_say("Save episode", cfg.play_sounds, blocking=True)
                     dataset.save_episode()
                 else:
                     log_say("Dataset is empty, continue execution", cfg.play_sounds, blocking=True)

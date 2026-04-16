@@ -263,9 +263,9 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
                 float(teleop_action.get("delta_x", teleop_action.get("x.vel", 0.0))),
                 float(teleop_action.get("delta_y", teleop_action.get("y.vel", 0.0))),
                 float(teleop_action.get("delta_z", teleop_action.get("z.vel", 0.0))),
-                float(teleop_action.get("delta_rx", teleop_action.get("wx.vel", 0.0))),
-                float(teleop_action.get("delta_ry", teleop_action.get("wy.vel", 0.0))),
-                float(teleop_action.get("delta_rz", teleop_action.get("wz.vel", 0.0))),
+                float(teleop_action.get("delta_rx", teleop_action.get("wx.vel", teleop_action.get("rx.vel", 0.0)))),
+                float(teleop_action.get("delta_ry", teleop_action.get("wy.vel", teleop_action.get("ry.vel", 0.0)))),
+                float(teleop_action.get("delta_rz", teleop_action.get("wz.vel", teleop_action.get("rz.vel", 0.0)))),
             ]
         return [float(v) for v in teleop_action][:6]
 

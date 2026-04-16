@@ -10,6 +10,7 @@ from lerobot.processor.hil_processor import HasTeleopEvents
 from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
+from share.envs.manipulation_primitive.task_frame import TASK_FRAME_AXIS_NAMES
 from share.teleoperators.spacemouse.lerobot_teleoperator_spacemouse import pyspacemouse
 
 
@@ -152,7 +153,7 @@ class SpaceMouse(Teleoperator, HasTeleopEvents):
         latest_action = self.latest_data.get("action", [0.0] * 6)
         action = {
             f"{ax}.vel": latest_action[i] * self.config.action_scale[i]
-            for i, ax in enumerate(["x", "y", "z", "wx", "wy", "wz"])
+            for i, ax in enumerate(TASK_FRAME_AXIS_NAMES)
         }
 
         # handle gripper action
