@@ -499,7 +499,6 @@ class DiscretizeGripperProcessorStep(ProcessorStep):
         new_transition = transition.copy()
         new_action = dict(action)
         for name, robot_action in new_action.items():
-            print("static, ", self.static_pos.get(name, None))
             if self.static_pos.get(name, None) is not None:
                 new_action[name][f"{GRIPPER_KEY}.pos"] = self.static_pos[name]
                 continue

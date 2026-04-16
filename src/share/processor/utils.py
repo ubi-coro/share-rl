@@ -48,7 +48,8 @@ def flatten_nested_policy_action(
 
 def policy_action_keys_for_robot(frame: "TaskFrame", gripper_enable: bool) -> list[str]:
     keys = list(frame.policy_action_keys())
-    if gripper_enable:
+    gripper_key = f"{GRIPPER_KEY}.pos"
+    if gripper_enable and gripper_key not in keys:
         keys.append(f"{GRIPPER_KEY}.pos")
     return keys
 
