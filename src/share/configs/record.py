@@ -55,8 +55,6 @@ class DatasetRecordConfig(draccus.ChoiceRegistry, DatasetConfig):
     vcodec: str = "libsvtav1"
 
     def __post_init__(self):
-        if self.single_task is None:
-            raise ValueError("You need to provide a task as argument in `single_task`.")
         if not self.in_memory:
             self.load_dir = False
 
