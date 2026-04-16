@@ -75,11 +75,14 @@ def record_loop(
     interactive: bool = False,
     debugger: MPNetDebugger | None = None,
 ):
+    # reset
     transition = mp_net.reset()
+    if mp_net.active_primitive in policies:
+        policies[mp_net.active_primitive].reset()
     if debugger is not None:
         debugger.log_reset(mp_net, transition)
 
-    # check if we need to terminate early
+    # check if we need to terminate early, ie during reset
     info = transition.get(TransitionKey.INFO, {})
     if info.get(TeleopEvents.STOP_RECORDING, False):
         return info
@@ -88,6 +91,7 @@ def record_loop(
     task = mp_net.config.primitives[mp_net.active_primitive].task_description
     task = mp_net.active_primitive if task is None else task
 
+    # record loop
     sum_reward = 0.0
     while True:
         start_loop_t = time.perf_counter()
