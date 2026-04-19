@@ -57,3 +57,39 @@ What to preserve when editing
 - prefer reusing the shared observation-pose utility instead of adding new
   redundant info keys
 - keep package imports light to avoid circular-import churn
+
+Task-frame rotation semantics
+-----------------------------
+
+The UR task-frame controller intentionally mixes two rotation semantics:
+
+- absolute rotational ``POS`` targets are exposed as wrapped XYZ Euler angles at
+  the API, because that is the only representation here where "lock roll, set
+  yaw, leave pitch learnable" is directly meaningful per axis
+- relative rotational ``POS`` targets are treated as a masked angular velocity
+  in the task-frame basis and integrated on ``SO(3)``
+
+The update rule is therefore:
+
+.. math::
+
+   R_{k+\!1/2} = \exp(\widehat{\omega}_{\mathrm{mask}} \, \Delta t)\, R_k
+
+followed, when absolute rotational axes are present, by converting
+``R_{k+1/2}`` to wrapped XYZ Euler angles, overwriting the absolute slots, and
+converting back to the controller's internal rotation-vector state.
+
+This is deliberate. Euler angles are a chart, not a linear space. A mixed
+policy that "integrates the relative slots in Euler" becomes unintuitive away
+from zero because the order of XYZ Euler rotations means an absolute setting on
+one axis can change the meaning of the remaining slots.
+
+The practical release-ready pattern is:
+
+- put the large fixed orientation bias into the task-frame ``origin``
+- keep mixed absolute rotational targets near zero whenever possible
+
+Near zero, the Euler chart is locally well behaved and the masked ``SO(3)``
+delta update is much easier to reason about. This keeps mixed absolute/relative
+orientation commands predictable without pretending that Euler slots and
+rotation-vector integration are the same space.

@@ -947,7 +947,14 @@ class RTDETaskFrameController(mp.Process):
         return f_soft / kp
 
     def _integrate_virtual_target_rotation(self, rotvec_cmd: np.ndarray, dt: float) -> np.ndarray:
-        """Update rotational virtual targets in either free SO(3) or constrained XYZ RPY semantics."""
+        """Update rotational virtual targets with masked SO(3) deltas plus Euler absolutes.
+
+        Relative rotational POS axes are interpreted as an angular velocity in the
+        task-frame basis and integrated on ``SO(3)`` with the remaining axes masked
+        to zero. Absolute rotational POS axes are then imposed in the user-facing
+        XYZ Euler chart. This preserves the expected 3D delta semantics while still
+        allowing per-axis absolute locks at the task-frame API.
+        """
         out = np.asarray(rotvec_cmd, dtype=np.float64).copy()
         target_rpy = np.asarray(self.target[3:6], dtype=np.float64)
         mask_abs_pos = np.array(
@@ -968,27 +975,14 @@ class RTDETaskFrameController(mp.Process):
         )
 
         if np.any(mask_delta_pos):
-            if np.all(mask_delta_pos) and not np.any(mask_abs_pos):
-                # Fully relative 3-axis rotation can follow free SO(3) integration.
-                omega = np.zeros(3, dtype=np.float64)
-                omega[mask_delta_pos] = target_rpy[mask_delta_pos]
-                return (R.from_rotvec(omega * dt) * R.from_rotvec(out)).as_rotvec()
-
-            # Mixed/partial rotational targets use the controller's constrained
-            # XYZ Euler chart so absolute axes stay locked while relative axes
-            # integrate in the same semantics exposed at the task-frame API.
-            rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
-            if np.any(mask_abs_pos):
-                rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
-            rpy_cmd[mask_delta_pos] = wrap_to_pi(
-                rpy_cmd[mask_delta_pos] + target_rpy[mask_delta_pos] * dt
-            )
-            return euler_xyz_to_rotvec(rpy_cmd)
+            omega = np.zeros(3, dtype=np.float64)
+            omega[mask_delta_pos] = target_rpy[mask_delta_pos]
+            out = (R.from_rotvec(omega * dt) * R.from_rotvec(out)).as_rotvec()
 
         if np.any(mask_abs_pos):
             rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
             rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
-            return euler_xyz_to_rotvec(rpy_cmd)
+            out = euler_xyz_to_rotvec(rpy_cmd)
 
         return out
 
