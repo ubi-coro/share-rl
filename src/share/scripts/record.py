@@ -81,7 +81,8 @@ def record_loop(
 ):
     # reset
     transition = mp_net.reset()
-    if mp_net.active_primitive in policies:
+    policy = policies.get(mp_net.active_primitive, None)
+    if policy is not None:
         policies[mp_net.active_primitive].reset()
     if debugger is not None:
         debugger.log_reset(mp_net, transition)
