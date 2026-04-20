@@ -69,7 +69,12 @@ class _DummyRobot:
 @dataclass
 class _DummyTaskFrameRobot(_DummyRobot):
     last_task_frame: TaskFrame | None = None
-    current_frame: TaskFrame = field(default_factory=lambda: TaskFrame(control_mode=[ControlMode.VEL] * 6))
+    current_frame: TaskFrame = field(
+        default_factory=lambda: TaskFrame(
+            control_mode=[ControlMode.VEL] * 6,
+            policy_mode=[None] * 6,
+        )
+    )
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -115,6 +120,7 @@ def test_env_step_after_reset_smoke():
     frame = TaskFrame(
         target=[0.0] * 6,
         control_mode=[ControlMode.VEL, ControlMode.POS, ControlMode.FORCE, ControlMode.POS, ControlMode.POS, ControlMode.VEL],
+        policy_mode=[None] * 6,
     )
     robot = _DummyTaskFrameRobot()
     env = ManipulationPrimitive(task_frame={"arm": frame}, robot_dict={"arm": robot}, cameras={})

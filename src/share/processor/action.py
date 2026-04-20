@@ -4,9 +4,9 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from lerobot.types import EnvTransition, TransitionKey
 from scipy.spatial.transform import Rotation
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.processor import EnvTransition, TransitionKey
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY, GRIPPER_KEY
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 
@@ -15,10 +15,9 @@ from share.envs.manipulation_primitive.task_frame import (
     ControlSpace,
     PolicyMode,
     TaskFrame,
-    TASK_FRAME_AXIS_NAMES
 )
 from share.envs.utils import check_delta_teleoperator
-from share.utils.transformation_utils import rotation_from_extrinsic_xyz, rotation_component_keys
+from share.utils.transformation_utils import rotation_from_extrinsic_xyz, rotation_component_keys, wrap_to_pi
 from share.processor.utils import policy_action_keys_for_robot, flatten_nested_policy_action
 from share.teleoperators.utils import TeleopEvents
 
@@ -32,10 +31,60 @@ for _registry_name in (
 ):
     ProcessorStepRegistry.unregister(_registry_name)
 
+
+def _task_pose_from_mixed_command(base_pose: list[float], frame: TaskFrame, task_target: list[float]) -> list[float]:
+    """Apply mixed relative/absolute task-frame POS semantics to one task-space command.
+
+    Translation relative axes integrate directly in Euclidean coordinates.
+    Rotational relative POS axes integrate as a masked ``SO(3)`` delta, then all
+    non-relative rotational POS axes are imposed in wrapped XYZ Euler coordinates.
+    This matches the UR controller's release-ready mixed-rotation semantics.
+    """
+    out = list(task_target)
+
+    for axis in range(3):
+        if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] == PolicyMode.RELATIVE:
+            out[axis] = float(base_pose[axis]) + float(task_target[axis])
+
+    relative_rot_axes = [
+        axis for axis in range(3, 6)
+        if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] == PolicyMode.RELATIVE
+    ]
+    absolute_rot_axes = [
+        axis for axis in range(3, 6)
+        if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] != PolicyMode.RELATIVE
+    ]
+
+    if relative_rot_axes or absolute_rot_axes:
+        rotation = Rotation.from_euler("xyz", base_pose[3:6], degrees=False)
+
+        if relative_rot_axes:
+            omega = np.zeros(3, dtype=np.float64)
+            for axis in relative_rot_axes:
+                omega[axis - 3] = float(task_target[axis])
+            rotation = Rotation.from_rotvec(omega) * rotation
+
+        if absolute_rot_axes:
+            rpy = wrap_to_pi(rotation.as_euler("xyz", degrees=False))
+            for axis in absolute_rot_axes:
+                rpy[axis - 3] = float(task_target[axis])
+            rotation = Rotation.from_euler("xyz", rpy, degrees=False)
+
+        out[3:6] = rotation.as_euler("xyz", degrees=False).tolist()
+
+    return out
+
+
+def _relative_rotation_delta_xyz(current_pose: list[float], previous_pose: list[float]) -> list[float]:
+    """Return the masked-SO(3)-compatible relative rotation delta between two XYZ Euler poses."""
+    current_rotation = Rotation.from_euler("xyz", current_pose[3:6], degrees=False)
+    previous_rotation = Rotation.from_euler("xyz", previous_pose[3:6], degrees=False)
+    return (current_rotation * previous_rotation.inv()).as_rotvec().tolist()
+
 @dataclass
 @ProcessorStepRegistry.register("to_nested_action")
 class ToNestedActionProcessorStep(ProcessorStep):
-    """Convert the flat policy action tensor into a per-robot keyed dict."""
+    """Unflatten one policy tensor into per-robot keyed learning-space actions."""
 
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
     gripper_enable: dict[str, bool] = field(default_factory=dict)
@@ -73,7 +122,12 @@ class ToNestedActionProcessorStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register("match_teleop_to_policy_action")
 class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
-    """Map raw teleop commands into the keyed policy learning-space action format."""
+    """Normalize raw teleop inputs into the keyed learning-space action schema.
+
+    Delta teleoperators stay in the policy's task/joint learning space.
+    Absolute-joint teleoperators are first mapped through FK so relative
+    task-space channels can be derived from pose differences.
+    """
 
     teleoperators: dict[str, Any] = field(default_factory=dict)
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
@@ -91,6 +145,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         self._is_delta_teleoperator = check_delta_teleoperator(self.teleoperators)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """Replace complementary teleop actions with keyed learning-space actions."""
         new_transition = transition.copy()
         complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
         teleop_action_dict = complementary_data.get(TELEOP_ACTION_KEY)
@@ -118,6 +173,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         return new_transition
 
     def _map_delta_teleop(self, name: str, frame: TaskFrame, teleop_action: Any, transition: EnvTransition) -> dict[str, float]:
+        """Map one delta teleoperator sample into the keyed learning-space schema."""
         deltas = self._extract_delta_action(teleop_action)
 
         # ik to get from integrated deltas to joints
@@ -129,7 +185,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
             base_joint_state = self._integration_base_joint_state(name, frame, transition)
             encoded: dict[str, float] = {}
             for axis in frame.learnable_axis_indices:
-                joint_name = frame.action_key_for_axis(axis)
+                joint_name = frame.joint_name_for_axis(axis)
                 joint_value = joint_target[joint_name]
                 if frame.policy_mode[axis] == PolicyMode.RELATIVE:
                     joint_value -= float(base_joint_state.get(joint_name, joint_value))
@@ -137,55 +193,80 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 
             # update virtual
             if any(frame.policy_mode[axis] == PolicyMode.ABSOLUTE for axis in frame.learnable_axis_indices):
-                learnable_joints = [frame.action_key_for_axis(axis) for axis in frame.learnable_axis_indices]
-                self._virtual_joint_target[name] = {name: joint_target[name] for name in learnable_joints}
+                learnable_joints = [frame.joint_name_for_axis(axis) for axis in frame.learnable_axis_indices]
+                self._virtual_joint_target[name] = {joint_name: joint_target[joint_name] for joint_name in learnable_joints}
 
             return encoded
 
-        source_pose = deltas
+        absolute_pose = list(frame.target)
         if any(
             frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] == PolicyMode.ABSOLUTE
             for axis in frame.learnable_axis_indices
         ):
             base_pose = self._integration_base_pose(name, frame, transition)
-            source_pose = [base_pose[i] + deltas[i] for i in range(6)]
-            self._virtual_task_pose[name] = source_pose
+            task_target = list(frame.target)
+            for axis in frame.learnable_axis_indices:
+                if frame.control_mode[axis] != ControlMode.POS:
+                    task_target[axis] = deltas[axis]
+                    continue
+                if frame.policy_mode[axis] == PolicyMode.RELATIVE:
+                    task_target[axis] = deltas[axis]
+                    continue
+                if axis < 3:
+                    task_target[axis] = float(base_pose[axis]) + float(deltas[axis])
+                else:
+                    task_target[axis] = float(wrap_to_pi(float(base_pose[axis]) + float(deltas[axis])))
 
-        return self._encode_learning_space(frame, source_pose)
+            absolute_pose = _task_pose_from_mixed_command(base_pose, frame, task_target)
+            self._virtual_task_pose[name] = list(absolute_pose)
+
+        return self._encode_learning_space(frame, absolute_pose=absolute_pose, relative_values=deltas)
 
     def _map_absolute_joint_teleop(self, name: str, frame: TaskFrame, teleop_action: Any) -> dict[str, float]:
+        """Map one absolute-joint teleoperator sample into the learning-space schema."""
         joint_state = self._extract_joint_action(teleop_action)
         if frame.space == ControlSpace.JOINT:
             prev_joint_state = self._prev_joint_state.get(name, joint_state)
             self._prev_joint_state[name] = dict(joint_state)
             encoded: dict[str, float] = {}
             for axis in frame.learnable_axis_indices:
-                joint_name = frame.action_key_for_axis(axis)
+                joint_name = frame.joint_name_for_axis(axis)
                 joint_value = float(joint_state[joint_name])
                 if frame.policy_mode[axis] == PolicyMode.RELATIVE:
                     joint_value -= float(prev_joint_state.get(joint_name, joint_value))
-                encoded[joint_name] = joint_value
+                encoded[frame.action_key_for_axis(axis)] = joint_value
             return encoded
 
         solver = self._require_solver(name)
         pose = solver.forward_kinematics(joint_state)
         prev_pose = self._prev_fk_pose.get(name, pose)
         self._prev_fk_pose[name] = pose
+        rot_delta = _relative_rotation_delta_xyz(pose, prev_pose)
 
-        source = []
+        relative_values = []
         for axis in range(6):
             if frame.policy_mode[axis] == PolicyMode.RELATIVE:
-                source.append(pose[axis] - prev_pose[axis])
+                if axis < 3:
+                    relative_values.append(pose[axis] - prev_pose[axis])
+                else:
+                    relative_values.append(rot_delta[axis - 3])
             else:
-                source.append(pose[axis])
+                relative_values.append(pose[axis])
 
-        return self._encode_learning_space(frame, source)
+        return self._encode_learning_space(frame, absolute_pose=pose, relative_values=relative_values)
 
-    def _encode_learning_space(self, frame: TaskFrame, source_pose: list[float]) -> dict[str, float]:
+    def _encode_learning_space(
+        self,
+        frame: TaskFrame,
+        absolute_pose: list[float],
+        relative_values: list[float] | None = None,
+    ) -> dict[str, float]:
+        """Encode one resolved pose plus relative channels into keyed policy inputs."""
         values: list[float] = []
         absolute_rot_axes = [
             axis for axis in frame.learnable_axis_indices if frame.is_absolute_rotation_axis(axis)
         ]
+        relative_values = absolute_pose if relative_values is None else relative_values
 
         for axis in frame.learnable_axis_indices:
             control_mode = frame.control_mode[axis]
@@ -193,12 +274,14 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
             if axis in absolute_rot_axes:
                 continue
             if control_mode in {ControlMode.VEL, ControlMode.WRENCH}:
-                values.append(source_pose[axis])
-            elif axis < 3 or policy_mode == PolicyMode.RELATIVE:
-                values.append(source_pose[axis])
+                values.append(relative_values[axis])
+            elif axis < 3 and policy_mode == PolicyMode.ABSOLUTE:
+                values.append(absolute_pose[axis])
+            elif policy_mode == PolicyMode.RELATIVE:
+                values.append(relative_values[axis])
 
         if absolute_rot_axes:
-            rot = [source_pose[3], source_pose[4], source_pose[5]]
+            rot = [absolute_pose[3], absolute_pose[4], absolute_pose[5]]
             if len(absolute_rot_axes) == 1:
                 angle = rot[absolute_rot_axes[0] - 3]
                 values.extend([math.cos(angle), math.sin(angle)])
@@ -215,6 +298,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         return {key: float(value) for key, value in zip(keys, values, strict=True)}
 
     def _integration_base_pose(self, name: str, frame: TaskFrame, transition: EnvTransition) -> list[float]:
+        """Resolve the task-pose reference used for absolute target accumulation."""
         use_virtual = self.use_virtual_reference[name] if isinstance(self.use_virtual_reference, dict) else self.use_virtual_reference
         if use_virtual and name in self._virtual_task_pose:
             return self._virtual_task_pose[name]
@@ -222,8 +306,8 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION)
         if isinstance(observation, dict):
             obs_pose = []
-            for axis_name in TASK_FRAME_AXIS_NAMES:
-                key = f"{name}.{axis_name}.ee_pos"
+            for axis in range(len(frame.target)):
+                key = f"{name}.{frame.pose_observation_key_for_axis(axis)}"
                 if key not in observation:
                     obs_pose = []
                     break
@@ -234,6 +318,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         return list(frame.target)
 
     def _integration_base_joint_state(self, name: str, frame: TaskFrame, transition: EnvTransition) -> dict[str, float]:
+        """Resolve the joint reference used when JOINT-space deltas are accumulated."""
         use_virtual = self.use_virtual_reference[name] if isinstance(self.use_virtual_reference, dict) else self.use_virtual_reference
         if use_virtual and name in self._virtual_joint_target:
             return dict(self._virtual_joint_target[name])
@@ -241,7 +326,8 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION)
         if isinstance(observation, dict):
             joint_state: dict[str, float] = {}
-            for joint_name in frame.joint_names:
+            for axis in range(len(frame.target)):
+                joint_name = frame.joint_name_for_axis(axis)
                 key = f"{name}.{joint_name}.pos"
                 if key in observation:
                     joint_state[joint_name] = observation[key]
@@ -251,6 +337,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
         return dict(self._prev_joint_state.get(name, {}))
 
     def _require_solver(self, name: str) -> Any:
+        """Fetch the configured FK/IK solver for one robot or fail clearly."""
         solver = self.kinematics.get(name)
         if solver is None:
             raise ValueError(f"Missing kinematics solver for '{name}'")
@@ -258,6 +345,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 
     @staticmethod
     def _extract_delta_action(teleop_action: Any) -> list[float]:
+        """Read one teleop sample as `[dx, dy, dz, drx, dry, drz]`."""
         if isinstance(teleop_action, dict):
             return [
                 float(teleop_action.get("delta_x", teleop_action.get("x.vel", 0.0))),
@@ -271,12 +359,13 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 
     @staticmethod
     def _extract_joint_action(teleop_action: dict) -> dict[str, float]:
+        """Normalize absolute-joint teleop keys to raw joint names without suffixes."""
         joint_state: dict[str, float] = {}
         for key, value in teleop_action.items():
             if key.endswith(".q"):
                 key = key.removesuffix(".q")
-            if "." not in key:
-                key = f"{key}.pos"
+            elif key.endswith(".pos"):
+                key = key.removesuffix(".pos")
             joint_state[key] = float(value)
         return joint_state
 
@@ -289,7 +378,7 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register("task_frame_intervention_action_processor")
 class InterventionActionProcessorStep(ProcessorStep):
-    """Merge keyed learning-space actions and project them into full robot actions."""
+    """Choose policy vs teleop input, then project keyed learning-space actions to robot actions."""
 
     teleoperators: dict[str, Any] = field(default_factory=dict)
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
@@ -297,10 +386,12 @@ class InterventionActionProcessorStep(ProcessorStep):
     gripper_static_pos: dict[str, float | None] = field(default_factory=dict)
 
     def __post_init__(self):
+        """Initialize intervention bookkeeping and optional leader-arm torque toggles."""
         self._disable_torque_on_intervention = {name: hasattr(teleop, "bus") for name, teleop in self.teleoperators.items()}
         self._intervention_occurred = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """Project either policy or intervention actions into full low-level robot actions."""
         policy_actions = transition.get(TransitionKey.ACTION)
         if not isinstance(policy_actions, dict):
             raise TypeError(f"Action should be a dict, got {type(policy_actions)}")
@@ -351,6 +442,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         return new_transition
 
     def _project_policy_action(self, frame: TaskFrame, encoded_action: dict[str, Any]) -> dict[str, float]:
+        """Expand one keyed learning-space action into a full task-frame command."""
         full_target = {
             frame.action_key_for_axis(axis): float(frame.target[axis])
             for axis in range(len(frame.target))
@@ -379,6 +471,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         return full_target
 
     def _map_to_teleop_action(self, policy_action: dict[str, dict[str, Any]], name: str) -> dict[str, float]:
+        """Map one keyed learning-space robot action back onto teleop feature names."""
         if name not in policy_action or name not in self.teleoperators:
             return {}
 
@@ -408,6 +501,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         return teleop_action
 
     def _decode_absolute_rotation(self, absolute_rot_axes: list[int], raw: list[float]) -> tuple[list[float], int]:
+        """Decode one manifold rotation representation back to XYZ Euler slots."""
         rot = [0.0, 0.0, 0.0]
         if len(absolute_rot_axes) == 1:
             if len(raw) < 2:
@@ -492,6 +586,7 @@ class DiscretizeGripperProcessorStep(ProcessorStep):
         self.reset()
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
+        """Replace continuous gripper commands with stateful open/close commands."""
         action = transition.get(TransitionKey.ACTION)
         if not isinstance(action, dict):
             return transition
@@ -558,7 +653,7 @@ class DiscretizeGripperProcessorStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register("to_joint_action_processor")
 class ToJointActionProcessorStep(ProcessorStep):
-    """Convert nested task-frame robot actions into nested joint robot actions when needed."""
+    """Resolve task-frame commands into joint commands for robots without native task control."""
 
     is_task_frame_robot: dict[str, bool] = field(default_factory=dict)
     task_frame: dict[str, TaskFrame] = field(default_factory=dict)
@@ -568,7 +663,7 @@ class ToJointActionProcessorStep(ProcessorStep):
     _virtual_task_pose: dict[str, list[float]] = field(default_factory=dict, init=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        """Convert task-space robot action dicts to joint-space robot action dicts."""
+        """Convert each non-task-frame robot action dict from task space through IK."""
         action = transition.get(TransitionKey.ACTION)
         if not isinstance(action, dict):
             return transition
@@ -603,7 +698,8 @@ class ToJointActionProcessorStep(ProcessorStep):
                 raise ValueError(f"IK failed for '{name}': {exc}") from exc
 
             robot_joint_action: dict[str, float] = {}
-            for joint_name in frame.joint_names:
+            joint_names = frame.joint_names if frame.joint_names is not None else sorted(ik_solution)
+            for joint_name in joint_names:
                 if joint_name not in ik_solution:
                     raise ValueError(f"IK solution for '{name}' missing joint '{joint_name}'")
                 robot_joint_action[f"{joint_name}.pos"] = float(ik_solution[joint_name])
@@ -618,6 +714,7 @@ class ToJointActionProcessorStep(ProcessorStep):
         return new_transition
 
     def _task_target_from_action(self, name: str, frame: TaskFrame, robot_action: dict[str, Any]) -> list[float]:
+        """Read one full task-frame command from its keyed robot-action dictionary."""
         task_target: list[float] = []
         for axis in range(len(frame.target)):
             key = frame.action_key_for_axis(axis)
@@ -633,13 +730,9 @@ class ToJointActionProcessorStep(ProcessorStep):
         task_target: list[float],
         transition: EnvTransition,
     ) -> list[float]:
-        """Integrate relative POS axes on top of the current/base task pose."""
+        """Resolve one mixed task-frame command into an absolute task pose."""
         base_pose = self._base_pose(name, frame, transition)
-        out = list(task_target)
-        for axis in frame.learnable_axis_indices:
-            if frame.control_mode[axis] == ControlMode.POS and frame.policy_mode[axis] == PolicyMode.RELATIVE:
-                out[axis] = base_pose[axis] + task_target[axis]
-        return out
+        return _task_pose_from_mixed_command(base_pose, frame, task_target)
 
     def _base_pose(self, name: str, frame: TaskFrame, transition: EnvTransition) -> list[float]:
         """Resolve integration base pose from virtual state, observation, or default target."""
@@ -650,8 +743,8 @@ class ToJointActionProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION)
         if isinstance(observation, dict):
             obs_pose = []
-            for axis_name in TASK_FRAME_AXIS_NAMES:
-                key = f"{name}.{axis_name}.ee_pos"
+            for axis in range(len(frame.target)):
+                key = f"{name}.{frame.pose_observation_key_for_axis(axis)}"
                 if key not in observation:
                     obs_pose = []
                     break

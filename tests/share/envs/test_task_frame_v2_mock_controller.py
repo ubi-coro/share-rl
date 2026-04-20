@@ -1,107 +1,62 @@
+"""Focused tests for non-hardware UR controller helpers."""
+
 from __future__ import annotations
 
-import importlib.util
-import sys
-import time
-from dataclasses import dataclass, field
-from multiprocessing.managers import SharedMemoryManager
-from pathlib import Path
+from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[3]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+import numpy as np
+import pytest
 
-MODULE_PATH = ROOT / "src/share/robots/lerobot_robot_ur/lerobot_robot_urV2/tf_controller.py"
-SPEC = importlib.util.spec_from_file_location("tf_controller_v2_test_module", MODULE_PATH)
-tf_controller = importlib.util.module_from_spec(SPEC)
-assert SPEC is not None and SPEC.loader is not None
-SPEC.loader.exec_module(tf_controller)
+from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode
+from share.robots.ur.lerobot_robot_ur.controller import Command, RTDETaskFrameController, TaskFrameCommand
 
 
-@dataclass
-class _ControllerConfig:
-    robot_ip: str
-    frequency: float = 100.0
-    payload_mass: float | None = None
-    payload_cog: list[float] | None = None
-    tcp_offset_pose: list[float] | None = None
-    soft_real_time: bool = False
-    rt_core: int = 0
-    launch_timeout: float = 1.0
-    get_max_k: int = 16
-    shm_manager: SharedMemoryManager | None = None
-    ft_filter_cutoff_hz: float | None = None
-    force_mode_gain_scaling: float = 1.0
-    max_pose_rpy: list[float] = field(default_factory=lambda: [float("inf")] * 6)
-    min_pose_rpy: list[float] = field(default_factory=lambda: [-float("inf")] * 6)
-    wrench_limits: list[float] = field(default_factory=lambda: [30.0] * 6)
-    speed_limits: list[float] = field(default_factory=lambda: [1.0] * 6)
-    deadband_pos: float = 0.001
-    deadband_rot: float = 0.01
-    leak_rate_pos: float = 5.0
-    leak_rate_rot: float = 5.0
-    compliance_safety_mode: str = "adaptive_wrench_limits"
-    compliance_safety_enable: list[bool] = field(default_factory=lambda: [False] * 6)
-    compliance_desired_wrench: list[float] = field(default_factory=lambda: [5.0] * 6)
-    compliance_adaptive_limit_theta: list[float] = field(default_factory=lambda: [1.0] * 6)
-    compliance_adaptive_limit_min: list[float] = field(default_factory=lambda: [0.1] * 6)
-    use_degrees: bool = False
-    verbose: bool = False
-    mock: bool = True
-    debug: bool = False
-    debug_axis: int = 0
+def test_task_frame_command_delta_mode_treats_only_relative_axes_as_deltas():
+    """Delta mode should be derived from policy_mode only."""
+    command = TaskFrameCommand(
+        policy_mode=[
+            PolicyMode.RELATIVE,
+            PolicyMode.ABSOLUTE,
+            None,
+            PolicyMode.RELATIVE,
+            None,
+            PolicyMode.ABSOLUTE,
+        ]
+    )
+
+    assert command.delta_mode == [
+        PolicyMode.RELATIVE,
+        PolicyMode.ABSOLUTE,
+        PolicyMode.ABSOLUTE,
+        PolicyMode.RELATIVE,
+        PolicyMode.ABSOLUTE,
+        PolicyMode.ABSOLUTE,
+    ]
 
 
-def test_mock_rtde_interfaces_generate_motion_from_force_mode():
-    hostname = f"pytest-mock-rtde-{time.time_ns()}"
-    rtde_c = tf_controller.MockRTDEControlInterface(hostname, frequency=200.0)
-    rtde_r = tf_controller.MockRTDEReceiveInterface(hostname)
-
-    rtde_c.forceModeSetGainScaling(0.5)
-    for _ in range(12):
-        period = rtde_c.initPeriod()
-        rtde_c.forceMode([0.0] * 6, [1, 1, 1, 1, 1, 1], [12.0, 0.0, 0.0, 0.0, 0.0, 1.5], 2, [1.0] * 6)
-        rtde_c.waitPeriod(period)
-
-    pose = rtde_r.getActualTCPPose()
-    speed = rtde_r.getActualTCPSpeed()
-    wrench = rtde_r.getActualTCPForce()
-
-    assert pose[0] > 0.0
-    assert abs(pose[5]) > 0.0
-    assert speed[0] > 0.0
-    assert wrench[0] > 0.0
+def test_task_frame_command_rejects_unknown_controller_override_keys():
+    """Unknown override keys should fail before queueing."""
+    with pytest.raises(ValueError, match="Unsupported UR task-frame controller overrides"):
+        TaskFrameCommand(
+            control_mode=[ControlMode.POS] * 6,
+            controller_overrides={"mystery_limit": [1.0] * 6},
+        ).to_queue_dict()
 
 
-def test_controller_mock_mode_starts_quickly_and_streams_state():
-    config = _ControllerConfig(robot_ip=f"pytest-controller-{time.time_ns()}")
-    controller = tf_controller.RTDETaskFrameController(config)
+def test_controller_zero_ft_reuses_last_command_layout_with_new_opcode():
+    """`zero_ft()` should reuse the last command payload with a new opcode."""
+    queued_items: list[dict[str, np.ndarray]] = []
+    controller = object.__new__(RTDETaskFrameController)
+    controller._last_cmd = TaskFrameCommand(
+        target=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        control_mode=[ControlMode.POS] * 6,
+        policy_mode=[PolicyMode.ABSOLUTE] * 6,
+    )
+    controller.robot_cmd_queue = SimpleNamespace(put=queued_items.append)
 
-    start = time.perf_counter()
-    controller.start(wait=True)
-    try:
-        assert time.perf_counter() - start < 0.5
+    controller.zero_ft()
 
-        cmd = tf_controller.TaskFrameCommand(
-            origin=[0.0] * 6,
-            target=[10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            control_mode=[tf_controller.ControlMode.WRENCH] + [tf_controller.ControlMode.VEL] * 5,
-            policy_mode=[None] * 6,
-            max_pose=[float("inf")] * 6,
-            min_pose=[-float("inf")] * 6,
-        )
-        controller.send_cmd(cmd)
-
-        state = controller.get_robot_state()
-        deadline = time.time() + 0.5
-        while time.time() < deadline and state["ActualTCPPose"][0] <= 0.0:
-            time.sleep(0.02)
-            state = controller.get_robot_state()
-
-        assert state["ActualTCPPose"][0] > 0.0
-        assert state["SetTCPForce"][0] > 0.0
-    finally:
-        controller.stop(wait=True)
-        if config.shm_manager is not None:
-            config.shm_manager.shutdown()
+    assert len(queued_items) == 1
+    queued = queued_items[0]
+    assert queued["cmd"] == int(Command.ZERO_FT)
+    np.testing.assert_allclose(queued["target"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])

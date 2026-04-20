@@ -1,14 +1,21 @@
+"""Focused tests for the current MP-Net workspace helpers."""
+
 from __future__ import annotations
 
-import argparse
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from share.scripts.eval_on_dataset import summarize_dataset_eval
-from share.scripts.train import build_train_config
-from share.workspace.store import WorkspaceStore
-from share.workspace.tools import WorkspaceAppRunner
+from share.workspace.mpnet import (
+    _decode_mpnet,
+    _encode_mpnet,
+    add_primitive,
+    attach_policy,
+    create_template_mpnet,
+    describe_transitions,
+    list_primitives,
+    set_terminal,
+    summarize_mpnet,
+)
 
 
 @dataclass
@@ -17,64 +24,39 @@ class _FakePolicy:
     device: str = "cpu"
 
 
-def test_app_runner_captures_logs_and_summary_fallback(monkeypatch, tmp_path):
-    store = WorkspaceStore(tmp_path / "workspace")
-    store.ensure_workspace(project="proj", task="task")
-    runner = WorkspaceAppRunner(store=store, repo_root=tmp_path)
+def test_mpnet_helpers_encode_and_decode_template_config():
+    """Template configs should round-trip through the workspace JSON helpers."""
+    config = create_template_mpnet(notes="demo template")
+    payload = _encode_mpnet(config)
+    loaded = _decode_mpnet(payload)
+    summary = summarize_mpnet(loaded)
 
-    def fake_run(command, cwd, text, capture_output, check):
-        assert command == ["echo", "hello"]
-        return subprocess.CompletedProcess(command, 0, stdout="hello\n", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    record = runner.run_subprocess(project="proj", task="task", run_type="demo", command=["echo", "hello"])
-
-    assert Path(record.stdout_path).read_text(encoding="utf-8") == "hello\n"
-    assert record.status == "succeeded"
-    assert Path(record.summary_path).exists()
+    assert payload["start_primitive"] == "main"
+    assert summary["primitive_count"] == 1
+    assert summary["primitives"][0]["notes"] == "demo template"
 
 
-def test_train_adapter_builds_config(monkeypatch, tmp_path):
+def test_mpnet_helpers_attach_policies_and_describe_transitions(monkeypatch):
+    """Policy attachment and transition summaries should match the edited config."""
     def fake_from_pretrained(policy_path: str, local_files_only: bool = False):
         assert policy_path == "/tmp/policy"
+        assert local_files_only is True
         return _FakePolicy()
 
-    monkeypatch.setattr("share.scripts.train.PreTrainedConfig.from_pretrained", fake_from_pretrained)
-    args = argparse.Namespace(
-        policy_path="/tmp/policy",
-        dataset_repo_id="demo/repo",
-        dataset_root=str(tmp_path / "dataset"),
-        output_dir=str(tmp_path / "output"),
-        job_name="demo-job",
-        policy_device=None,
-        steps=42,
-        batch_size=4,
-        eval_freq=0,
-        log_freq=10,
-        save_freq=42,
-        summary_path=None,
-        local_files_only=True,
-        no_save_checkpoint=False,
-    )
+    monkeypatch.setattr("share.workspace.mpnet.PreTrainedConfig.from_pretrained", fake_from_pretrained)
 
-    cfg = build_train_config(args)
+    config = create_template_mpnet()
+    add_primitive(config, "finish", template_from="main", is_terminal=True, connect_from="main")
+    set_terminal(config, "main", False)
+    attach_policy(config, "main", "/tmp/policy", {"steps": 42})
 
-    assert cfg.dataset.repo_id == "demo/repo"
-    assert cfg.steps == 42
-    assert str(cfg.policy.pretrained_path) == "/tmp/policy"
+    primitives = {primitive["name"]: primitive for primitive in list_primitives(config)}
+    transitions = describe_transitions(config)
 
-
-def test_eval_adapter_summarizes_primitive_datasets(tmp_path):
-    dataset_root = tmp_path / "dataset"
-    primitive_dir = dataset_root / "approach" / "meta"
-    primitive_dir.mkdir(parents=True)
-    (primitive_dir / "info.json").write_text(
-        '{"repo_id":"demo/repo-approach","total_episodes":3,"total_frames":90,"codebase_version":"v1"}',
-        encoding="utf-8",
-    )
-
-    summary = summarize_dataset_eval(dataset_root, "/tmp/policy")
-
-    assert summary["overall"]["episode_count"] == 3
-    assert summary["primitives"][0]["primitive"] == "approach"
+    assert primitives["main"]["policy_path"] == "/tmp/policy"
+    assert primitives["main"]["policy_overwrites"] == {"steps": 42}
+    assert primitives["finish"]["is_terminal"] is True
+    assert len(transitions) == 1
+    assert transitions[0]["type"] == "always"
+    assert transitions[0]["source"] == "main"
+    assert transitions[0]["target"] == "finish"

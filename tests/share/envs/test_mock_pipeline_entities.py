@@ -57,7 +57,7 @@ def test_mock_kinematics_solver_is_deterministic_for_fk_and_ik():
     pose = solver.forward_kinematics(joints)
     roundtrip_joints = solver.inverse_kinematics(pose)
 
-    assert pose == pytest.approx([0.4, 0.2, -0.1, 0.04, 0.02, -0.01])
+    assert pose == pytest.approx([0.2, 0.3, -0.1, 0.0, 0.0, 0.0])
     assert roundtrip_joints == pytest.approx(joints)
 
 

@@ -49,7 +49,7 @@ class TaskFrame:
     joint_names: list[str] | None = None
 
     def __post_init__(self) -> None:
-        """Validate task-frame axis layout and mode compatibility."""
+        """Validate task-frame shape, defaults, and per-axis mode compatibility."""
         width = len(self.target)
         if width == 0:
             raise ValueError("target must contain at least one axis")
@@ -73,7 +73,7 @@ class TaskFrame:
                 self.origin = 6 * [0.0]
             if len(self.origin) != 6:
                 raise ValueError("origin must be a 6 vector (xyz + extrinsic XYZ Euler roll/pitch/yaw in rad)")
-        elif self.space == ControlSpace.TASK:
+        elif self.space == ControlSpace.JOINT:
             if self.origin is not None:
                 raise ValueError("origin must be None when space == JOINT")
             if self.joint_names is None:
@@ -138,6 +138,7 @@ class TaskFrame:
         )
 
     def is_absolute_rotation_axis(self, axis: int) -> bool:
+        """Whether one task-space axis uses an absolute rotational POS target."""
         return (
                 axis >= 3 and
                 self.control_mode[axis] == ControlMode.POS and
@@ -145,10 +146,16 @@ class TaskFrame:
                 self.space == ControlSpace.TASK
         )
 
+    def joint_name_for_axis(self, axis: int) -> str:
+        """Return the raw joint name for one JOINT-space axis."""
+        if self.space != ControlSpace.JOINT or self.joint_names is None:
+            raise ValueError("joint_name_for_axis is only valid for JOINT-space task frames")
+        return self.joint_names[axis]
+
     def action_key_for_axis(self, axis: int) -> str:
         """Return the low-level action key for one axis of this task frame."""
         if self.space == ControlSpace.JOINT:
-            return f"{self.joint_names[axis]}.pos"
+            return f"{self.joint_name_for_axis(axis)}.pos"
 
         axis_name = TASK_FRAME_AXIS_NAMES[axis]
         suffix = {
@@ -157,6 +164,12 @@ class TaskFrame:
             ControlMode.WRENCH: "ee_wrench",
         }[self.control_mode[axis]]
         return f"{axis_name}.{suffix}"
+
+    def pose_observation_key_for_axis(self, axis: int) -> str:
+        """Return the processed observation key for one task-space pose axis."""
+        if self.space != ControlSpace.TASK:
+            raise ValueError("pose_observation_key_for_axis is only valid for TASK-space task frames")
+        return f"{TASK_FRAME_AXIS_NAMES[axis]}.ee_pos"
 
     def policy_action_keys(self) -> list[str]:
         """Return ordered learning-space keys matching the flat policy tensor layout."""

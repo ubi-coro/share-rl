@@ -326,7 +326,7 @@ def compose_delta_pose(
 # getting information (keys, poses) from observations
 def rotation_component_keys(frame: "TaskFrame", absolute_rot_axes: list[int]) -> list[str]:
     if len(absolute_rot_axes) == 1:
-        axis_name = frame.action_key_for_axis(absolute_rot_axes[0]).removesuffix(".pos")
+        axis_name = TASK_FRAME_AXIS_NAMES[absolute_rot_axes[0]]
         return [f"{axis_name}.pos.cos", f"{axis_name}.pos.sin"]
     if len(absolute_rot_axes) == 2:
         return ["rotation.s2.x", "rotation.s2.y", "rotation.s2.z"]

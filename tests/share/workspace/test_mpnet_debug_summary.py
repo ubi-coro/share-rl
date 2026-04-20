@@ -8,6 +8,7 @@ from share.workspace.mpnet import (
     MoveDeltaPrimitiveConfig,
     OnSuccess,
     OnTargetPoseReached,
+    OpenLoopTrajectorySpec,
     OpenLoopTrajectoryPrimitiveConfig,
     TaskFrame,
     summarize_mpnet_debug,
@@ -26,9 +27,11 @@ def test_summarize_mpnet_debug_reports_roles_types_and_conditions():
             ),
             "retreat": OpenLoopTrajectoryPrimitiveConfig(
                 task_frame={"arm": TaskFrame(target=[0.1, 0.0, 0.0, 0.0, 0.0, 0.0])},
-                delta={"arm": [-0.1, 0.0, 0.1, 0.0, 0.0, 0.0]},
-                duration_substeps=4,
-                substeps_per_step=2,
+                trajectory=OpenLoopTrajectorySpec(
+                    delta={"arm": [-0.1, 0.0, 0.1, 0.0, 0.0, 0.0]},
+                    frame={"arm": "world"},
+                    duration_s={"arm": 2.0},
+                ),
                 is_terminal=True,
             ),
         },

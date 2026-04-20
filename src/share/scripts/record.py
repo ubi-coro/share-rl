@@ -17,13 +17,17 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import ACTION, REWARD, DONE
 from lerobot.utils.control_utils import predict_action
-from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+try:
+    from lerobot.utils.device_utils import get_safe_torch_device
+except ImportError:  # pragma: no cover - compatibility with older lerobot layouts
+    from lerobot.utils.utils import get_safe_torch_device
 
 from share.configs.record import RecordConfig
 from share.debug.mpnet_debug import MPNetDebugger

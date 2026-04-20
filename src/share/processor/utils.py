@@ -15,6 +15,7 @@ def flatten_nested_policy_action(
     gripper_enable: dict[str, bool],
     like: Any | None = None,
 ) -> torch.Tensor:
+    """Flatten keyed per-robot learning-space actions into one policy tensor."""
 
     # first tensor in a dict helper
     def _first_tensor(value: Any) -> torch.Tensor | None:
@@ -47,6 +48,7 @@ def flatten_nested_policy_action(
 
 
 def policy_action_keys_for_robot(frame: "TaskFrame", gripper_enable: bool) -> list[str]:
+    """Return one robot's ordered learning-space keys, optionally with gripper."""
     keys = list(frame.policy_action_keys())
     gripper_key = f"{GRIPPER_KEY}.pos"
     if gripper_enable and gripper_key not in keys:

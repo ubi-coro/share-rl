@@ -28,6 +28,7 @@ from share.envs.manipulation_primitive_net.transitions import (
     OnTargetPoseReached,
 )
 from share.utils.mock_utils import MockRobot, MockTeleoperator
+from share.utils.transformation_utils import compose_delta_pose
 
 
 class IdentityProcessor:
@@ -284,8 +285,13 @@ def test_move_delta_only_resolves_fixed_pos_axes_from_entry_delta():
         ),
     )
 
+    expected_pose = compose_delta_pose(
+        [1.0, 2.0, 3.0, *expected_orientation],
+        [0.25, 0.4, 0.3, 0.05, 0.1, -0.15],
+        "world",
+    )
     assert env.target_pose["arm"] == pytest.approx(
-        [1.25, 5.0, 7.0, expected_orientation[0] + 0.05, expected_orientation[1] + 0.1, expected_orientation[2] - 0.15]
+        [expected_pose[0], 5.0, 7.0, expected_pose[3], expected_pose[4], expected_pose[5]]
     )
 
 
@@ -302,7 +308,7 @@ def test_move_delta_resolves_partial_fixed_rotation_axes_independently():
             )
         },
         delta={"arm": [0.0, 0.0, 0.0, 0.4, 0.2, 0.5]},
-        delta_frame={"arm": "ee_current"},
+        delta_frame={"arm": "ee"},
     )
     config.validate(
         robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
@@ -325,7 +331,12 @@ def test_move_delta_resolves_partial_fixed_rotation_axes_independently():
         ),
     )
 
-    assert env.target_pose["arm"][3] == pytest.approx(start_rpy[0] + 0.4)
+    expected_x_only = compose_delta_pose(
+        [0.0, 0.0, 0.0, *start_rpy],
+        [0.0, 0.0, 0.0, 0.4, 0.0, 0.0],
+        "ee",
+    )
+    assert env.target_pose["arm"][3] == pytest.approx(expected_x_only[3])
     assert env.target_pose["arm"][4] == pytest.approx(8.0)
     assert env.target_pose["arm"][5] == pytest.approx(7.0)
 

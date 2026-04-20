@@ -18,6 +18,7 @@ from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import
     ManipulationPrimitiveNet,
 )
 from share.envs.manipulation_primitive_net.transitions import Outcome
+from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode, TaskFrame
 
 
 class DummyEnv:
@@ -94,6 +95,13 @@ def _primitive(*, is_terminal: bool = False, policy=None):
         is_terminal=is_terminal,
         policy=policy,
         features={ACTION: SimpleNamespace(shape=(1,))},
+        task_frame={
+            "arm": TaskFrame(
+                target=[0.0] * 6,
+                control_mode=[ControlMode.POS] * 6,
+                policy_mode=[None] * 6,
+            )
+        },
         on_entry=lambda _env, _entry_context: None,
     )
 

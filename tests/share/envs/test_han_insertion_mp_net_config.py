@@ -1,70 +1,71 @@
-"""Tests for the migrated HAN insertion MP-net experiment config.
+"""Focused tests for the current fiddle-out experiment config."""
 
-These tests cover the experiment-local functionality added in
-``src/experiments/env/han_insertion_mp_net.py``:
-
-- primitive-graph construction,
-- randomized reset target propagation into explicit reset primitives,
-- and the custom press-to-insert transition logic.
-"""
+from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+import math
 import sys
+from pathlib import Path
+
+import pytest
 
 
-_MODULE_PATH = (
-    Path(__file__).resolve().parents[3] / "src" / "experiments" / "env" / "han_insertion_mp_net.py"
-)
-_SPEC = importlib.util.spec_from_file_location("han_insertion_mp_net", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "experiments" / "envs" / "fiddle_out.py"
+_SPEC = importlib.util.spec_from_file_location("fiddle_out_experiment", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
-HanInsertionMPNetEnvConfig = _MODULE.HanInsertionMPNetEnvConfig
-InsertionReadyTransition = _MODULE.InsertionReadyTransition
+DemoUR3eTeleopFiddleOutEnvConfig = _MODULE.DemoUR3eTeleopFiddleOutEnvConfig
+EEFiddleOutCirclePrimitiveConfig = _MODULE.EEFiddleOutCirclePrimitiveConfig
+OnSuccess = _MODULE.OnSuccess
+OnTargetPoseReached = _MODULE.OnTargetPoseReached
+TaskFrame = _MODULE.TaskFrame
+ControlMode = _MODULE.ControlMode
+ControlSpace = _MODULE.ControlSpace
 
 
-def test_han_insertion_config_builds_expected_primitive_graph():
-    """The migrated config should expose the reset path, press, insert, and terminal primitives."""
+def test_demo_fiddle_out_config_builds_expected_graph():
+    """The shipped experiment should expose the teleop -> fiddle-out loop."""
+    cfg = DemoUR3eTeleopFiddleOutEnvConfig()
 
-    cfg = HanInsertionMPNetEnvConfig(use_vision=False)
+    assert cfg.start_primitive == "teleop"
+    assert cfg.reset_primitive == "teleop"
+    assert set(cfg.primitives) == {"teleop", "fiddle_out"}
+    assert isinstance(cfg.transitions[0], OnSuccess)
+    assert isinstance(cfg.transitions[1], OnTargetPoseReached)
 
-    assert cfg.start_primitive == "press"
-    assert cfg.reset_primitive == "reset_lift"
-    assert set(cfg.primitives) == {"reset_lift", "reset_hover", "reset_settle", "press", "insert", "terminal"}
-    assert cfg.primitives["insert"].task_frame["main"].policy_action_dim == 3
-    assert cfg.primitives["terminal"].is_terminal is True
+    teleop_frame = cfg.primitives["teleop"].task_frame
+    fiddle_frame = cfg.primitives["fiddle_out"].task_frame
 
-
-def test_han_insertion_reset_pose_updates_explicit_reset_primitives():
-    """Sampling a reset pose should update the hover and settle reset primitives consistently."""
-
-    cfg = HanInsertionMPNetEnvConfig(use_vision=False)
-    sampled_pose = cfg.sample_reset_pose(__import__("numpy").random.default_rng(0))
-    cfg.apply_reset_pose(sampled_pose)
-
-    hover_target = cfg.primitives["reset_hover"].task_frame["main"].target
-    settle_target = cfg.primitives["reset_settle"].task_frame["main"].target
-
-    assert settle_target == sampled_pose
-    assert hover_target[0] == sampled_pose[0]
-    assert hover_target[1] == sampled_pose[1]
-    assert hover_target[5] == sampled_pose[5]
-    assert hover_target[2] == min(cfg.reset_hover_z_m, cfg._workspace_max_pose[2])
+    assert teleop_frame.policy_action_dim == 6
+    assert teleop_frame.space == ControlSpace.TASK
+    assert teleop_frame.control_mode == [ControlMode.POS] * 6
+    assert fiddle_frame.policy_action_dim == 0
+    assert cfg.primitives["fiddle_out"].trajectory.frame == "ee"
 
 
-def test_insertion_ready_transition_fires_on_force_or_depth():
-    """The custom press transition should fire on either contact force or insertion depth."""
-
-    transition = InsertionReadyTransition(
-        source="press",
-        target="insert",
-        position_threshold=0.032,
-        force_threshold=5.0,
+def test_fiddle_out_circle_target_pose_applies_xy_circle_and_local_z_lift():
+    """The scripted target should draw an EE-frame XY circle while ramping local Z."""
+    primitive = EEFiddleOutCirclePrimitiveConfig(
+        task_frame={"main": TaskFrame(target=[0.0] * 6, origin=[0.0] * 6)},
+        trajectory=_MODULE.OpenLoopTrajectorySpec(
+            delta={"main": [0.0, 0.0, -0.02, 0.0, 0.0, 0.0]},
+            frame={"main": "ee"},
+            duration_s={"main": 1.0},
+        ),
+        circle_radius_m={"main": 0.01},
+        circle_frequency_hz={"main": 1.0},
     )
 
-    assert transition.evaluate({"main.z.ee_pos": 0.0, "main.z.ee_wrench": 5.1}, {}).terminated is True
-    assert transition.evaluate({"main.z.ee_pos": 0.0321, "main.z.ee_wrench": 0.0}, {}).terminated is True
-    assert transition.evaluate({"main.z.ee_pos": 0.0, "main.z.ee_wrench": 0.0}, {}).terminated is False
+    target = primitive.target_pose_at(
+        alpha=0.25,
+        start_pose={"main": [0.0] * 6},
+        goal_pose={"main": [0.0, 0.0, -0.02, 0.0, 0.0, 0.0]},
+    )["main"]
+
+    assert target[0] == pytest.approx(0.01 * (math.cos(math.pi / 2.0) - 1.0))
+    assert target[1] == pytest.approx(0.01 * math.sin(math.pi / 2.0))
+    assert target[2] == pytest.approx(-0.005)
+    assert target[3:] == pytest.approx([0.0, 0.0, 0.0])
