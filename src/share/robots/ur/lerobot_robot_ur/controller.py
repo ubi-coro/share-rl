@@ -206,6 +206,8 @@ class RTDETaskFrameController(mp.Process):
             controller_overrides={
                 "kp": np.array(self.config.kp, dtype=np.float64),
                 "kd": np.array(self.config.kd, dtype=np.float64),
+                "min_pose": np.array(self.config.min_pose_rpy, dtype=np.float64),
+                "max_pose": np.array(self.config.max_pose_rpy, dtype=np.float64),
                 "wrench_limits": np.array(self.config.wrench_limits, dtype=np.float64),
                 "compliance_adaptive_limit_enable": np.array(self.config.compliance_adaptive_limit_enable, dtype=bool),
                 "compliance_reference_limit_enable": np.array(self.config.compliance_reference_limit_enable, dtype=bool),
@@ -982,7 +984,7 @@ class RTDETaskFrameController(mp.Process):
         if np.any(mask_abs_pos):
             rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
             rpy_cmd[mask_abs_pos] = target_rpy[mask_abs_pos]
-            out = euler_xyz_to_rotvec(rpy_cmd)
+            return euler_xyz_to_rotvec(rpy_cmd)
 
         return out
 

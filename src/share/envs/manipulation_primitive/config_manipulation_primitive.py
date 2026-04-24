@@ -12,7 +12,7 @@ from lerobot.datasets.pipeline_features import PREFIXES_TO_STRIP, strip_prefix, 
 from lerobot.envs import EnvConfig
 from lerobot.teleoperators import Teleoperator
 from lerobot.robots import Robot
-from lerobot.processor import DataProcessorPipeline, DeviceProcessorStep, ImageCropResizeProcessorStep
+from lerobot.processor import DataProcessorPipeline, DeviceProcessorStep
 from lerobot.processor.converters import identity_transition
 from lerobot.processor.hil_processor import GRIPPER_KEY
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
@@ -48,7 +48,7 @@ from share.processor.info import (
 from share.processor.observation import (
     JointsToEEObservation,
     RelativeFrameObservationProcessor,
-    DefaultObservationProcessor
+    StateObservationProcessor, ImageObservationProcessor,
 )
 from share.teleoperators import TeleopEvents
 from share.utils.transformation_utils import task_pose_to_world_pose, compose_delta_pose, world_pose_to_task_pose
@@ -380,7 +380,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             # builds OBS_STATE based on what we want to have in there
             # if obs has no joint vel and we want it, compute numerically
             # same for ee_vel
-            DefaultObservationProcessor(
+            StateObservationProcessor(
                 device=device,
                 gripper_enable=self.processor.gripper.enable,
                 add_joint_position_to_observation=self.processor.observation.add_joint_position_to_observation,
@@ -394,22 +394,26 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                 ee_wrench_axes=self.processor.observation.ee_wrench_axes,
                 stack_frames=self.processor.observation.stack_frames,
             ),
-            DeviceProcessorStep(device=device)
         ])
+
+        if self.processor.image_preprocessing:
+            env_pipeline_steps.append(
+                ImageObservationProcessor(
+                    crop_params_dict=self.processor.image_preprocessing.crop_params_dict,
+                    resize_size=self.processor.image_preprocessing.resize_size,
+                    filter_keys=self.processor.image_preprocessing.filter_keys,
+                    debug_timing=self.processor.hooks.time_env_processor,
+                    log_every=self.processor.hooks.log_every,
+                )
+            )
+
+        env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
         # action relative to starting pose
         if any_enabled(self.processor.observation.relative_ee_pos):
             env_pipeline_steps.append(
                 RelativeFrameObservationProcessor(
                     enable=self.processor.observation.relative_ee_pos
-                )
-            )
-
-        if self.processor.image_preprocessing:
-            env_pipeline_steps.append(
-                ImageCropResizeProcessorStep(
-                    crop_params_dict=self.processor.image_preprocessing.crop_params_dict,
-                    resize_size=self.processor.image_preprocessing.resize_size
                 )
             )
 

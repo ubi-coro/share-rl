@@ -1,10 +1,13 @@
 from collections import deque
 from dataclasses import dataclass, field
+import logging
+import time
 from typing import Any
 
 import einops
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import EnvTransition, TransitionKey
@@ -20,6 +23,7 @@ from share.utils.transformation_utils import (
 
 for _registry_name in (
     "default_observation_processor",
+    "image_preprocessing_processor",
     "joints_to_ee_observation",
     "relative_frame_observation",
     "joint_velocity_processor",
@@ -29,8 +33,8 @@ for _registry_name in (
 
 
 @dataclass
-@ProcessorStepRegistry.register("default_observation_processor")
-class DefaultObservationProcessor(ProcessorStep):
+@ProcessorStepRegistry.register("state_observation_processor")
+class StateObservationProcessor(ProcessorStep):
     """Build ``observation.state`` from normalized per-robot modality config.
 
     All boolean, axis-selection, and frame-stacking settings are expected to be
@@ -83,10 +87,6 @@ class DefaultObservationProcessor(ProcessorStep):
                 state_tensor = torch.cat(list(self._state_buffer), dim=-1)
 
             new_observation[OBS_STATE] = state_tensor
-
-        for key, value in observation.items():
-            if "image" in key:
-                new_observation[key] = self._process_image(value)
 
         new_transition[TransitionKey.OBSERVATION] = new_observation
         return new_transition
@@ -144,23 +144,6 @@ class DefaultObservationProcessor(ProcessorStep):
         self._update_prev_obs(observation)
         return values
 
-    def _process_image(self, image: Any) -> torch.Tensor:
-        img = image if isinstance(image, torch.Tensor) else torch.from_numpy(np.asarray(image))
-
-        if img.ndim == 3:
-            h, w, c = img.shape
-            if c < h and c < w:
-                img = einops.rearrange(img, "h w c -> c h w")
-        elif img.ndim == 4:
-            _, h, w, c = img.shape
-            if c < h and c < w:
-                img = einops.rearrange(img, "b h w c -> b c h w")
-        else:
-            raise ValueError(f"Expected image tensor with 3 or 4 dimensions, got shape {tuple(img.shape)}")
-
-        img = img.to(torch.float32)
-        return img / 255.0 if img.max() > 1.0 else img
-
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
@@ -199,12 +182,6 @@ class DefaultObservationProcessor(ProcessorStep):
                 type=FeatureType.STATE,
                 shape=(state_dim * self._resolved_stack_frames(),),
             )
-
-        for name, feature in obs_features.items():
-            if feature.type == FeatureType.VISUAL:
-                h, w, c = feature.shape
-                if c < h and c < w:
-                    obs_features[name].shape = (c, h, w)
 
         return new_features
 
@@ -288,6 +265,321 @@ class DefaultObservationProcessor(ProcessorStep):
     def reset(self) -> None:
         self._prev_obs.clear()
         self._state_buffer = deque(maxlen=self._resolved_stack_frames())
+
+
+@dataclass
+@ProcessorStepRegistry.register("image_observation_processor")
+class ImageObservationProcessor(ProcessorStep):
+    """Crop, resize, channel-order, and normalize image observations."""
+
+    crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
+    resize_size: tuple[int, int] | None = None
+    filter_keys: list[str] | None = None
+    debug_timing: bool = False
+    log_every: int = 1
+
+    _call_count: int = field(default=0, init=False)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if not isinstance(observation, dict):
+            return transition
+
+        self._call_count += 1
+        should_log_timing = self.debug_timing and self.log_every > 0 and self._call_count % self.log_every == 0
+        timing_parts: list[str] = []
+        new_transition = transition.copy()
+        new_observation = dict(observation)
+        for key, value in observation.items():
+            if "image" not in key:
+                continue
+            should_preprocess = self._matches_filter(key)
+            crop = self._crop_params_for(key) if should_preprocess else None
+            resize_size = self.resize_size if should_preprocess else None
+            timings: dict[str, float] | None = {} if should_log_timing else None
+            new_value = self.process_image_tensor(value, crop=crop, resize_size=resize_size, timings=timings)
+            new_observation[key] = new_value
+            if timings is not None:
+                timing_parts.append(self._format_image_timing(key, value, new_value, timings))
+
+        new_transition[TransitionKey.OBSERVATION] = new_observation
+        if timing_parts:
+            logging.info("[image-preprocess] pass=%d | %s", self._call_count, " | ".join(timing_parts))
+        return new_transition
+
+    def process_image_tensor(
+            self,
+            image: Any,
+            *,
+            crop: tuple[int, int, int, int] | None = None,
+            resize_size: tuple[int, int] | None = None,
+            timings: dict[str, float] | None = None,
+    ) -> torch.Tensor:
+        """Return a float CHW/BCHW image tensor, cropping before float conversion."""
+        if self._can_use_numpy_image_path(image):
+            return self._process_numpy_image_tensor(image, crop=crop, resize_size=resize_size, timings=timings)
+
+        total_t0 = time.perf_counter()
+        t0 = time.perf_counter()
+        img = image if isinstance(image, torch.Tensor) else torch.as_tensor(np.asarray(image))
+        self._record_timing(timings, "as_tensor", t0)
+
+        t0 = time.perf_counter()
+        original_dtype = img.dtype
+        layout = self._image_layout(img)
+        self._record_timing(timings, "layout", t0)
+
+        if crop is not None:
+            t0 = time.perf_counter()
+            img = self._crop_image(img, crop, layout)
+            self._record_timing(timings, "crop", t0)
+
+        if layout in ("hwc", "bhwc"):
+            t0 = time.perf_counter()
+            pattern = "h w c -> c h w" if img.ndim == 3 else "b h w c -> b c h w"
+            img = einops.rearrange(img, pattern)
+            self._record_timing(timings, "rearrange", t0)
+
+        t0 = time.perf_counter()
+        img = self._normalize_image(img, original_dtype)
+        self._record_timing(timings, "normalize", t0)
+
+        if resize_size is not None:
+            t0 = time.perf_counter()
+            img = self._resize_image(img, resize_size)
+            self._record_timing(timings, "resize", t0)
+
+        self._record_timing(timings, "total", total_t0)
+        return img
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        new_features = {ft: dict(bucket) for ft, bucket in features.items()}
+        obs_features = new_features.get(PipelineFeatureType.OBSERVATION, {})
+        for key, feature in obs_features.items():
+            if feature.type != FeatureType.VISUAL:
+                continue
+            c, h, w = self._chw_shape(feature.shape)
+            if self._matches_filter(key):
+                crop = self._crop_params_for(key)
+                if crop is not None:
+                    _, _, h, w = crop
+                if self.resize_size is not None:
+                    h, w = self.resize_size
+            obs_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(c, h, w))
+        return new_features
+
+    def _matches_filter(self, key: str) -> bool:
+        if not self.filter_keys:
+            return True
+        candidates = self._image_key_candidates(key)
+        return any(filter_key in candidates for filter_key in self.filter_keys)
+
+    def _crop_params_for(self, key: str) -> tuple[int, int, int, int] | None:
+        if not self.crop_params_dict:
+            return None
+        candidates = self._image_key_candidates(key)
+        for candidate in candidates:
+            if candidate in self.crop_params_dict:
+                return self.crop_params_dict[candidate]
+        return None
+
+    def _process_numpy_image_tensor(
+        self,
+        image: Any,
+        *,
+        crop: tuple[int, int, int, int] | None,
+        resize_size: tuple[int, int] | None,
+        timings: dict[str, float] | None,
+    ) -> torch.Tensor:
+        total_t0 = time.perf_counter()
+        t0 = time.perf_counter()
+        img = image.detach().numpy() if isinstance(image, torch.Tensor) else np.asarray(image)
+        self._record_timing(timings, "as_tensor", t0)
+
+        t0 = time.perf_counter()
+        original_dtype = img.dtype
+        layout = self._numpy_image_layout(img)
+        self._record_timing(timings, "layout", t0)
+
+        if crop is not None:
+            t0 = time.perf_counter()
+            img = self._crop_numpy_image(img, crop, layout)
+            self._record_timing(timings, "crop", t0)
+
+        if resize_size is not None:
+            t0 = time.perf_counter()
+            img = self._resize_numpy_image(img, resize_size, layout)
+            self._record_timing(timings, "resize", t0)
+
+        if layout == "hwc":
+            t0 = time.perf_counter()
+            img = np.moveaxis(img, -1, 0)
+            self._record_timing(timings, "rearrange", t0)
+
+        t0 = time.perf_counter()
+        img = self._normalize_numpy_image(img, original_dtype)
+        self._record_timing(timings, "normalize", t0)
+
+        t0 = time.perf_counter()
+        tensor = torch.from_numpy(np.ascontiguousarray(img))
+        self._record_timing(timings, "from_numpy", t0)
+        self._record_timing(timings, "total", total_t0)
+        return tensor
+
+    def _resize_numpy_image(
+        self,
+        img: np.ndarray,
+        resize_size: tuple[int, int],
+        layout: str,
+    ) -> np.ndarray:
+        cv2 = self._get_cv2()
+        height, width = resize_size
+        if layout == "chw":
+            img = np.moveaxis(img, 0, -1)
+            resized = cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+            return np.moveaxis(resized, -1, 0)
+        return cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+
+    def _format_image_timing(
+        self,
+        key: str,
+        input_value: Any,
+        output_value: torch.Tensor,
+        timings: dict[str, float],
+    ) -> str:
+        ordered = ("as_tensor", "layout", "crop", "resize", "rearrange", "normalize", "from_numpy", "total")
+        parts = [f"{name}={timings.get(name, 0.0):.2f}ms" for name in ordered if name in timings]
+        return (
+            f"{key} in={self._shape_of(input_value)} out={tuple(output_value.shape)} "
+            f"dtype={getattr(input_value, 'dtype', type(input_value).__name__)} -> {output_value.dtype} "
+            + ", ".join(parts)
+        )
+
+    @staticmethod
+    def _normalize_numpy_image(img: np.ndarray, original_dtype: np.dtype) -> np.ndarray:
+        if np.issubdtype(original_dtype, np.floating):
+            img = img.astype(np.float32, copy=False)
+            return img / 255.0 if img.max() > 1.0 else img
+        if original_dtype == np.bool_:
+            return img.astype(np.float32, copy=False)
+        scale = 1.0 / (255.0 if original_dtype == np.uint8 else float(np.iinfo(original_dtype).max))
+        return img.astype(np.float32, copy=False) * scale
+
+    @staticmethod
+    def _get_cv2():
+        try:
+            import cv2
+        except ImportError as exc:
+            raise RuntimeError("OpenCV is required for CPU image resizing in ImagePreprocessingProcessor.") from exc
+        return cv2
+
+    @staticmethod
+    def _record_timing(timings: dict[str, float] | None, name: str, start: float) -> None:
+        if timings is not None:
+            timings[name] = (time.perf_counter() - start) * 1000.0
+
+    @staticmethod
+    def _shape_of(value: Any) -> tuple[int, ...] | str:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            return type(value).__name__
+        return tuple(int(dim) for dim in shape)
+
+    @staticmethod
+    def _image_layout(img: torch.Tensor) -> str:
+        if img.ndim == 3:
+            first, second, third = img.shape
+            if third < first and third < second:
+                return "hwc"
+            return "chw"
+        if img.ndim == 4:
+            _, second, third, fourth = img.shape
+            if fourth < second and fourth < third:
+                return "bhwc"
+            return "bchw"
+        raise ValueError(f"Expected image tensor with 3 or 4 dimensions, got shape {tuple(img.shape)}")
+
+    @staticmethod
+    def _can_use_numpy_image_path(image: Any) -> bool:
+        if isinstance(image, np.ndarray):
+            return image.ndim == 3
+        return isinstance(image, torch.Tensor) and image.device.type == "cpu" and image.ndim == 3
+
+    @staticmethod
+    def _crop_image(
+        img: torch.Tensor,
+        crop: tuple[int, int, int, int],
+        layout: str,
+    ) -> torch.Tensor:
+        top, left, height, width = crop
+        bottom = top + height
+        right = left + width
+        if layout == "hwc":
+            return img[top:bottom, left:right, :]
+        if layout == "bhwc":
+            return img[:, top:bottom, left:right, :]
+        if layout == "chw":
+            return img[:, top:bottom, left:right]
+        return img[:, :, top:bottom, left:right]
+
+    @staticmethod
+    def _normalize_image(img: torch.Tensor, original_dtype: torch.dtype) -> torch.Tensor:
+        if not img.is_floating_point():
+            img = img.to(torch.float32)
+            if original_dtype == torch.uint8:
+                return img.mul_(1.0 / 255.0)
+            if original_dtype == torch.bool:
+                return img
+            return img.mul_(1.0 / float(torch.iinfo(original_dtype).max))
+
+        img = img.to(torch.float32)
+        return img / 255.0 if img.max() > 1.0 else img
+
+    @staticmethod
+    def _resize_image(img: torch.Tensor, resize_size: tuple[int, int]) -> torch.Tensor:
+        batched = img.ndim == 4
+        batch = img if batched else img.unsqueeze(0)
+        batch = F.interpolate(batch, size=resize_size, mode="bilinear", align_corners=False)
+        return batch if batched else batch.squeeze(0)
+
+    @staticmethod
+    def _chw_shape(shape: tuple[int, ...]) -> tuple[int, int, int]:
+        if len(shape) != 3:
+            raise ValueError(f"Expected visual feature shape with 3 dimensions, got {shape}")
+        first, second, third = shape
+        if third < first and third < second:
+            return third, first, second
+        return first, second, third
+
+    @staticmethod
+    def _numpy_image_layout(img: np.ndarray) -> str:
+        first, second, third = img.shape
+        if third < first and third < second:
+            return "hwc"
+        return "chw"
+
+    @staticmethod
+    def _crop_numpy_image(
+            img: np.ndarray,
+            crop: tuple[int, int, int, int],
+            layout: str,
+    ) -> np.ndarray:
+        top, left, height, width = crop
+        bottom = top + height
+        right = left + width
+        if layout == "hwc":
+            return img[top:bottom, left:right, :]
+        return img[:, top:bottom, left:right]
+
+    @staticmethod
+    def _image_key_candidates(key: str) -> set[str]:
+        parts = key.split(".")
+        candidates = {key, parts[-1]}
+        if len(parts) >= 2:
+            candidates.add(".".join(parts[-2:]))
+        return candidates
 
 
 @dataclass

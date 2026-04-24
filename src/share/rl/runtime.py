@@ -11,11 +11,14 @@ from typing import Any
 import torch
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.configs.train import TrainRLServerPipelineConfig
-from lerobot.policies.factory import make_policy
+from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.modeling_sac import SACPolicy
+from lerobot.processor import TransitionKey
 from lerobot.transport.utils import bytes_to_state_dict
+from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_IMAGES
 from lerobot.utils.transition import move_state_dict_to_device
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import (
     ManipulationPrimitiveNetConfig,
@@ -150,12 +153,186 @@ def make_policies_for_registry(
         ensure_identity_features_map(primitive)
         policy_cfg = copy.deepcopy(registry.policy_cfgs[primitive_id])
         policy = make_policy(cfg=policy_cfg, env_cfg=primitive)
+        # `make_policy(..., env_cfg=...)` does not thread manual dataset stats into the
+        # policy config, so we normalize that config here before any processor is built.
+        resolved_dataset_stats = resolve_policy_dataset_stats(policy.config)
+        if resolved_dataset_stats is not None:
+            policy.config.dataset_stats = resolved_dataset_stats
         if train_mode:
             policy = policy.train()
         else:
             policy = policy.eval()
         policies[primitive_id] = policy
     return policies
+
+
+def make_policy_processors(
+    policies: dict[str, SACPolicy],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the same policy pre/post processors for every runtime entry point.
+
+    The actor and learner should agree on normalization exactly. Centralizing the
+    processor construction here keeps both paths on the same `make_pre_post_processors`
+    code path and makes it harder for one side to drift from the other.
+    """
+
+    preprocessors: dict[str, Any] = {}
+    postprocessors: dict[str, Any] = {}
+    for primitive_id, policy in policies.items():
+        pretrained_path = getattr(policy.config, "pretrained_path", None)
+        dataset_stats = resolve_policy_dataset_stats(policy.config)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config,
+            pretrained_path=pretrained_path,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": policy.config.device},
+            },
+        )
+        preprocessors[primitive_id] = preprocessor
+        postprocessors[primitive_id] = postprocessor
+    return preprocessors, postprocessors
+
+
+def resolve_policy_dataset_stats(policy_cfg: SACConfig) -> dict[str, dict[str, Any]] | None:
+    """Resolve config-provided stats into the exact feature keys used by the processors.
+
+    We support a compact config style where image stats can be declared once under
+    `OBS_IMAGE` and then fanned out to each concrete image feature key such as
+    `observation.images.front`. We also validate shapes here so LeRobot's placeholder
+    SAC defaults are ignored unless they actually match the current env feature sizes.
+    """
+
+    configured_stats = copy.deepcopy(getattr(policy_cfg, "dataset_stats", None))
+    if not configured_stats:
+        return None
+
+    visual_stats = None
+    for shared_visual_key in (OBS_IMAGE, OBS_IMAGES):
+        if shared_visual_key in configured_stats:
+            visual_stats = copy.deepcopy(configured_stats[shared_visual_key])
+            break
+
+    feature_defs = {**policy_cfg.input_features, **policy_cfg.output_features}
+    resolved_stats: dict[str, dict[str, Any]] = {}
+    for feature_name, feature in feature_defs.items():
+        feature_stats = configured_stats.get(feature_name)
+        if feature_stats is None and feature.type is FeatureType.VISUAL and visual_stats is not None:
+            feature_stats = visual_stats
+        if feature_stats is None:
+            continue
+
+        reshaped_stats = _reshape_feature_stats(feature_stats, feature=feature)
+        norm_mode = policy_cfg.normalization_mapping.get(feature.type, NormalizationMode.IDENTITY)
+
+        if not _stats_match_feature(reshaped_stats, feature=feature, norm_mode=norm_mode):
+            continue
+        resolved_stats[feature_name] = reshaped_stats
+
+    return resolved_stats or None
+
+
+def _reshape_feature_stats(stats: dict[str, Any], *, feature: Any) -> dict[str, Any]:
+    """Adapt per-feature stats to the tensor shapes expected by LeRobot normalization.
+
+    LeRobot normalizes channel-first tensors, so image stats like `[C]` need to become
+    `[C, 1, 1]` for broadcasted arithmetic against `[B, C, H, W]` batches.
+    """
+
+    reshaped_stats = copy.deepcopy(stats)
+    if feature.type is not FeatureType.VISUAL:
+        return reshaped_stats
+
+    target_rank = len(feature.shape)
+    target_channels = feature.shape[0]
+    for stat_key in ("mean", "std", "min", "max", "q01", "q99", "q10", "q90"):
+        values = reshaped_stats.get(stat_key)
+        if values is None:
+            continue
+
+        tensor = torch.as_tensor(values, dtype=torch.float32)
+        if tensor.ndim != 1 or tensor.shape[0] != target_channels:
+            continue
+
+        reshaped_stats[stat_key] = tensor.view(target_channels, *([1] * (target_rank - 1))).tolist()
+
+    return reshaped_stats
+
+
+def _stats_match_feature(
+    stats: dict[str, Any],
+    *,
+    feature: Any,
+    norm_mode: NormalizationMode,
+) -> bool:
+    """Return whether a stats payload can safely normalize a specific feature.
+
+    This extra guard keeps config-driven normalization opt-in in practice: malformed or
+    stale stats are skipped instead of crashing the actor or silently training on the
+    wrong scale.
+    """
+
+    required_stats_by_mode = {
+        NormalizationMode.MEAN_STD: ("mean", "std"),
+        NormalizationMode.MIN_MAX: ("min", "max"),
+        NormalizationMode.QUANTILES: ("q01", "q99"),
+        NormalizationMode.QUANTILE10: ("q10", "q90"),
+    }
+    required_stats = required_stats_by_mode.get(norm_mode, ())
+    if any(stat_key not in stats for stat_key in required_stats):
+        return False
+
+    if feature.type is FeatureType.VISUAL:
+        expected_shapes = {
+            tuple(feature.shape),
+            (feature.shape[0], *([1] * (len(feature.shape) - 1))),
+        }
+    else:
+        expected_shapes = {tuple(feature.shape)}
+
+    for stat_key in required_stats:
+        tensor = torch.as_tensor(stats[stat_key])
+        if tuple(tensor.shape) not in expected_shapes:
+            return False
+
+    return True
+
+
+def preprocess_replay_batch(
+    *,
+    preprocessor: Any,
+    observations: dict[str, torch.Tensor],
+    actions: torch.Tensor,
+    next_observations: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
+    """Run replay data through the same transition-oriented preprocessor steps as inference.
+
+    The public inference helper passes a flat observation dict into `preprocessor(...)`,
+    which is then converted into an `EnvTransition` before the processor steps run. The
+    learner already has nested replay tensors in transition form, so we apply the shared
+    processor pipeline directly to transitions and keep the replay layout unchanged.
+    """
+
+    normalized_transition = preprocessor._forward(
+        {
+            TransitionKey.OBSERVATION: observations,
+            TransitionKey.ACTION: actions,
+            TransitionKey.COMPLEMENTARY_DATA: None,
+        }
+    )
+    normalized_next_transition = preprocessor._forward(
+        {
+            TransitionKey.OBSERVATION: next_observations,
+            TransitionKey.ACTION: None,
+            TransitionKey.COMPLEMENTARY_DATA: None,
+        }
+    )
+
+    return (
+        normalized_transition[TransitionKey.OBSERVATION],
+        normalized_transition[TransitionKey.ACTION],
+        normalized_next_transition[TransitionKey.OBSERVATION],
+    )
 
 
 def apply_parameter_updates_from_queue(

@@ -11,6 +11,7 @@ from typing import Any
 
 import grpc
 import torch
+from lerobot.utils.device_utils import get_safe_torch_device
 from torch.multiprocessing import Queue
 from torch.optim import Optimizer
 
@@ -27,7 +28,7 @@ from lerobot.utils.constants import ACTION, TRAINING_STATE_DIR
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import get_step_checkpoint_dir, save_checkpoint, update_last_checkpoint
 from lerobot.utils.transition import move_state_dict_to_device, move_transition_to_device
-from lerobot.utils.utils import get_safe_torch_device, init_logging
+from lerobot.utils.utils import init_logging
 
 from share.configs.rl import MPNetTrainRLServerPipelineConfig
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import (
@@ -35,7 +36,9 @@ from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import
 )
 from share.rl.runtime import (
     build_adaptive_registry,
+    make_policy_processors,
     make_policies_for_registry,
+    preprocess_replay_batch,
 )
 from share.utils.control_utils import suppress_logging
 
@@ -150,6 +153,9 @@ def add_actor_information_and_train(
         mp_net = ManipulationPrimitiveNet(cfg.env)
         try:
             policies = make_policies_for_registry(cfg.env, registry, train_mode=True)
+            # Reuse the exact same policy preprocessor stack as the actor so replay
+            # training and live inference see identically normalized inputs.
+            preprocessors, _ = make_policy_processors(policies)
         finally:
             mp_net.close()
 
@@ -204,25 +210,31 @@ def add_actor_information_and_train(
                     queue_size=2,
                 )
 
+            optimize_t0 = time.perf_counter()
             training_infos = optimize_policy_once(
                 policy=policy,
+                preprocessor=preprocessors[primitive_id],
                 optimizers=optimizers[primitive_id],
                 online_iterator=online_iterators[primitive_id],
                 optimization_step=optimization_steps[primitive_id],
             )
+            optimize_dt_s = time.perf_counter() - optimize_t0
             optimization_steps[primitive_id] += 1
             did_optimize = True
 
             training_infos["Optimization step"] = optimization_steps[primitive_id]
             training_infos["primitive_id"] = primitive_id
             training_infos["replay_buffer_size"] = len(replay_buffer)
+            training_infos["update_dt_ms"] = optimize_dt_s * 1000.0
+            training_infos["update_frequency_hz"] = 1.0 / max(optimize_dt_s, 1e-9)
 
             if cfg.log_freq > 0 and optimization_steps[primitive_id] % cfg.log_freq == 0:
                 logging.info(
-                    "[LEARNER] [%s] optimization_step=%s replay=%s loss_critic=%.5f",
+                    "[LEARNER] [%s] optimization_step=%s replay=%s update=%.1fHz loss_critic=%.5f",
                     primitive_id,
                     optimization_steps[primitive_id],
                     len(replay_buffer),
+                    training_infos["update_frequency_hz"],
                     training_infos.get("loss_critic", float("nan")),
                 )
 
@@ -263,6 +275,7 @@ def add_actor_information_and_train(
 
 def optimize_policy_once(
     policy: SACPolicy,
+    preprocessor: Any,
     optimizers: dict[str, Optimizer],
     online_iterator: Any,
     optimization_step: int,
@@ -279,6 +292,13 @@ def optimize_policy_once(
         observations = batch["state"]
         next_observations = batch["next_state"]
         done = batch["done"]
+
+        observations, actions, next_observations = preprocess_replay_batch(
+            preprocessor=preprocessor,
+            observations=observations,
+            actions=actions,
+            next_observations=next_observations,
+        )
 
         if check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations):
             continue

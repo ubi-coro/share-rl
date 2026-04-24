@@ -10,6 +10,7 @@ from typing import Any
 import grpc
 import torch
 from lerobot.policies.sac.configuration_sac import SACConfig
+from lerobot.utils.device_utils import get_safe_torch_device
 from torch.multiprocessing import Event, Queue
 
 from lerobot.configs import parser
@@ -23,22 +24,25 @@ from lerobot.transport.utils import (
     send_bytes_in_chunks,
     transitions_to_bytes,
 )
+from lerobot.utils.control_utils import predict_action
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import Transition, move_transition_to_device
-from lerobot.utils.utils import get_safe_torch_device, init_logging
+from lerobot.utils.utils import init_logging
 
 from share.configs.rl import MPNetTrainRLServerPipelineConfig
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import (
     ManipulationPrimitiveNet,
 )
 from share.rl.runtime import (
-    PrimitiveBudgetCounter,
     apply_parameter_updates_from_queue,
     build_adaptive_registry,
-    make_policies_for_registry, sanitize_local_grpc_proxy_env,
+    make_policy_processors,
+    make_policies_for_registry,
+    sanitize_local_grpc_proxy_env,
 )
-from share.teleoperators import TeleopEvents
+from share.teleoperators import TeleopEvents, has_event, is_intervention
+from share.utils.logging_utils import log_runtime_frequency
 
 
 class _CompositeShutdownEvent:
@@ -191,7 +195,8 @@ def act_with_policy(
     device = get_safe_torch_device(registry.actor_learner_policy_cfg.device, log=True)
 
     policies = make_policies_for_registry(env.config, registry, train_mode=False)
-    step_counter = PrimitiveBudgetCounter(registry.online_step_budgets)
+    preprocessors, postprocessors = make_policy_processors(policies)
+    collection_counts = {primitive_id: 0 for primitive_id in registry.adaptive_ids}
     applied_parameter_updates = 0
 
     def reset_segment_state() -> dict[str, Any]:
@@ -202,6 +207,32 @@ def act_with_policy(
             "policy_inference_dts": [],
             "pending_transitions": [],
         }
+
+    def publish_segment(active_primitive: str) -> None:
+        push_transitions_to_transport_queue(
+            transitions=segment_state["pending_transitions"],
+            transitions_queue=transitions_queue,
+        )
+        if segment_state["total_steps"] > 0:
+            stats = get_frequency_stats(segment_state["policy_inference_dts"])
+            intervention_rate = segment_state["intervention_steps"] / segment_state["total_steps"]
+            interactions_queue.put(
+                python_object_to_bytes(
+                    {
+                        "Primitive": active_primitive,
+                        "Interaction step": collection_counts[active_primitive],
+                        "Episodic reward": segment_state["reward_sum"],
+                        "Episode intervention": int(segment_state["intervention_steps"] > 0),
+                        "Intervention rate": intervention_rate,
+                        **stats,
+                    }
+                )
+            )
+
+    def reset_active_policy() -> None:
+        policy = policies.get(env.active_primitive)
+        if policy is not None and hasattr(policy, "reset"):
+            policy.reset()
 
     # Give the streaming worker a short window to fetch initial learner parameters.
     push_frequency = registry.actor_learner_policy_cfg.actor_learner_config.policy_parameters_push_frequency
@@ -218,14 +249,16 @@ def act_with_policy(
         time.sleep(0.01)
 
     transition = env.reset()
+    reset_active_policy()
     segment_state = reset_segment_state()
 
     try:
-        while not step_counter.all_finished and not shutdown_event.is_set():
+        while not shutdown_event.is_set():
             step_start_t = time.perf_counter()
             active_primitive = env.active_primitive
             policy = policies.get(active_primitive)
             obs = transition[TransitionKey.OBSERVATION]
+            work_dt = 0.0
 
             consumed_updates = apply_parameter_updates_from_queue(
                 policies=policies,
@@ -238,9 +271,21 @@ def act_with_policy(
                 inference_t0 = time.perf_counter()
 
                 policy_obs = {key: value for key, value in obs.items() if key in policy.config.input_features}
-                action = policy.select_action(batch=policy_obs)
+                task = env.config.primitives[active_primitive].task_description
+                task = active_primitive if task is None else task
+                action = predict_action(
+                    observation=policy_obs,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessors[active_primitive],
+                    postprocessor=postprocessors[active_primitive],
+                    use_amp=policy.config.use_amp,
+                    task=task,
+                    robot_type=None,
+                ).squeeze()
 
                 inference_dt = time.perf_counter() - inference_t0
+                work_dt = inference_dt
                 segment_state["policy_inference_dts"].append(inference_dt)
                 policy_fps = 1.0 / (inference_dt + 1e-9)
                 if cfg.env.fps is not None and policy_fps < cfg.env.fps:
@@ -248,7 +293,7 @@ def act_with_policy(
                         "[ACTOR] Policy FPS %.1f below required %s at local step %s for primitive '%s'",
                         policy_fps,
                         cfg.env.fps,
-                        step_counter[active_primitive],
+                        collection_counts[active_primitive],
                         active_primitive,
                     )
             else:
@@ -260,13 +305,16 @@ def act_with_policy(
             truncated = bool(new_transition.get(TransitionKey.TRUNCATED, False))
             info = new_transition.get(TransitionKey.INFO, {})
 
+            if has_event(info, TeleopEvents.STOP_RECORDING):
+                break
+
             if policy is not None:
-                step_counter.increment(active_primitive)
                 segment_state["reward_sum"] += reward
                 segment_state["total_steps"] += 1
+                collection_counts[active_primitive] += 1
 
-                is_intervention = _is_intervention(info)
-                if is_intervention:
+                intervention_active = is_intervention(info)
+                if intervention_active:
                     segment_state["intervention_steps"] += 1
 
                 next_obs = new_transition[TransitionKey.OBSERVATION]
@@ -282,7 +330,7 @@ def act_with_policy(
                     truncated=truncated,
                     complementary_info={
                         "primitive_index": registry.id_to_index[active_primitive],
-                        "is_intervention": bool(is_intervention),
+                        "is_intervention": bool(intervention_active),
                     },
                 )
                 transition_payload["id"] = active_primitive
@@ -290,68 +338,48 @@ def act_with_policy(
 
             transition = new_transition
 
-            if done or truncated:
-                if policy is not None:
-                    push_transitions_to_transport_queue(
-                        transitions=segment_state["pending_transitions"],
-                        transitions_queue=transitions_queue,
+            rerecord_requested = has_event(info, TeleopEvents.RERECORD_EPISODE)
+            if done or truncated or rerecord_requested:
+                if policy is not None and rerecord_requested:
+                    collection_counts[active_primitive] -= segment_state["total_steps"]
+                elif policy is not None:
+                    publish_segment(active_primitive)
+                    logging.info(
+                        "[ACTOR] adaptive_episode primitive=%s success=%s reward=%.3f length=%d",
+                        active_primitive,
+                        has_event(info, TeleopEvents.SUCCESS),
+                        segment_state["reward_sum"],
+                        segment_state["total_steps"],
                     )
-
-                    stats = get_frequency_stats(segment_state["policy_inference_dts"])
-                    intervention_rate = 0.0
-                    if segment_state["total_steps"] > 0:
-                        intervention_rate = segment_state["intervention_steps"] / segment_state["total_steps"]
-
-                    interactions_queue.put(
-                        python_object_to_bytes(
-                            {
-                                "Primitive": active_primitive,
-                                "Interaction step": step_counter[active_primitive],
-                                "Episodic reward": segment_state["reward_sum"],
-                                "Episode intervention": int(segment_state["intervention_steps"] > 0),
-                                "Intervention rate": intervention_rate,
-                                **stats,
-                            }
-                        )
-                    )
-
-                    step_counter.finish_episode(active_primitive)
-                    consumed_updates = apply_parameter_updates_from_queue(
+                    applied_parameter_updates += apply_parameter_updates_from_queue(
                         policies=policies,
                         parameters_queue=parameters_queue,
                         device=device,
                     )
-                    applied_parameter_updates += consumed_updates
-
-                if step_counter.all_finished:
-                    break
 
                 transition = env.reset()
+                reset_active_policy()
                 segment_state = reset_segment_state()
 
             if cfg.env.fps is not None:
                 dt = time.perf_counter() - step_start_t
                 precise_sleep(max(1 / cfg.env.fps - dt, 0.0))
+            dt_loop = time.perf_counter() - step_start_t
+            log_runtime_frequency(
+                prefix="ACTOR",
+                primitive=active_primitive,
+                loop_dt_s=dt_loop,
+                work_dt_s=work_dt if policy is not None else dt_loop,
+                work_label="policy" if policy is not None else "step",
+            )
     finally:
         env.close()
 
     return {
-        "global_step": step_counter.global_step,
-        "per_primitive_steps": {primitive_id: step_counter[primitive_id] for primitive_id in registry.adaptive_ids},
+        "global_step": sum(collection_counts.values()),
+        "per_primitive_steps": dict(collection_counts),
         "applied_parameter_updates": applied_parameter_updates,
     }
-
-
-def _is_intervention(info: dict[str, Any]) -> bool:
-    keys = [TeleopEvents.IS_INTERVENTION]
-    if hasattr(TeleopEvents.IS_INTERVENTION, "value"):
-        keys.append(TeleopEvents.IS_INTERVENTION.value)
-    for key in keys:
-        if bool(info.get(key, False)):
-            return True
-    return False
-
-
 def get_frequency_stats(policy_inference_dts: list[float]) -> dict[str, float]:
     if len(policy_inference_dts) <= 1:
         return {}

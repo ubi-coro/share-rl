@@ -32,8 +32,9 @@ except ImportError:  # pragma: no cover - compatibility with older lerobot layou
 from share.configs.record import RecordConfig
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
-from share.teleoperators import TeleopEvents
+from share.teleoperators import TeleopEvents, has_event, is_intervention
 from share.utils.control_utils import make_policies_and_datasets
+from share.utils.logging_utils import log_runtime_frequency
 from share.utils.video_utils import MultiVideoEncodingManager
 
 init_logging()
@@ -76,7 +77,8 @@ def record_loop(
     postprocessors: dict[str, PolicyProcessorPipeline[PolicyAction, PolicyAction]],
     display_data: bool = False,
     display_compressed_images: bool = False,
-    interactive: bool = False,
+    save_only_interventions: bool = False,
+    force_intervention: bool = False,
     debugger: MPNetDebugger | None = None,
 ):
     # reset
@@ -89,7 +91,7 @@ def record_loop(
 
     # check if we need to terminate early, ie during reset
     info = transition.get(TransitionKey.INFO, {})
-    if info.get(TeleopEvents.STOP_RECORDING, False):
+    if has_event(info, TeleopEvents.STOP_RECORDING):
         return info
 
     # get task description
@@ -105,7 +107,7 @@ def record_loop(
         dataset = datasets.get(mp_net.active_primitive, None)
 
         # (1) Decide and process action a_t
-        if policy is not None:
+        if policy is not None and not force_intervention:
             # noinspection PyTypeChecker
             action = predict_action(
                 observation={key: obs[key] for key in policy.config.input_features},
@@ -134,12 +136,17 @@ def record_loop(
         sum_reward += float(reward)
 
         # (3) Exit on episode end
-        if info.get(TeleopEvents.INTERVENTION_COMPLETED, False) or info.get(TeleopEvents.STOP_RECORDING, False):
+        intervention_segment_finished = (
+            policy is not None and
+            save_only_interventions and
+            has_event(info, TeleopEvents.INTERVENTION_COMPLETED)
+        )
+        if intervention_segment_finished or has_event(info, TeleopEvents.STOP_RECORDING):
             return info
 
-        # (4) Store transition. When interactive, only store frames on interventions
+        # (4) Store transition. In correction-only mode, only intervention steps are saved.
         # store o_t, a_t, r_t+1
-        if dataset is not None and (not interactive or info.get(TeleopEvents.IS_INTERVENTION, False)):
+        if dataset is not None and (not save_only_interventions or is_intervention(info)):
             # observations are batched and may contain other keys
             dataset_observation = {
                 k: v.squeeze().cpu()
@@ -170,7 +177,7 @@ def record_loop(
         if (
             done or
             truncated or
-            info.get(TeleopEvents.RERECORD_EPISODE, False)
+            has_event(info, TeleopEvents.RERECORD_EPISODE)
         ):
             return info
 
@@ -178,10 +185,13 @@ def record_loop(
         dt_load = time.perf_counter() - start_loop_t
         precise_sleep(1 / mp_net.config.fps - dt_load)
         dt_loop = time.perf_counter() - start_loop_t
-        logging.info(
-            f"[{task}] "
-            f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
-            f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
+        log_runtime_frequency(
+            prefix="RECORD",
+            primitive=mp_net.active_primitive,
+            task=task,
+            loop_dt_s=dt_loop,
+            work_dt_s=dt_load,
+            work_label="step",
         )
 
 
@@ -198,6 +208,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     # make
     mp_net = ManipulationPrimitiveNet(cfg.env)
+    force_intervention = not cfg.use_policy
+    mp_net.set_step_info({TeleopEvents.IS_INTERVENTION: True} if force_intervention else None)
     debugger = None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
 
@@ -216,18 +228,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     postprocessors=postprocessors,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
-                    interactive=cfg.interactive,
+                    save_only_interventions=cfg.save_only_interventions,
+                    force_intervention=force_intervention,
                     debugger=debugger,
                 )
 
-                if info.get(TeleopEvents.STOP_RECORDING, False):
+                if has_event(info, TeleopEvents.STOP_RECORDING):
                     break
 
                 if dataset is None:
                     continue
 
                 # dataset ops, saving / clearing episode buffers
-                if info.get(TeleopEvents.RERECORD_EPISODE, False):
+                if has_event(info, TeleopEvents.RERECORD_EPISODE):
                     log_say("Re-record episode", cfg.play_sounds, blocking=True)
                     dataset.clear_episode_buffer()
                 elif dataset.writer.episode_buffer["size"] > 0:

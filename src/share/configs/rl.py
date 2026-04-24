@@ -16,6 +16,9 @@ class MPNetTrainRLServerPipelineConfig(TrainRLServerPipelineConfig):
     env: ManipulationPrimitiveNetConfig
     dataset: DatasetConfig | None = None
     policy: PreTrainedConfig | None = None
+    log_freq: int = 10
+    num_workers: int = 6
+    batch_size: int = 256
 
     def validate(self) -> None:
         if not self.job_name:

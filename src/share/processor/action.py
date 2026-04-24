@@ -402,8 +402,9 @@ class InterventionActionProcessorStep(ProcessorStep):
         teleop_action_dict = complementary_data.get(TELEOP_ACTION_KEY)
         is_intervention = bool(info.get(TeleopEvents.IS_INTERVENTION, False))
 
-        self._intervention_occurred = self._intervention_occurred | is_intervention
-        if self._intervention_occurred and not is_intervention:
+        intervention_just_completed = self._intervention_occurred and not is_intervention
+        self._intervention_occurred = is_intervention
+        if intervention_just_completed:
             info[TeleopEvents.INTERVENTION_COMPLETED] = True
 
         if is_intervention and isinstance(teleop_action_dict, dict):

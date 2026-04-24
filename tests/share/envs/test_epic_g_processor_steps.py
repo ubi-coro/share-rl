@@ -5,13 +5,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from lerobot.processor.core import TransitionKey
+from lerobot.processor import TransitionKey
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
 from share.processor.action import RelativeFrameActionProcessor
 from share.processor.observation import (
     JointsToEEObservation,
     RelativeFrameObservationProcessor,
-    DefaultObservationProcessor,
+    StateObservationProcessor,
+    ImagePreprocessingProcessor,
 )
 from share.processor.utils import flatten_nested_policy_action
 from share.utils.transformation_utils import euler_xyz_from_rotation, euler_xyz_from_rotvec, rotation_from_extrinsic_xyz
@@ -229,7 +230,7 @@ def test_flatten_nested_policy_action_raises_on_missing_key():
 
 def test_default_observation_processor_collects_modalities_and_images():
     """Enabled modalities should populate state and normalize images."""
-    step = DefaultObservationProcessor(
+    step = StateObservationProcessor(
         gripper_enable={"arm": True},
         add_joint_position_to_observation={"arm": True},
         add_joint_velocity_to_observation={"arm": True},
@@ -292,9 +293,25 @@ def test_default_observation_processor_collects_modalities_and_images():
     ]))
 
 
+def test_image_preprocessing_processor_crops_before_normalizing_images():
+    """Image preprocessing should apply camera-key crops and return CHW floats."""
+    step = ImagePreprocessingProcessor(
+        crop_params_dict={"cam": (1, 1, 2, 2)},
+        resize_size=None,
+    )
+
+    image = torch.arange(4 * 4 * 3, dtype=torch.uint8).reshape(4, 4, 3)
+    out = step(_transition(observation={"observation.images.cam": image}))[TransitionKey.OBSERVATION]
+
+    expected = image[1:3, 1:3, :].permute(2, 0, 1).to(torch.float32) / 255.0
+    assert out["observation.images.cam"].shape == (3, 2, 2)
+    assert out["observation.images.cam"].dtype == torch.float32
+    torch.testing.assert_close(out["observation.images.cam"], expected)
+
+
 def test_default_observation_processor_transform_features_counts_enabled_modalities():
     """Feature inference should reflect enabled state channels."""
-    step = DefaultObservationProcessor(
+    step = StateObservationProcessor(
         gripper_enable={"arm": True},
         add_joint_position_to_observation={"arm": True},
         add_joint_velocity_to_observation={"arm": True},
@@ -328,7 +345,7 @@ def test_default_observation_processor_transform_features_counts_enabled_modalit
 def test_default_observation_processor_supports_axis_selection_and_frame_stacking():
     """Axis filtering and frame stacking should shape observation.state consistently."""
 
-    step = DefaultObservationProcessor(
+    step = StateObservationProcessor(
         add_joint_position_to_observation={"arm": False},
         add_joint_velocity_to_observation={"arm": False},
         add_current_to_observation={"arm": False},

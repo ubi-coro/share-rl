@@ -3,11 +3,8 @@ from pathlib import Path
 
 import draccus
 
-from lerobot.configs import parser
 from lerobot.configs.default import DatasetConfig
-from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.envs import EnvConfig
 from share.debug.mpnet_debug import MPNetDebugConfig
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
 
@@ -78,8 +75,10 @@ class RecordConfig:
     env: ManipulationPrimitiveNetConfig
     dataset: DatasetRecordConfig | None = None
     debug: MPNetDebugConfig | None = None
-    # Whether to control the robot with a policy
-    policy: PreTrainedConfig | None = None
+    # Whether record should load and run the configured policy.
+    use_policy: bool = True
+    # Whether to save only intervention/correction steps instead of the full rollout.
+    save_only_interventions: bool = False
     # Display all cameras on screen
     display_data: bool = False
     # Display data on a remote Rerun server
@@ -92,26 +91,6 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
-    # Interactively take control during rollouts
-    interactive: bool = False
-
-    def __post_init__(self):
-
-        # todo: per primitive
-
-        # HACK: We parse again the cli args here to get the pretrained path if there was one.
-        policy_path = parser.get_path_arg("policy")
-
-        if policy_path:
-            cli_overrides = parser.get_cli_overrides("policy")
-
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
-            self.policy.pretrained_path = policy_path
-
-    @classmethod
-    def __get_path_fields__(cls) -> list[str]:
-        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
-        return ["policy"]
 
 
 @dataclass(kw_only=True)

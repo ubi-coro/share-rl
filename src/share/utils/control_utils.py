@@ -61,7 +61,7 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 stats = rename_stats(datasets[name].meta.stats, rename_map)
 
             # 2) policy
-            if p.policy is None:
+            if not cfg.use_policy or p.policy is None:
                 policies[name] = None
                 preprocessors[name] = None
                 postprocessors[name] = None
@@ -80,7 +80,7 @@ def make_policies_and_datasets(cfg: RecordConfig):
 
             pre, post = make_pre_post_processors(
                 policy_cfg=p.policy,
-                pretrained_path=str(p.policy.pretrained_path),
+                pretrained_path=p.policy.pretrained_path,
                 dataset_stats=stats,
                 preprocessor_overrides={
                     "device_processor": {"device": p.policy.device},

@@ -208,10 +208,6 @@ class OpenLoopTrajectoryPrimitive(ManipulationPrimitive):
             display_cameras=display_cameras,
         )
 
-    @property
-    def uses_autonomous_step(self) -> bool:
-        return True
-
     def reset_runtime_state(self) -> None:
         super().reset_runtime_state()
         self._start_pose: dict[str, list[float]] = {}

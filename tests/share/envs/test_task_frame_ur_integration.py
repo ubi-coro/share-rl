@@ -78,6 +78,8 @@ def test_ur_action_features_follow_the_current_task_frame_schema():
     robot.config = SimpleNamespace(
         kp=[2500.0] * 3 + [150.0] * 3,
         kd=[80.0] * 3 + [8.0] * 3,
+        min_pose_rpy=[-float("inf")] * 6,
+        max_pose_rpy=[float("inf")] * 6,
         wrench_limits=[30.0] * 6,
         compliance_adaptive_limit_enable=[False] * 6,
         compliance_reference_limit_enable=[False] * 6,

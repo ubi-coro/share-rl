@@ -311,6 +311,8 @@ def test_ur_wrapper_locks_joint_space_and_rejects_task_space_afterwards():
     robot.config = types.SimpleNamespace(
         kp=[2500.0] * 3 + [150.0] * 3,
         kd=[80.0] * 3 + [8.0] * 3,
+        min_pose_rpy=[-float("inf")] * 6,
+        max_pose_rpy=[float("inf")] * 6,
         wrench_limits=[30.0] * 6,
         compliance_adaptive_limit_enable=[False] * 6,
         compliance_reference_limit_enable=[False] * 6,
@@ -356,6 +358,8 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     robot.config = types.SimpleNamespace(
         kp=[2500.0] * 3 + [150.0] * 3,
         kd=[80.0] * 3 + [8.0] * 3,
+        min_pose_rpy=[-float("inf")] * 6,
+        max_pose_rpy=[float("inf")] * 6,
         wrench_limits=[30.0] * 6,
         compliance_adaptive_limit_enable=[False] * 6,
         compliance_reference_limit_enable=[False] * 6,
@@ -415,6 +419,44 @@ def test_ur_wrapper_applies_task_frame_controller_overrides():
     assert robot.task_frame.controller_overrides["kd"] == [4.0] * 6
     assert robot.task_frame.controller_overrides["wrench_limits"] == [10.0] * 6
     assert robot.task_frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
+
+
+def test_ur_wrapper_applies_config_rpy_pose_limits_by_default():
+    controller_module = _load_controller_module()
+    ur_module = _load_ur_module(controller_module)
+    robot = object.__new__(ur_module.UR)
+    robot.controller = _ReadyController()
+    robot.gripper = None
+    robot.cameras = {}
+    robot.config = types.SimpleNamespace(
+        kp=[2500.0] * 3 + [150.0] * 3,
+        kd=[80.0] * 3 + [8.0] * 3,
+        min_pose_rpy=[-float("inf"), -float("inf"), -0.16, -0.3, -float("inf"), -float("inf")],
+        max_pose_rpy=[float("inf"), float("inf"), -0.13, 0.3, float("inf"), float("inf")],
+        wrench_limits=[30.0] * 6,
+        compliance_adaptive_limit_enable=[False] * 6,
+        compliance_reference_limit_enable=[False] * 6,
+        compliance_desired_wrench=[5.0] * 6,
+        compliance_adaptive_limit_min=[0.1] * 6,
+    )
+    robot.task_frame = controller_module.TaskFrameCommand(
+        controller_overrides=robot._default_controller_overrides()
+    )
+    robot._active_control_space = None
+
+    robot.set_task_frame(
+        TaskFrame(
+            target=[0.0] * 6,
+            control_mode=[ControlMode.POS] * 6,
+        )
+    )
+
+    assert robot.task_frame.controller_overrides["min_pose"] == robot.config.min_pose_rpy
+    assert robot.task_frame.controller_overrides["max_pose"] == robot.config.max_pose_rpy
+
+    queue_dict = robot.task_frame.to_queue_dict()
+    np.testing.assert_allclose(queue_dict["min_pose"], robot.config.min_pose_rpy)
+    np.testing.assert_allclose(queue_dict["max_pose"], robot.config.max_pose_rpy)
 
 
 def test_ur_wrapper_rejects_unknown_task_frame_controller_override():

@@ -290,6 +290,8 @@ class UR(Robot):
         return {
             "kp": list(self.config.kp),
             "kd": list(self.config.kd),
+            "min_pose": list(self.config.min_pose_rpy),
+            "max_pose": list(self.config.max_pose_rpy),
             "wrench_limits": list(self.config.wrench_limits),
             "compliance_adaptive_limit_enable": list(self.config.compliance_adaptive_limit_enable),
             "compliance_reference_limit_enable": list(self.config.compliance_reference_limit_enable),
