@@ -462,9 +462,11 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             if name not in robot_dict:
                 raise ValueError(f"Missing robot for task-frame entry '{name}'.")
 
+            has_teleop = name in is_delta_teleoperator
+
             # ENV-101: learnable VEL/FORCE axes require delta teleoperator input.
             for axis in frame.learnable_axis_indices:
-                if frame.control_mode[axis] in {ControlMode.VEL, ControlMode.WRENCH} and not is_delta_teleoperator[name]:
+                if frame.control_mode[axis] in {ControlMode.VEL, ControlMode.WRENCH} and has_teleop and not is_delta_teleoperator[name]:
                     raise ValueError(
                         "Adaptive task-frame axes with VEL/FORCE control require a delta teleoperator. "
                         f"Got robot='{name}', axis={axis}, control_mode={frame.control_mode[axis].name}, "
@@ -494,7 +496,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             # ENV-102: TASK-space with absolute-joint teleop or joint-only robot requires kinematics.
             requires_kinematics = (
                     frame.space == ControlSpace.TASK and
-                    (not is_delta_teleoperator[name] or not is_task_frame_robot[name])
+                    ((has_teleop and not is_delta_teleoperator[name]) or not is_task_frame_robot[name])
             )
             if requires_kinematics and not self.processor.kinematics.enable[name]:
                 raise ValueError(
