@@ -225,7 +225,7 @@ class ManipulationPrimitiveNet(gym.Env):
         if any(buttons):
             print(f"\n[DEBUG STEP 6 RAW INFO] info: { {str(k): v for k, v in info.items()} }\n", flush=True)
 
-        success_val = info.get(TeleopEvents.SUCCESS, info.get("success", False))
+        success_val = info.get(TeleopEvents.SUCCESS, info.get(str(TeleopEvents.SUCCESS), info.get("success", False)))
         if success_val:
             print(f"\n[DEBUG STEP 6 SUCCESS] active={self._active}, transitions_list={self._transitions.get(self._active)}, info_keys={[str(k) for k in info.keys()]}\n", flush=True)
 

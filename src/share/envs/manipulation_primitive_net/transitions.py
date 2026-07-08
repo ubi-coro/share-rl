@@ -54,8 +54,15 @@ class OnSuccess(Transition):
     additional_reward: float = 1.0
 
     def evaluate(self, obs: dict[str, Any], info: dict[str, Any]) -> Outcome:
+        key = self.success_key
+        terminated = info.get(key, False)
+        if not terminated:
+            terminated = info.get(str(key), False)
+        if not terminated and hasattr(key, "value"):
+            terminated = info.get(key.value, False)
+
         return Outcome(
-            terminated=info.get(self.success_key, False),
+            terminated=bool(terminated),
             reward=self.additional_reward,
             reason="success" if self.reason is None else self.reason
         )
