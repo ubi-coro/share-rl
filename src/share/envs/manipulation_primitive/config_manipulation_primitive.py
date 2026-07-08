@@ -339,6 +339,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         else:
             action_before_hooks, action_after_hooks = [], []
 
+        print(f"\n[DEBUG MAKE] action_pipeline_steps: {[type(step).__name__ for step in action_pipeline_steps]}\n", flush=True)
         return DataProcessorPipeline(
             steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition,
             before_step_hooks=action_before_hooks, after_step_hooks=action_after_hooks
