@@ -596,11 +596,13 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             entry_context: Optional processed observation and prior task-frame
                 origin from the primitive that just terminated.
         """
+        start_pose, target_pose = self.resolve_targets(entry_context)
+        for name, frame in self.task_frame.items():
+            for axis in range(len(frame.target)):
+                if frame.policy_mode[axis] is None:
+                    target_pose[name][axis] = start_pose[name][axis]
         env.set_target_pose(
-            {
-                name: [float(v) for v in frame.target]
-                for name, frame in self.task_frame.items()
-            },
+            target_pose,
             info_key=self.target_pose_info_key,
         )
 
