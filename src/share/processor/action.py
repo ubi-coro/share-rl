@@ -316,10 +316,13 @@ class InterventionActionProcessorStep(ProcessorStep):
             info[TeleopEvents.INTERVENTION_COMPLETED] = True
 
         if is_intervention and isinstance(teleop_action_dict, dict):
-            source_actions = teleop_action_dict
+            source_actions = dict(teleop_action_dict)
             for name in teleop_action_dict:
                 if self._disable_torque_on_intervention.get(name, False):
                     self.teleoperators[name].disable_torque()
+            for name in self.task_frame:
+                if name not in source_actions:
+                    source_actions[name] = policy_actions.get(name, {})
         else:
             source_actions = policy_actions
             if self._intervention_occurred:
