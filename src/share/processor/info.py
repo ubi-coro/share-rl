@@ -174,8 +174,11 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
     def __post_init__(self):
         self._events = {event: False for event in self.mapping}
         self._is_string_key = {event: isinstance(mapping_key, str) for event, mapping_key in self.mapping.items()}
+        self._stdin_triggered = False
 
         from pynput import keyboard
+        import sys
+        import threading
 
         def on_press(key):
             for event, mapping_key in self.mapping.items():
@@ -202,12 +205,33 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                     ...
 
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
+        try:
+            self._listener.start()
+        except Exception:
+            pass
+
+        def listen_stdin():
+            while True:
+                try:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    if "s" in line or line.strip() == "":
+                        self._events[TeleopEvents.SUCCESS] = True
+                        self._stdin_triggered = True
+                except Exception:
+                    break
+
+        self._stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
+        self._stdin_thread.start()
 
     def info(self, info: dict) -> dict:
         new_info = dict(info)
         for event_name, event_value in self._events.items():
             new_info[event_name] = new_info.get(event_name, False) | event_value
+        if self._stdin_triggered:
+            self._events[TeleopEvents.SUCCESS] = False
+            self._stdin_triggered = False
         return new_info
 
     def transform_features(
@@ -219,5 +243,7 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         self._events = {event: False for event in self.mapping}
 
     def __del__(self):
-        for l in self._listener.values():
-            l.stop()
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
