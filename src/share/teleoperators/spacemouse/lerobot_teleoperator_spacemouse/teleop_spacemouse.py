@@ -180,6 +180,8 @@ class SpaceMouse(Teleoperator, HasTeleopEvents):
         events: dict[str, Any] = {}
 
         buttons = self.latest_data.get("buttons", [0] * 2)
+        if any(buttons):
+            print(f"[DEBUG SpaceMouse Buttons] Raw buttons: {buttons}, Mapping: {self.config.button_mapping}", flush=True)
 
         for index, data in self.config.button_mapping.items():
             event = data["event"]
