@@ -174,11 +174,18 @@ def record_loop(
         dt_load = time.perf_counter() - start_loop_t
         precise_sleep(1 / mp_net.config.fps - dt_load)
         dt_loop = time.perf_counter() - start_loop_t
-        logging.info(
+        import sys
+        telemetry_msg = (
             f"[{task}] "
             f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
             f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
         )
+        if sys.stdout.isatty():
+            sys.stdout.write(f"\r{telemetry_msg}")
+            sys.stdout.flush()
+        else:
+            if info.get("episode_step", 0) % 90 == 0:
+                logging.info(telemetry_msg)
 
 
 @parser.wrap()

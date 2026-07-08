@@ -220,14 +220,9 @@ class ManipulationPrimitiveNet(gym.Env):
         info["transition_reason"] = None
         info[DEFAULT_TARGET_POSE_AXES_INFO_KEY] = self._default_target_pose_axes(primitive)
 
-        # 6) Check for transitions
-        buttons = self.teleop_dict["left"].latest_data.get("buttons", [0] * 2)
-        if any(buttons):
-            print(f"\n[DEBUG STEP 6 RAW INFO] info: { {str(k): v for k, v in info.items()} }\n", flush=True)
-
         success_val = info.get(TeleopEvents.SUCCESS, info.get(str(TeleopEvents.SUCCESS), info.get("success", False)))
         if success_val:
-            print(f"\n[DEBUG STEP 6 SUCCESS] active={self._active}, transitions_list={self._transitions.get(self._active)}, info_keys={[str(k) for k in info.keys()]}\n", flush=True)
+            print(f"\n[DEBUG SUCCESS EVENT DETECTED] active={self._active}, transitions_list={self._transitions.get(self._active)}\n", flush=True)
 
         for transition in self._transitions[self._active]:
             result = transition.evaluate(obs=processed_obs, info=info)

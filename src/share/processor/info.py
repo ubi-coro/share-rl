@@ -79,6 +79,7 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
         """Validates that the provided teleoperator supports events after initialization."""
         for t in self.teleoperators.values():
             _check_teleop_with_events(t)
+        self._require_release = {}  # event_name -> bool
 
     def info(self, info: dict) -> dict:
         """
@@ -96,6 +97,14 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
             if any(events.values()):
                 print(f"[DEBUG Pipeline Step] Teleoperator events: {events}", flush=True)
             for event_name, event_value in events.items():
+                event_value = bool(event_value)
+
+                # Release-to-arm logic: suppress event until released
+                if self._require_release.get(event_name, False):
+                    if not event_value:
+                        self._require_release[event_name] = False
+                    event_value = False
+
                 # Store all formats for maximum compatibility across versions/serializers
                 new_info[event_name] = new_info.get(event_name, False) | event_value
                 if hasattr(event_name, "value"):
@@ -107,6 +116,12 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+    def reset(self) -> None:
+        # On reset (e.g. entering a new primitive), require button release before arming transitions
+        for t in self.teleoperators.values():
+            for event_name in t.get_teleop_events():
+                self._require_release[event_name] = True
 
 
 @ProcessorStepRegistry.register("add_footswitch_events_as_info")
@@ -217,18 +232,47 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
             pass
 
         def listen_stdin():
-            while True:
-                try:
-                    line = sys.stdin.readline()
-                    print(f"\n[DEBUG STDIN] Received line: {repr(line)}\n", flush=True)
-                    if not line:
+            import select
+            try:
+                import termios
+                import tty
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                has_tty = True
+            except Exception:
+                has_tty = False
+
+            if not has_tty:
+                # Fallback for non-TTY environments (Jupyter, IDE run windows)
+                while True:
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+                        if "s" in line or line.strip() == "":
+                            self._events[TeleopEvents.SUCCESS] = True
+                            self._stdin_triggered = True
+                    except Exception:
                         break
-                    if "s" in line or line.strip() == "":
-                        self._events[TeleopEvents.SUCCESS] = True
-                        self._stdin_triggered = True
-                except Exception as e:
-                    print(f"\n[DEBUG STDIN] Error: {e}\n", flush=True)
-                    break
+                return
+
+            # TTY raw keypress loop
+            try:
+                while True:
+                    tty.setcbreak(fd)
+                    rlist, _, _ = select.select([fd], [], [], 0.1)
+                    if rlist:
+                        ch = sys.stdin.read(1)
+                        if ch == "s":
+                            self._events[TeleopEvents.SUCCESS] = True
+                            self._stdin_triggered = True
+            except Exception:
+                pass
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
 
         self._stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
         self._stdin_thread.start()
@@ -237,6 +281,10 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         new_info = dict(info)
         for event_name, event_value in self._events.items():
             new_info[event_name] = new_info.get(event_name, False) | event_value
+            if hasattr(event_name, "value"):
+                new_info[event_name.value] = new_info.get(event_name.value, False) | event_value
+            new_info[str(event_name)] = new_info.get(str(event_name), False) | event_value
+
         if self._stdin_triggered:
             self._events[TeleopEvents.SUCCESS] = False
             self._stdin_triggered = False
