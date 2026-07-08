@@ -96,7 +96,11 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
             if any(events.values()):
                 print(f"[DEBUG Pipeline Step] Teleoperator events: {events}", flush=True)
             for event_name, event_value in events.items():
+                # Store all formats for maximum compatibility across versions/serializers
                 new_info[event_name] = new_info.get(event_name, False) | event_value
+                if hasattr(event_name, "value"):
+                    new_info[event_name.value] = new_info.get(event_name.value, False) | event_value
+                new_info[str(event_name)] = new_info.get(str(event_name), False) | event_value
         return new_info
 
     def transform_features(
