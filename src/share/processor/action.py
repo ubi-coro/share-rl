@@ -90,6 +90,12 @@ class MatchTeleopToPolicyActionProcessorStep(ProcessorStep):
     def __post_init__(self) -> None:
         self._is_delta_teleoperator = check_delta_teleoperator(self.teleoperators)
 
+    def reset(self) -> None:
+        self._virtual_task_pose.clear()
+        self._virtual_joint_target.clear()
+        self._prev_fk_pose.clear()
+        self._prev_joint_state.clear()
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
         complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})

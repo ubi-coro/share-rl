@@ -256,10 +256,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
         # 2. Map teleoperation to the Left arm's control space
         self.teleop = {
             "left": SpaceMouseConfig(
-                action_scale=[0.05, 0.05, 0.2, 0.1, 0.1, 0.1],
-                button_mapping={
-                    0: {"event": TeleopEvents.SUCCESS, "toggle": False}
-                }
+                action_scale=[0.05, 0.05, 0.2, 0.1, 0.1, 0.1]
             )
         }
 
