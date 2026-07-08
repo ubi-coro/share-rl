@@ -207,7 +207,9 @@ class ManipulationPrimitiveNet(gym.Env):
             info=info,
             complementary_data=complementary_data,
         )
+        print(f"\n[DEBUG ENV PROCESSOR] BEFORE: {transition.get(TransitionKey.INFO)}\n", flush=True)
         processed_transition = self._env_processors[active](transition)
+        print(f"[DEBUG ENV PROCESSOR] AFTER: {processed_transition.get(TransitionKey.INFO)}\n", flush=True)
         processed_obs = processed_transition[TransitionKey.OBSERVATION]
 
         # 5) Build info
