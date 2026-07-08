@@ -46,7 +46,6 @@ class ManipulationPrimitive(gymnasium.Env):
             self._motor_keys.update([f"{name}.{key}" for key in robot._motors_ft])
 
     def step(self, action: dict[str, dict[str, float]]) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        print(f"[DEBUG PRIMITIVE STEP] active_env={self.task_frame.keys()}, left_act: {action.get('left')}, right_act: {action.get('right')}", flush=True)
         """Apply one outer primitive step.
 
         Args:

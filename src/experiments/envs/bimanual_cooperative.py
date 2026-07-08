@@ -268,7 +268,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.RELATIVE] * 6,
+                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
@@ -295,7 +295,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.RELATIVE] * 6,
+                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
                 ),
             },
             processor=processor,
@@ -309,7 +309,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.RELATIVE] * 6,
+                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
