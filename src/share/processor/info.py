@@ -214,12 +214,14 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
             while True:
                 try:
                     line = sys.stdin.readline()
+                    print(f"\n[DEBUG STDIN] Received line: {repr(line)}\n", flush=True)
                     if not line:
                         break
                     if "s" in line or line.strip() == "":
                         self._events[TeleopEvents.SUCCESS] = True
                         self._stdin_triggered = True
-                except Exception:
+                except Exception as e:
+                    print(f"\n[DEBUG STDIN] Error: {e}\n", flush=True)
                     break
 
         self._stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
