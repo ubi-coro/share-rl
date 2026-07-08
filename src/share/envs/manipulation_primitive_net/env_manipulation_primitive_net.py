@@ -223,11 +223,12 @@ class ManipulationPrimitiveNet(gym.Env):
         info[DEFAULT_TARGET_POSE_AXES_INFO_KEY] = self._default_target_pose_axes(primitive)
 
         # 6) Check for transitions
+        success_val = info.get(TeleopEvents.SUCCESS, info.get("success", False))
+        if success_val:
+            print(f"\n[DEBUG STEP 6 SUCCESS] active={self._active}, transitions_list={self._transitions.get(self._active)}, info_keys={[str(k) for k in info.keys()]}\n", flush=True)
+
         for transition in self._transitions[self._active]:
             result = transition.evaluate(obs=processed_obs, info=info)
-            success_val = info.get(TeleopEvents.SUCCESS, info.get("success", False))
-            if success_val:
-                print(f"\n[DEBUG TRANSITION] SUCCESS TRIGGERED! active={self._active}, success_val={success_val}, result={result}, info_keys={[str(k) for k in info.keys()]}\n", flush=True)
             if not (result.terminated or result.truncated):
                 continue
 
