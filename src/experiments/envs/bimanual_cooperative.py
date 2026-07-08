@@ -11,7 +11,8 @@ from scipy.spatial.transform import Rotation as R
 
 from lerobot.envs import EnvConfig
 from lerobot.robots import Robot
-from lerobot.teleoperators import Teleoperator, TeleopEvents
+from lerobot.teleoperators import Teleoperator
+from share.teleoperators import TeleopEvents
 
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
     EventConfig,
@@ -48,13 +49,26 @@ def _shared_processor() -> ManipulationPrimitiveProcessorConfig:
             add_ee_pos_to_observation=True,
             add_joint_position_to_observation=False,
         ),
-        gripper=GripperConfig(enable=True),
+        gripper=GripperConfig(enable=True, discretize=True),
         events=EventConfig(
-            foot_switch_mapping={
-                (TeleopEvents.SUCCESS,): {"device": 20, "toggle": False},
+            key_mapping={
+                TeleopEvents.SUCCESS: "s",
             },
         ),
     )
+
+
+@ManipulationPrimitiveConfig.register_subclass("mapped_primitive")
+@dataclass
+class MappedManipulationPrimitiveConfig(ManipulationPrimitiveConfig):
+    teleop_mapping: dict[str, str] = field(default_factory=dict)
+
+    def make(self, robot_dict, teleop_dict, cameras, device="cpu"):
+        mapped_teleop = {}
+        for target, source in self.teleop_mapping.items():
+            if source in teleop_dict:
+                mapped_teleop[target] = teleop_dict[source]
+        return super().make(robot_dict, mapped_teleop, cameras, device=device)
 
 
 class SynchronousArmPrimitive(ManipulationPrimitive):
@@ -87,6 +101,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         self._T_v_tcp_left: np.ndarray | None = None
         self._T_v_tcp_right: np.ndarray | None = None
         self._T_world_v_tcp: np.ndarray | None = None
+        self._prev_left_target: list[float] | None = None
         self._initialized = False
 
     def step(self, action: dict[str, dict[str, float]]) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
@@ -113,16 +128,21 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             self._T_world_v_tcp = T_world_v_tcp
             self._T_v_tcp_left = np.linalg.inv(T_world_v_tcp) @ T_world_left
             self._T_v_tcp_right = np.linalg.inv(T_world_v_tcp) @ T_world_right
+            self._prev_left_target = left_pose_raw
             self._initialized = True
 
-        # Extract delta commands mapped to the left arm's SpaceMouse actions
+        # Extract commands from the action dict (which is integrated absolute position targets)
         left_cmd = action.get("left", {})
-        dx = float(left_cmd.get("x.ee_pos", 0.0))
-        dy = float(left_cmd.get("y.ee_pos", 0.0))
-        dz = float(left_cmd.get("z.ee_pos", 0.0))
-        drx = float(left_cmd.get("rx.ee_pos", 0.0))
-        dry = float(left_cmd.get("ry.ee_pos", 0.0))
-        drz = float(left_cmd.get("rz.ee_pos", 0.0))
+        
+        # Compute delta relative to the target pose of the previous step
+        current_left_target = [float(left_cmd.get(f"{ax}.ee_pos", self._prev_left_target[i])) for i, ax in enumerate(TASK_FRAME_AXIS_NAMES)]
+        
+        dx = current_left_target[0] - self._prev_left_target[0]
+        dy = current_left_target[1] - self._prev_left_target[1]
+        dz = current_left_target[2] - self._prev_left_target[2]
+        drx = current_left_target[3] - self._prev_left_target[3]
+        dry = current_left_target[4] - self._prev_left_target[4]
+        drz = current_left_target[5] - self._prev_left_target[5]
 
         # Update V-TCP position and orientation
         if self._T_world_v_tcp is not None:
@@ -140,6 +160,9 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         # Right target needs to be converted back to the right base coordinate system
         T_rightbase_target_right = np.linalg.inv(self.T_leftbase_rightbase) @ T_world_target_right
         right_target_pose = homogeneous_to_sixvec(T_rightbase_target_right)
+
+        # Update previous target reference for next step delta calculation
+        self._prev_left_target = left_target_pose
 
         # Assemble the action dict for both robot arms
         cooperative_action = {
@@ -215,14 +238,14 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
         # 1. Define both robot configs
         self.robot = {
             "left": URConfig(
-                robot_ip="172.22.22.2",
+                robot_ip="172.22.22.5",
                 kp=[3000, 3000, 3000, 200, 200, 200],
                 soft_real_time=True,
                 rt_core=3,
                 use_gripper=True,
             ),
             "right": URConfig(
-                robot_ip="172.22.22.3",
+                robot_ip="172.22.22.2",
                 kp=[3000, 3000, 3000, 200, 200, 200],
                 soft_real_time=True,
                 rt_core=3,
@@ -232,7 +255,12 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
 
         # 2. Map teleoperation to the Left arm's control space
         self.teleop = {
-            "left": SpaceMouseConfig(action_scale=[0.05, 0.05, 0.2, 0.1, 0.1, 0.1])
+            "left": SpaceMouseConfig(
+                action_scale=[0.05, 0.05, 0.2, 0.1, 0.1, 0.1],
+                button_mapping={
+                    0: {"event": TeleopEvents.SUCCESS, "toggle": False}
+                }
+            )
         }
 
         # 3. Define the primitives
@@ -257,7 +285,8 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
         )
 
         # Right-only controls
-        right_arm_primitive = ManipulationPrimitiveConfig(
+        right_arm_primitive = MappedManipulationPrimitiveConfig(
+            teleop_mapping={"right": "left"},
             task_frame={
                 "left": TaskFrame(
                     target=[0.0] * 6,

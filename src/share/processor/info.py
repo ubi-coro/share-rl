@@ -94,8 +94,7 @@ class AddTeleopEventsAsInfoStep(InfoProcessorStep):
         new_info = dict(info)
         for t in self.teleoperators.values():
             events = t.get_teleop_events()
-            if any(events.values()):
-                print(f"[DEBUG Pipeline Step] Teleoperator events: {events}", flush=True)
+
             for event_name, event_value in events.items():
                 event_value = bool(event_value)
 
