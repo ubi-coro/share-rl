@@ -81,6 +81,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         cameras: dict[str, Any],
         display_cameras: bool = False,
         right_arm_base_pose_in_left_base: list[float] | None = None,
+        fps: float = 30.0,
     ):
         super().__init__(
             task_frame=task_frame,
@@ -94,6 +95,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         # Rigid offset transform between the two robot base frames
         self.T_leftbase_rightbase = sixvec_to_homogeneous(right_arm_base_pose_in_left_base)
+        self.fps = fps
         self.reset_runtime_state()
 
     def reset_runtime_state(self) -> None:
@@ -105,11 +107,11 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         self._initialized = False
 
     def step(self, action: dict[str, dict[str, float]]) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        if not self._initialized:
-            # Read initial poses of both end-effectors in their base frames
-            left_obs = self.robot_dict["left"].get_observation()
-            right_obs = self.robot_dict["right"].get_observation()
+        # Read observations
+        left_obs = self.robot_dict["left"].get_observation()
+        right_obs = self.robot_dict["right"].get_observation()
 
+        if not self._initialized:
             left_pose_raw = [left_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
             right_pose_raw = [right_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
 
@@ -131,18 +133,14 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             self._prev_left_target = left_pose_raw
             self._initialized = True
 
-        # Extract commands from the action dict (which is integrated absolute position targets)
+        # Extract commands from the action dict (which are relative deltas when policy_mode is RELATIVE)
         left_cmd = action.get("left", {})
-        
-        # Compute delta relative to the target pose of the previous step
-        current_left_target = [float(left_cmd.get(f"{ax}.ee_pos", self._prev_left_target[i])) for i, ax in enumerate(TASK_FRAME_AXIS_NAMES)]
-        
-        dx = current_left_target[0] - self._prev_left_target[0]
-        dy = current_left_target[1] - self._prev_left_target[1]
-        dz = current_left_target[2] - self._prev_left_target[2]
-        drx = current_left_target[3] - self._prev_left_target[3]
-        dry = current_left_target[4] - self._prev_left_target[4]
-        drz = current_left_target[5] - self._prev_left_target[5]
+        dx = float(left_cmd.get("x.ee_pos", 0.0))
+        dy = float(left_cmd.get("y.ee_pos", 0.0))
+        dz = float(left_cmd.get("z.ee_pos", 0.0))
+        drx = float(left_cmd.get("rx.ee_pos", 0.0))
+        dry = float(left_cmd.get("ry.ee_pos", 0.0))
+        drz = float(left_cmd.get("rz.ee_pos", 0.0))
 
         # Update V-TCP position and orientation
         if self._T_world_v_tcp is not None:
@@ -161,19 +159,27 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         T_rightbase_target_right = np.linalg.inv(self.T_leftbase_rightbase) @ T_world_target_right
         right_target_pose = homogeneous_to_sixvec(T_rightbase_target_right)
 
-        # Update previous target reference for next step delta calculation
-        self._prev_left_target = left_target_pose
+        # Convert target absolute pose to command format expected by controller (cancel dt if relative)
+        left_mode = self.task_frame["left"].policy_mode
+        left_act_dict = {}
+        for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
+            val = left_target_pose[i]
+            if left_mode[i] == PolicyMode.RELATIVE:
+                val = (val - left_obs[f"{ax}.ee_pos"]) * self.fps
+            left_act_dict[f"{ax}.ee_pos"] = val
+
+        right_mode = self.task_frame["right"].policy_mode
+        right_act_dict = {}
+        for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
+            val = right_target_pose[i]
+            if right_mode[i] == PolicyMode.RELATIVE:
+                val = (val - right_obs[f"{ax}.ee_pos"]) * self.fps
+            right_act_dict[f"{ax}.ee_pos"] = val
 
         # Assemble the action dict for both robot arms
         cooperative_action = {
-            "left": {
-                f"{TASK_FRAME_AXIS_NAMES[i]}.ee_pos": left_target_pose[i]
-                for i in range(6)
-            },
-            "right": {
-                f"{TASK_FRAME_AXIS_NAMES[i]}.ee_pos": right_target_pose[i]
-                for i in range(6)
-            },
+            "left": left_act_dict,
+            "right": right_act_dict,
         }
 
         # Keep grippers closed/engaged as before
@@ -215,6 +221,7 @@ class SynchronousArmPrimitiveConfig(ManipulationPrimitiveConfig):
             cameras=cameras,
             display_cameras=display_cameras,
             right_arm_base_pose_in_left_base=self.right_arm_base_pose_in_left_base,
+            fps=self.processor.fps,
         )
 
         env_processor = self.make_env_processor(device)
@@ -268,7 +275,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
+                    policy_mode=[PolicyMode.RELATIVE] * 6,
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
@@ -295,7 +302,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
+                    policy_mode=[PolicyMode.RELATIVE] * 6,
                 ),
             },
             processor=processor,
@@ -309,7 +316,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
-                    policy_mode=[PolicyMode.ABSOLUTE] * 6,
+                    policy_mode=[PolicyMode.RELATIVE] * 6,
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
