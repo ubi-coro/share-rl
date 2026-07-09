@@ -153,6 +153,14 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         dry = float(left_cmd.get("ry.ee_pos", 0.0))
         drz = float(left_cmd.get("rz.ee_pos", 0.0))
 
+        # Apply deadband to prevent joystick center drift
+        dx = 0.0 if abs(dx) < 0.005 else dx
+        dy = 0.0 if abs(dy) < 0.005 else dy
+        dz = 0.0 if abs(dz) < 0.005 else dz
+        drx = 0.0 if abs(drx) < 0.005 else drx
+        dry = 0.0 if abs(dry) < 0.005 else dry
+        drz = 0.0 if abs(drz) < 0.005 else drz
+
         print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
 
         # Calculate actual V-TCP position for reference clamping (prevents target runaway/wind-up)
@@ -321,7 +329,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
         # 2. Map teleoperation to the Left arm's control space
         self.teleop = {
             "left": SpaceMouseConfig(
-                action_scale=[0.05, 0.05, 0.2, 0.4, 0.4, 0.4]
+                action_scale=[0.05, 0.05, 0.2, 0.3, 0.3, 0.3]
             )
         }
 
@@ -375,12 +383,14 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[PolicyMode.RELATIVE] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[None] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
             },
             v_tcp_offset_in_midpoint=[0.0, 0.0, -0.5],
