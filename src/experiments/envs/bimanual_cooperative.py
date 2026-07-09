@@ -164,15 +164,15 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         # Convert target absolute pose to command format expected by controller (cancel dt if relative)
         left_mode = self.task_frame["left"].policy_mode
-        left_obs_rotvec = [left_obs[f"{ax}.ee_pos"] for ax in ["rx", "ry", "rz"]]
-        left_delta_rot = (R.from_rotvec(left_target_pose[3:]) * R.from_rotvec(left_obs_rotvec).inv()).as_rotvec()
+        left_prev_rot = [self._prev_left_target[i] for i in range(3, 6)]
+        left_delta_rot = (R.from_rotvec(left_target_pose[3:]) * R.from_rotvec(left_prev_rot).inv()).as_rotvec()
 
         left_act_dict = {}
         for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
             if i < 3:
                 val = left_target_pose[i]
                 if left_mode[i] == PolicyMode.RELATIVE:
-                    val = (val - left_obs[f"{ax}.ee_pos"]) * self.fps
+                    val = (val - self._prev_left_target[i]) * self.fps
             else:
                 if left_mode[i] == PolicyMode.RELATIVE:
                     val = left_delta_rot[i - 3] * self.fps
@@ -180,6 +180,9 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
                     left_target_euler = rotvec_to_euler_xyz(left_target_pose[3:])
                     val = left_target_euler[i - 3]
             left_act_dict[f"{ax}.ee_pos"] = val
+
+        # Update the tracked left target pose for relative delta command calculations on next step
+        self._prev_left_target = left_target_pose
 
         right_mode = self.task_frame["right"].policy_mode
         right_obs_rotvec = [right_obs[f"{ax}.ee_pos"] for ax in ["rx", "ry", "rz"]]
