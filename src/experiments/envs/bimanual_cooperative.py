@@ -82,6 +82,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         cameras: dict[str, Any],
         display_cameras: bool = False,
         right_arm_base_pose_in_left_base: list[float] | None = None,
+        v_tcp_offset_in_midpoint: list[float] | None = None,
         fps: float = 30.0,
     ):
         import copy
@@ -95,11 +96,12 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             display_cameras=display_cameras,
         )
         if right_arm_base_pose_in_left_base is None:
-            # Default right base is offset by 80cm along world X
-            right_arm_base_pose_in_left_base = [0.8, 0.0, 0.0, 0.0, 0.0, 0.0]
+            # Default right base is offset by 1.0m along world X
+            right_arm_base_pose_in_left_base = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         # Rigid offset transform between the two robot base frames
         self.T_leftbase_rightbase = sixvec_to_homogeneous(right_arm_base_pose_in_left_base)
+        self.v_tcp_offset_in_midpoint = v_tcp_offset_in_midpoint
         self.fps = fps
         self.reset_runtime_state()
 
@@ -126,6 +128,9 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         if not self._initialized:
             # Initialize V-TCP at the midpoint
             p_v_tcp = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
+            if self.v_tcp_offset_in_midpoint is not None:
+                p_v_tcp += np.array(self.v_tcp_offset_in_midpoint)
+
             R_v_tcp = np.eye(3)
             T_world_v_tcp = np.eye(4)
             T_world_v_tcp[:3, :3] = R_v_tcp
@@ -244,7 +249,10 @@ class SynchronousArmPrimitiveConfig(ManipulationPrimitiveConfig):
     """Primitive config that builds the SynchronousArmPrimitive environment."""
 
     right_arm_base_pose_in_left_base: list[float] = field(
-        default_factory=lambda: [0.8, 0.0, 0.0, 0.0, 0.0, 0.0]
+        default_factory=lambda: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    )
+    v_tcp_offset_in_midpoint: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0]
     )
 
     def make(
@@ -268,6 +276,7 @@ class SynchronousArmPrimitiveConfig(ManipulationPrimitiveConfig):
             cameras=cameras,
             display_cameras=display_cameras,
             right_arm_base_pose_in_left_base=self.right_arm_base_pose_in_left_base,
+            v_tcp_offset_in_midpoint=self.v_tcp_offset_in_midpoint,
             fps=self.processor.fps,
         )
 
@@ -372,6 +381,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     policy_mode=[None] * 6,
                 ),
             },
+            v_tcp_offset_in_midpoint=[0.0, 0.0, -0.5],
             processor=processor,
             notes="Move both arms in unison relative to the Virtual TCP.",
         )
