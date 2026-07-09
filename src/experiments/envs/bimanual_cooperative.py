@@ -285,6 +285,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                 soft_real_time=True,
                 rt_core=3,
                 use_gripper=True,
+                compliance_reference_limit_enable=[True]*6,
             ),
             "right": URConfig(
                 robot_ip="172.22.22.2",
@@ -292,6 +293,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                 soft_real_time=True,
                 rt_core=3,
                 use_gripper=True,
+                compliance_reference_limit_enable=[True]*6,
             ),
         }
 
