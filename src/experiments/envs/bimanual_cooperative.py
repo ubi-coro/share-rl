@@ -105,6 +105,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         self._T_v_tcp_right: np.ndarray | None = None
         self._T_world_v_tcp: np.ndarray | None = None
         self._prev_left_target: list[float] | None = None
+        self._prev_right_target: list[float] | None = None
         self._initialized = False
 
     def step(self, action: dict[str, dict[str, float]]) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
@@ -132,6 +133,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             self._T_v_tcp_left = np.linalg.inv(T_world_v_tcp) @ T_world_left
             self._T_v_tcp_right = np.linalg.inv(T_world_v_tcp) @ T_world_right
             self._prev_left_target = left_pose_raw
+            self._prev_right_target = right_pose_raw
             self._initialized = True
 
         # Extract commands from the action dict (which are relative deltas when policy_mode is RELATIVE)
@@ -145,10 +147,11 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
 
-        # Update V-TCP position and orientation
+        # Update V-TCP position and orientation (scaled by dt to convert velocities to step displacements)
+        dt = 1.0 / self.fps
         if self._T_world_v_tcp is not None:
-            self._T_world_v_tcp[:3, 3] += [dx, dy, dz]
-            rot = R.from_euler("xyz", [drx, dry, drz]).as_matrix()
+            self._T_world_v_tcp[:3, 3] += np.array([dx, dy, dz]) * dt
+            rot = R.from_euler("xyz", np.array([drx, dry, drz]) * dt).as_matrix()
             self._T_world_v_tcp[:3, :3] = rot @ self._T_world_v_tcp[:3, :3]
 
         # Compute individual arm target transformations
@@ -185,8 +188,8 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         self._prev_left_target = left_target_pose
 
         right_mode = self.task_frame["right"].policy_mode
-        right_obs_rotvec = [right_obs[f"{ax}.ee_pos"] for ax in ["rx", "ry", "rz"]]
-        right_delta_rot = (R.from_rotvec(right_target_pose[3:]) * R.from_rotvec(right_obs_rotvec).inv()).as_rotvec()
+        right_prev_rot = [self._prev_right_target[i] for i in range(3, 6)]
+        right_delta_rot = (R.from_rotvec(right_target_pose[3:]) * R.from_rotvec(right_prev_rot).inv()).as_rotvec()
         right_target_euler = rotvec_to_euler_xyz(right_target_pose[3:])
 
         right_act_dict = {}
@@ -194,7 +197,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             if i < 3:
                 val = right_target_pose[i]
                 if right_mode[i] == PolicyMode.RELATIVE:
-                    val = (val - right_obs[f"{ax}.ee_pos"]) * self.fps
+                    val = (val - self._prev_right_target[i]) * self.fps
             else:
                 if right_mode[i] == PolicyMode.RELATIVE:
                     val = right_delta_rot[i - 3] * self.fps
@@ -202,17 +205,19 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
                     val = right_target_euler[i - 3]
             right_act_dict[f"{ax}.ee_pos"] = val
 
+        # Update the tracked right target pose for relative delta command calculations on next step
+        self._prev_right_target = right_target_pose
+
         # Assemble the action dict for both robot arms
         cooperative_action = {
             "left": left_act_dict,
             "right": right_act_dict,
         }
 
-        # Keep grippers closed/engaged as before
+        # Command both grippers in sync using the left arm's teleoperated gripper action
         if "gripper.pos" in action.get("left", {}):
             cooperative_action["left"]["gripper.pos"] = action["left"]["gripper.pos"]
-        if "gripper.pos" in action.get("right", {}):
-            cooperative_action["right"]["gripper.pos"] = action["right"]["gripper.pos"]
+            cooperative_action["right"]["gripper.pos"] = action["left"]["gripper.pos"]
 
         return super().step(cooperative_action)
 
