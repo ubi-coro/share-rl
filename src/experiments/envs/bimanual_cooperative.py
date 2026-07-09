@@ -170,7 +170,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             # This threshold gate prevents closing a continuous feedback loop and eliminates sensor-induced drift.
             pos_err = self._T_world_v_tcp[:3, 3] - p_v_tcp_actual
             err_norm = np.linalg.norm(pos_err)
-            if err_norm > 0.02:
+            if err_norm > 0.02 and np.linalg.norm([dx, dy, dz]) > 1e-5:
                 self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + (pos_err / err_norm) * 0.02
 
             # 2. Update rotation (open-loop to ensure smooth rotation about V-TCP without sensor noise feedback)
@@ -321,7 +321,7 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
         # 2. Map teleoperation to the Left arm's control space
         self.teleop = {
             "left": SpaceMouseConfig(
-                action_scale=[0.05, 0.05, 0.2, 0.1, 0.1, 0.1]
+                action_scale=[0.05, 0.05, 0.2, 0.4, 0.4, 0.4]
             )
         }
 
