@@ -37,6 +37,7 @@ from share.robots.ur import URConfig
 from share.utils.transformation_utils import (
     homogeneous_to_sixvec,
     sixvec_to_homogeneous,
+    rotvec_to_euler_xyz,
 )
 
 
@@ -142,11 +143,13 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         dry = float(left_cmd.get("ry.ee_pos", 0.0))
         drz = float(left_cmd.get("rz.ee_pos", 0.0))
 
+        print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
+
         # Update V-TCP position and orientation
         if self._T_world_v_tcp is not None:
             self._T_world_v_tcp[:3, 3] += [dx, dy, dz]
             rot = R.from_euler("xyz", [drx, dry, drz]).as_matrix()
-            self._T_world_v_tcp[:3, :3] = self._T_world_v_tcp[:3, :3] @ rot
+            self._T_world_v_tcp[:3, :3] = rot @ self._T_world_v_tcp[:3, :3]
 
         # Compute individual arm target transformations
         T_world_target_left = self._T_world_v_tcp @ self._T_v_tcp_left
@@ -161,19 +164,39 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         # Convert target absolute pose to command format expected by controller (cancel dt if relative)
         left_mode = self.task_frame["left"].policy_mode
+        left_obs_rotvec = [left_obs[f"{ax}.ee_pos"] for ax in ["rx", "ry", "rz"]]
+        left_delta_rot = (R.from_rotvec(left_target_pose[3:]) * R.from_rotvec(left_obs_rotvec).inv()).as_rotvec()
+
         left_act_dict = {}
         for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
-            val = left_target_pose[i]
-            if left_mode[i] == PolicyMode.RELATIVE:
-                val = (val - left_obs[f"{ax}.ee_pos"]) * self.fps
+            if i < 3:
+                val = left_target_pose[i]
+                if left_mode[i] == PolicyMode.RELATIVE:
+                    val = (val - left_obs[f"{ax}.ee_pos"]) * self.fps
+            else:
+                if left_mode[i] == PolicyMode.RELATIVE:
+                    val = left_delta_rot[i - 3] * self.fps
+                else:
+                    left_target_euler = rotvec_to_euler_xyz(left_target_pose[3:])
+                    val = left_target_euler[i - 3]
             left_act_dict[f"{ax}.ee_pos"] = val
 
         right_mode = self.task_frame["right"].policy_mode
+        right_obs_rotvec = [right_obs[f"{ax}.ee_pos"] for ax in ["rx", "ry", "rz"]]
+        right_delta_rot = (R.from_rotvec(right_target_pose[3:]) * R.from_rotvec(right_obs_rotvec).inv()).as_rotvec()
+        right_target_euler = rotvec_to_euler_xyz(right_target_pose[3:])
+
         right_act_dict = {}
         for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
-            val = right_target_pose[i]
-            if right_mode[i] == PolicyMode.RELATIVE:
-                val = (val - right_obs[f"{ax}.ee_pos"]) * self.fps
+            if i < 3:
+                val = right_target_pose[i]
+                if right_mode[i] == PolicyMode.RELATIVE:
+                    val = (val - right_obs[f"{ax}.ee_pos"]) * self.fps
+            else:
+                if right_mode[i] == PolicyMode.RELATIVE:
+                    val = right_delta_rot[i - 3] * self.fps
+                else:
+                    val = right_target_euler[i - 3]
             right_act_dict[f"{ax}.ee_pos"] = val
 
         # Assemble the action dict for both robot arms
