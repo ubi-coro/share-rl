@@ -117,14 +117,13 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         left_obs = self.robot_dict["left"].get_observation()
         right_obs = self.robot_dict["right"].get_observation()
 
+        left_pose_raw = [left_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
+        right_pose_raw = [right_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
+
+        T_world_left = sixvec_to_homogeneous(left_pose_raw)
+        T_world_right = self.T_leftbase_rightbase @ sixvec_to_homogeneous(right_pose_raw)
+
         if not self._initialized:
-            left_pose_raw = [left_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
-            right_pose_raw = [right_obs[f"{ax}.ee_pos"] for ax in TASK_FRAME_AXIS_NAMES]
-
-            T_world_left = sixvec_to_homogeneous(left_pose_raw)
-            T_rightbase_right = sixvec_to_homogeneous(right_pose_raw)
-            T_world_right = self.T_leftbase_rightbase @ T_rightbase_right
-
             # Initialize V-TCP at the midpoint
             p_v_tcp = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
             R_v_tcp = np.eye(3)
@@ -151,12 +150,26 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
 
+        # Calculate actual V-TCP pose for reference clamping (prevents target runaway/wind-up)
+        p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
+        R_v_tcp_actual = T_world_left[:3, :3]  # Use left arm orientation as reference
+
         # Update V-TCP position and orientation (scaled by dt to convert velocities to step displacements)
         dt = 1.0 / self.fps
         if self._T_world_v_tcp is not None:
+            # 1. Update position & Clamp tracking error relative to actual robot position (max 2cm)
             self._T_world_v_tcp[:3, 3] += np.array([dx, dy, dz]) * dt
+            pos_err = self._T_world_v_tcp[:3, 3] - p_v_tcp_actual
+            self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + np.clip(pos_err, -0.02, 0.02)
+
+            # 2. Update rotation & Clamp orientation error (max 0.08 rad / ~4.5 deg)
             rot = R.from_euler("xyz", np.array([drx, dry, drz]) * dt).as_matrix()
             self._T_world_v_tcp[:3, :3] = rot @ self._T_world_v_tcp[:3, :3]
+            
+            rot_err = self._T_world_v_tcp[:3, :3] @ R_v_tcp_actual.T
+            rot_err_vec = R.from_matrix(rot_err).as_rotvec()
+            rot_err_clamped = np.clip(rot_err_vec, -0.08, 0.08)
+            self._T_world_v_tcp[:3, :3] = R.from_rotvec(rot_err_clamped).as_matrix() @ R_v_tcp_actual
 
         # Compute individual arm target transformations
         T_world_target_left = self._T_world_v_tcp @ self._T_v_tcp_left
@@ -285,7 +298,6 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                 soft_real_time=True,
                 rt_core=3,
                 use_gripper=True,
-                compliance_reference_limit_enable=[True]*6,
             ),
             "right": URConfig(
                 robot_ip="172.22.22.2",
@@ -293,7 +305,6 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                 soft_real_time=True,
                 rt_core=3,
                 use_gripper=True,
-                compliance_reference_limit_enable=[True]*6,
             ),
         }
 
