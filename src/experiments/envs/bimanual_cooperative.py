@@ -84,8 +84,12 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         right_arm_base_pose_in_left_base: list[float] | None = None,
         fps: float = 30.0,
     ):
+        import copy
+        task_frame_copy = copy.deepcopy(task_frame)
+        task_frame_copy["right"].policy_mode = [PolicyMode.RELATIVE] * 6
+
         super().__init__(
-            task_frame=task_frame,
+            task_frame=task_frame_copy,
             robot_dict=robot_dict,
             cameras=cameras,
             display_cameras=display_cameras,
