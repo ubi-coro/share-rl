@@ -157,6 +157,8 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         # Calculate actual V-TCP position for reference clamping (prevents target runaway/wind-up)
         p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
+        if self.v_tcp_offset_in_midpoint is not None:
+            p_v_tcp_actual += np.array(self.v_tcp_offset_in_midpoint)
 
         # Update V-TCP position and orientation (scaled by dt to convert velocities to step displacements)
         dt = 1.0 / self.fps
