@@ -1,6 +1,7 @@
 import json
+import math
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from PIL import Image
 
 import numpy as np
@@ -17,6 +18,7 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import (
 )
 from share.envs.manipulation_primitive.env_manipulation_primitive import ManipulationPrimitive
 from share.envs.manipulation_primitive.task_frame import TaskFrame
+from share.teleoperators import TeleopEvents
 import logging
 
 from pose_estimation import GraspObjectSpec, PoseEstimator, create_pose_estimator
@@ -87,6 +89,34 @@ def pose_xyzrpy_to_transform(pose: list[float] | np.ndarray) -> np.ndarray:
     return transform
 
 
+def pose_within_tolerance(
+    current_pose: list[float] | np.ndarray,
+    expected_pose: list[float] | np.ndarray,
+    tolerance: float | list[float],
+) -> bool:
+    """Check whether ``current_pose`` matches ``expected_pose`` within per-axis tolerance.
+
+    Both poses are xyzrpy (translation in meters, rotation in radians). Rotation
+    axis errors are wrapped to [-pi, pi] before comparison.
+    """
+    current_pose = np.asarray(current_pose, dtype=np.float64).reshape(6)
+    expected_pose = np.asarray(expected_pose, dtype=np.float64).reshape(6)
+    if isinstance(tolerance, (int, float)):
+        tolerances = [float(tolerance)] * 6
+    else:
+        tolerances = [float(v) for v in tolerance]
+        if len(tolerances) != 6:
+            raise ValueError("pose tolerance must be a scalar or length-6 list.")
+
+    for axis in range(6):
+        error = current_pose[axis] - expected_pose[axis]
+        if axis >= 3:
+            error = math.atan2(math.sin(error), math.cos(error))
+        if abs(error) > tolerances[axis]:
+            return False
+    return True
+
+
 def tcp_pose_rotvec_to_transform(pose: list[float] | np.ndarray) -> np.ndarray:
     pose = np.asarray(pose, dtype=np.float64).reshape(6)
     transform = np.eye(4, dtype=np.float64)
@@ -105,8 +135,12 @@ class FoundationPosePrimitive(ManipulationPrimitive):
             calibration_file: str | Path,
             display_cameras: bool = False,
             pose_key: str = "pose",
+            expected_pose: list[float] | None = None,
+            pose_tolerance: float | list[float] = 0.02,
     ):
         super().__init__(task_frame, robot_dict, cameras, display_cameras)
+        self.expected_pose = expected_pose
+        self.pose_tolerance = pose_tolerance
 
         if isinstance(grasp_object, GraspObjectSpec):
             self.object_spec = grasp_object
@@ -192,6 +226,23 @@ class FoundationPosePrimitive(ManipulationPrimitive):
             logger.info(f"GRIPPER POSE IN OBJECT FRAME: {transform_to_pose_xyzrpy(gripper_pose_object)}")
 
         self.set_runtime_value(self.pose_key, object_pose_world)
+
+        # No expected pose configured: treat the estimate as trusted so OnSuccess
+        # behaves like the unconditional Always transition used before this check
+        # existed. Set expected_pose to actually gate on tolerance.
+        pose_ok = True
+        if self.expected_pose is not None:
+            pose_ok = pose_within_tolerance(object_pose_world, self.expected_pose, self.pose_tolerance)
+            logger.info(
+                "pose estimation tolerance check %s (estimated=%s, expected=%s, tolerance=%s)",
+                "passed" if pose_ok else "failed",
+                object_pose_world,
+                self.expected_pose,
+                self.pose_tolerance,
+            )
+        info[TeleopEvents.SUCCESS] = pose_ok
+        info[TeleopEvents.FAILURE] = not pose_ok
+
         self._pose_estimator_initialized = False
         return obs, reward, terminated, truncated, info
 
@@ -212,6 +263,12 @@ class FoundationPosePrimitive(ManipulationPrimitive):
 class FoundationPosePrimitiveConfig(ManipulationPrimitiveConfig):
     grasp_obj: GraspObjectSpec|str|None = None
     calibration_file: str = ""
+    # Optimal/expected object pose (world frame, xyzrpy). When set, the primitive
+    # checks the estimated pose against it and reports TeleopEvents.SUCCESS /
+    # TeleopEvents.FAILURE in info so OnSuccess/OnFailure transitions can route
+    # to different next primitives depending on whether the estimate is trusted.
+    expected_pose: list[float] | None = None
+    pose_tolerance: float | list[float] = field(default_factory=lambda: [0.02, 0.02, 0.02, 0.2, 0.2, 0.2])
 
     def validate(self, robot_dict, teleop_dict):
         super().validate(robot_dict, teleop_dict)
@@ -233,7 +290,9 @@ class FoundationPosePrimitiveConfig(ManipulationPrimitiveConfig):
                                       display_cameras=display_cameras,
                                       grasp_object=self.grasp_obj,
                                       calibration_file=self.calibration_file,
-                                      pose_key="object_pose")
+                                      pose_key="object_pose",
+                                      expected_pose=self.expected_pose,
+                                      pose_tolerance=self.pose_tolerance)
 
         env_processor = self.make_env_processor(device)
         action_processor = self.make_action_processor(robot_dict, teleop_dict, device)

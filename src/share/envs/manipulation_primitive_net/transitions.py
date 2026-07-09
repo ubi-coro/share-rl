@@ -61,6 +61,20 @@ class OnSuccess(Transition):
         )
 
 
+@Transition.register_subclass("on_failure")
+@dataclass
+class OnFailure(Transition):
+    failure_key: str = TeleopEvents.FAILURE
+    additional_reward: float = 0.0
+
+    def evaluate(self, obs: dict[str, Any], info: dict[str, Any]) -> Outcome:
+        return Outcome(
+            terminated=info.get(self.failure_key, False),
+            reward=self.additional_reward,
+            reason="failure" if self.reason is None else self.reason
+        )
+
+
 @Transition.register_subclass("on_observation_threshold")
 @dataclass
 class OnObservationThreshold(Transition):

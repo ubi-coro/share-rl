@@ -23,7 +23,12 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import (
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, TaskFrame, PolicyMode, ControlSpace
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
-from share.envs.manipulation_primitive_net.transitions import Always, OnTargetPoseReached, OnTimeLimit
+from share.envs.manipulation_primitive_net.transitions import (
+    OnFailure,
+    OnSuccess,
+    OnTargetPoseReached,
+    OnTimeLimit,
+)
 from pose_estimation import GraspObjectSpec
 from share.robots.ur import URConfig
 from share.teleoperators import TeleopEvents
@@ -172,10 +177,13 @@ class UR5eFoundationPosePickEnvConfig(ManipulationPrimitiveNetConfig):
                 target="estimate_object_pose",
                 tolerance=list(self.target_tolerance),
             ),
-            Always(
+            OnSuccess(
                 source="estimate_object_pose",
                 target="move_to_grasp_pose",
-                # tolerance=list(self.target_tolerance)
+            ),
+            OnFailure(
+                source="estimate_object_pose",
+                target="move_to_scan_pose",
             ),
             OnTargetPoseReached(
                 source="move_to_grasp_pose",
@@ -204,9 +212,13 @@ class UR5eFoundationPosePickEnvConfig(ManipulationPrimitiveNetConfig):
                 target="estimate_object_pose_2",
                 max_steps=int(90),
             ),
-            Always(
+            OnSuccess(
                 source="estimate_object_pose_2",
                 target="move_to_grasp_pose_2",
+            ),
+            OnFailure(
+                source="estimate_object_pose_2",
+                target="move_to_scan_pose_2",
             ),
             OnTargetPoseReached(
                 source="move_to_grasp_pose_2",
