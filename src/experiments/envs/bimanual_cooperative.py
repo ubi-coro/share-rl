@@ -150,26 +150,25 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
 
-        # Calculate actual V-TCP pose for reference clamping (prevents target runaway/wind-up)
+        # Calculate actual V-TCP position for reference clamping (prevents target runaway/wind-up)
         p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
-        R_v_tcp_actual = T_world_left[:3, :3]  # Use left arm orientation as reference
 
         # Update V-TCP position and orientation (scaled by dt to convert velocities to step displacements)
         dt = 1.0 / self.fps
         if self._T_world_v_tcp is not None:
-            # 1. Update position & Clamp tracking error relative to actual robot position (max 2cm)
+            # 1. Update position
             self._T_world_v_tcp[:3, 3] += np.array([dx, dy, dz]) * dt
+            
+            # Clamp target position to prevent wind-up ONLY if tracking error exceeds 2cm threshold.
+            # This threshold gate prevents closing a continuous feedback loop and eliminates sensor-induced drift.
             pos_err = self._T_world_v_tcp[:3, 3] - p_v_tcp_actual
-            self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + np.clip(pos_err, -0.02, 0.02)
+            err_norm = np.linalg.norm(pos_err)
+            if err_norm > 0.02:
+                self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + (pos_err / err_norm) * 0.02
 
-            # 2. Update rotation & Clamp orientation error (max 0.08 rad / ~4.5 deg)
+            # 2. Update rotation (open-loop to ensure smooth rotation about V-TCP without sensor noise feedback)
             rot = R.from_euler("xyz", np.array([drx, dry, drz]) * dt).as_matrix()
             self._T_world_v_tcp[:3, :3] = rot @ self._T_world_v_tcp[:3, :3]
-            
-            rot_err = self._T_world_v_tcp[:3, :3] @ R_v_tcp_actual.T
-            rot_err_vec = R.from_matrix(rot_err).as_rotvec()
-            rot_err_clamped = np.clip(rot_err_vec, -0.08, 0.08)
-            self._T_world_v_tcp[:3, :3] = R.from_rotvec(rot_err_clamped).as_matrix() @ R_v_tcp_actual
 
         # Compute individual arm target transformations
         T_world_target_left = self._T_world_v_tcp @ self._T_v_tcp_left
