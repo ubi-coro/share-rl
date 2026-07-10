@@ -161,7 +161,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         dry = 0.0 if abs(dry) < 0.005 else dry
         drz = 0.0 if abs(drz) < 0.005 else drz
 
-        print(f"[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", flush=True)
+        print(f"\r[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", end="", flush=True)
 
         # Calculate actual V-TCP position for reference clamping (prevents target runaway/wind-up)
         p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
