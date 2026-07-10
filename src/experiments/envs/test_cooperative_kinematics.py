@@ -65,10 +65,27 @@ class MockRobot(Robot):
     def step(self):
         pass
 
+def print_poses(step_idx, left_robot, right_robot):
+    left_z = left_robot.current_pose[2]
+    left_y = left_robot.current_pose[1]
+    left_rx, left_ry, left_rz = R.from_rotvec(left_robot.current_pose[3:6]).as_euler("xyz", degrees=True)
+
+    # Right base is offset by X=1.0m, so we get right pose in left base (world) coordinate frame:
+    right_z = right_robot.current_pose[2]
+    right_y = right_robot.current_pose[1]
+    right_rx, right_ry, right_rz = R.from_rotvec(right_robot.current_pose[3:6]).as_euler("xyz", degrees=True)
+
+    print(
+        f"Step {step_idx:02d} | "
+        f"Left (Z={left_z:.4f}, Y={left_y:.4f}, Ry={left_ry:6.1f}°, Rz={left_rz:6.1f}°) | "
+        f"Right (Z={right_z:.4f}, Y={right_y:.4f}, Ry={right_ry:6.1f}°, Rz={right_rz:6.1f}°)"
+    )
+
 def run_test():
     # 1. Setup mock robots
-    # Left robot starting at [0, 0, 1.0], right robot starting at [0, 0, 1.0] in right base frame
-    # (Note: right base is offset by x=1.0, so right EE is at world [1.0, 0, 1.0])
+    # Both start at local [0, 0, 1.0].
+    # Left base is at X=0, so left EE is at world [0.0, 0.0, 1.0].
+    # Right base is at X=1.0, so right EE is at world [1.0, 0.0, 1.0].
     left_start = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     right_start = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0] 
     
@@ -106,74 +123,58 @@ def run_test():
         fps=30.0
     )
     
-    print("\n--- STEP 1: INITIALIZATION (0 INPUT) ---")
-    action = {
-        "left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}
-    }
-    
-    env.step(action)
-    print("V-TCP Target position:", env._T_world_v_tcp[:3, 3])
-    print("Left command:", [f"{k}: {v:.4f}" for k, v in left_robot.last_action.items() if "ee_pos" in k])
-    print("Right command:", [f"{k}: {v:.4f}" for k, v in right_robot.last_action.items() if "ee_pos" in k])
-    
-    # Update mock robot positions to simulate movement
     dt = 1.0 / 30.0
-    # Left and right both run in RELATIVE controller mode due to synchronous arm init overrides:
+
+    print("\n=== STEP 1: INITIALIZATION ===")
+    action = {"left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}}
+    env.step(action)
+    print_poses(0, left_robot, right_robot)
+    
+    # Update poses (should remain identical to start)
     for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
         left_robot.current_pose[i] += left_robot.last_action[f"{ax}.ee_pos"] * dt
         right_robot.current_pose[i] += right_robot.last_action[f"{ax}.ee_pos"] * dt
 
-    print("\n--- STEP 2: YAW ROTATION COMMAND (rz = 0.3 rad/s) ---")
-    action = {
-        "left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}
-    }
-    action["left"]["rz.ee_pos"] = 0.3  # Command yaw rotation
-    
+    print("\n=== STEP 2: MULTI-STEP PITCH TRAJECTORY (ry = 0.3 rad/s) ===")
+    print("Commanding constant positive Pitch command. One arm should go UP, the other DOWN, and wrists should pitch.")
+    for step in range(1, 16):
+        action = {"left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}}
+        action["left"]["ry.ee_pos"] = 0.3
+        env.step(action)
+        
+        # Integrate robot poses
+        for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
+            left_robot.current_pose[i] += left_robot.last_action[f"{ax}.ee_pos"] * dt
+            right_robot.current_pose[i] += right_robot.last_action[f"{ax}.ee_pos"] * dt
+            
+        print_poses(step, left_robot, right_robot)
+
+    # Let's reset the robots to start position before the Yaw test
+    left_robot.current_pose = list(left_start)
+    right_robot.current_pose = list(right_start)
+    env._initialized = False # force V-TCP re-initialization
+
+    print("\n=== STEP 3: INITIALIZATION ===")
+    action = {"left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}}
     env.step(action)
-    print("Left command (should show non-zero y translation):")
-    print("  x.ee_pos:", f"{left_robot.last_action['x.ee_pos']:.4f}")
-    print("  y.ee_pos:", f"{left_robot.last_action['y.ee_pos']:.4f}")
-    print("  z.ee_pos:", f"{left_robot.last_action['z.ee_pos']:.4f}")
-    print("Right command (should show opposite y translation):")
-    print("  x.ee_pos:", f"{right_robot.last_action['x.ee_pos']:.4f}")
-    print("  y.ee_pos:", f"{right_robot.last_action['y.ee_pos']:.4f}")
-    print("  z.ee_pos:", f"{right_robot.last_action['z.ee_pos']:.4f}")
-    
-    # Update mock robot positions
+    print_poses(0, left_robot, right_robot)
     for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
         left_robot.current_pose[i] += left_robot.last_action[f"{ax}.ee_pos"] * dt
         right_robot.current_pose[i] += right_robot.last_action[f"{ax}.ee_pos"] * dt
 
-    print("\n--- STEP 3: PITCH ROTATION COMMAND (ry = 0.3 rad/s) ---")
-    action = {
-        "left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}
-    }
-    action["left"]["ry.ee_pos"] = 0.3  # Command pitch rotation
-    
-    env.step(action)
-    print("Left command (should translate down in Z):")
-    print("  z.ee_pos:", f"{left_robot.last_action['z.ee_pos']:.4f}")
-    print("Right command (should translate up in Z):")
-    print("  z.ee_pos:", f"{right_robot.last_action['z.ee_pos']:.4f}")
-    
-    # Update mock robot positions
-    for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
-        left_robot.current_pose[i] += left_robot.last_action[f"{ax}.ee_pos"] * dt
-        right_robot.current_pose[i] += right_robot.last_action[f"{ax}.ee_pos"] * dt
-
-    print("\n--- STEP 4: RELEASE JOYSTICK (0 INPUT) ---")
-    action = {
-        "left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}
-    }
-    env.step(action)
-    print("Left command (should be exactly 0):")
-    print("  x.ee_pos:", f"{left_robot.last_action['x.ee_pos']:.4f}")
-    print("  y.ee_pos:", f"{left_robot.last_action['y.ee_pos']:.4f}")
-    print("  z.ee_pos:", f"{left_robot.last_action['z.ee_pos']:.4f}")
-    print("Right command (should be exactly 0):")
-    print("  x.ee_pos:", f"{right_robot.last_action['x.ee_pos']:.4f}")
-    print("  y.ee_pos:", f"{right_robot.last_action['y.ee_pos']:.4f}")
-    print("  z.ee_pos:", f"{right_robot.last_action['z.ee_pos']:.4f}")
+    print("\n=== STEP 4: MULTI-STEP YAW TRAJECTORY (rz = 0.3 rad/s) ===")
+    print("Commanding constant positive Yaw command. One arm should go FORWARD (+Y), the other BACKWARD (-Y), and wrists should yaw.")
+    for step in range(1, 16):
+        action = {"left": {f"{ax}.ee_pos": 0.0 for ax in TASK_FRAME_AXIS_NAMES}}
+        action["left"]["rz.ee_pos"] = 0.3
+        env.step(action)
+        
+        # Integrate robot poses
+        for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
+            left_robot.current_pose[i] += left_robot.last_action[f"{ax}.ee_pos"] * dt
+            right_robot.current_pose[i] += right_robot.last_action[f"{ax}.ee_pos"] * dt
+            
+        print_poses(step, left_robot, right_robot)
 
 if __name__ == "__main__":
     run_test()
