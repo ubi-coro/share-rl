@@ -9,6 +9,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from experiments.envs.bimanual_cooperative import DemoURBimanualCooperativeEnvConfig
 from share.envs.manipulation_primitive.task_frame import TASK_FRAME_AXIS_NAMES
 
+def countdown(seconds, message):
+    print(f"\n{message}")
+    for i in range(seconds, 0, -1):
+        print(f"Starting in {i} seconds... (Make sure area is clear! Press Ctrl+C to abort)")
+        time.sleep(1.0)
+
 def main():
     print("--- Cooperating physical arm rotations validation script ---")
     print("Initializing environment and connecting to the robots...")
@@ -29,34 +35,15 @@ def main():
     # duration = 0.35 / 0.3 = 1.16 seconds.
     # At 30 fps, this is: 1.16 * 30 = 35 steps.
     
-    while True:
-        print("\nSelect a rotation to test:")
-        print("1. 20-degree Pitch (tilt up then down)")
-        print("2. 20-degree Yaw (steer left then right)")
-        print("3. 20-degree Roll (spin about rod axis)")
-        print("4. Exit")
-        choice = input("Enter choice (1-4): ").strip()
-        
-        if choice == '4':
-            break
-            
-        axis = None
-        if choice == '1':
-            axis = "ry.ee_pos"
-            name = "Pitch"
-        elif choice == '2':
-            axis = "rz.ee_pos"
-            name = "Yaw"
-        elif choice == '3':
-            axis = "rx.ee_pos"
-            name = "Roll"
-        else:
-            print("Invalid choice.")
-            continue
-            
-        print(f"\nReady to execute {name} rotation test.")
-        print("The arms will tilt in one direction by 20 degrees, pause, and tilt back.")
-        input("Press Enter to START (Make sure area is clear!)...")
+    tests = [
+        ("ry.ee_pos", "20-degree Pitch (tilt up then down)"),
+        ("rz.ee_pos", "20-degree Yaw (steer left then right)"),
+        ("rx.ee_pos", "20-degree Roll (spin about rod axis)")
+    ]
+    
+    for axis, name in tests:
+        # Countdown before each test
+        countdown(5, f"=== NEXT TEST: {name} ===")
         
         # 1. Rotate in positive direction
         print("Rotating positive...")
@@ -88,9 +75,10 @@ def main():
             coop_env.step(action)
             time.sleep(1.0 / 30.0)
             
-        print("\nRotation step test finished.")
+        print("Test finished.")
+        time.sleep(1.5)
 
-    print("\nDisconnecting from robots...")
+    print("\nAll rotation tests finished. Disconnecting from robots...")
     net.close()
 
 if __name__ == "__main__":
