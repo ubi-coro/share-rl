@@ -331,7 +331,7 @@ class InterventionActionProcessorStep(ProcessorStep):
                     source_actions[name] = dict(policy_actions.get(name, {}))
                     # Set the command to the current observed position to satisfy the flattener
                     # while preserving the physical state of the gripper.
-                    obs = transition.get(TransitionKey.OBSERVATION, {})
+                    obs = transition.get(TransitionKey.OBSERVATION) or {}
                     obs_key = f"{name}.{GRIPPER_KEY}.pos"
                     if obs_key in obs:
                         obs_val = obs[obs_key]
