@@ -190,11 +190,11 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             # 1. Update position
             self._T_world_v_tcp[:3, 3] += np.array([dx, dy, dz]) * dt
             
-            # Clamp target position to prevent wind-up ONLY if tracking error exceeds 2cm threshold.
+            # Clamp target position to prevent wind-up ONLY if tracking error exceeds 10cm threshold.
             pos_err = self._T_world_v_tcp[:3, 3] - p_v_tcp_actual
             err_norm = np.linalg.norm(pos_err)
-            if err_norm > 0.02 and np.linalg.norm([dx, dy, dz]) > 1e-5:
-                self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + (pos_err / err_norm) * 0.02
+            if err_norm > 0.10 and np.linalg.norm([dx, dy, dz]) > 1e-5:
+                self._T_world_v_tcp[:3, 3] = p_v_tcp_actual + (pos_err / err_norm) * 0.10
 
             # 2. Update rotation (open-loop to ensure smooth rotation about V-TCP without sensor noise feedback)
             rot = R.from_euler("xyz", np.array([drx, dry, drz]) * dt).as_matrix()
@@ -405,14 +405,14 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[PolicyMode.RELATIVE] * 6,
-                    controller_overrides={"kp": [300, 300, 300, 150, 150, 150]},
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[None] * 6,
-                    controller_overrides={"kp": [300, 300, 300, 150, 150, 150]},
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
             },
             v_tcp_offset_in_midpoint=[0.0, 0.0, 0.0],
@@ -430,14 +430,14 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[PolicyMode.RELATIVE] * 6,
-                    controller_overrides={"kp": [300, 300, 300, 150, 150, 150]},
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
                 "right": TaskFrame(
                     target=[0.0] * 6,
                     space=ControlSpace.TASK,
                     control_mode=[ControlMode.POS] * 6,
                     policy_mode=[None] * 6,
-                    controller_overrides={"kp": [300, 300, 300, 150, 150, 150]},
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
                 ),
             },
             v_tcp_offset_in_midpoint=[0.0, 0.0, 0.0],
