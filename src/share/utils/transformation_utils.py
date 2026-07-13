@@ -292,27 +292,20 @@ def compose_delta_pose(
         start_pose_world: Absolute 6D world pose used as the delta reference.
         delta: 6D Cartesian delta to apply.
         frame_name: Delta frame selector. ``"world"`` applies the delta
-            directly; ``"ee"`` rotates the translational component by
-            the current EE orientation before composing it.
+            directly; ``"ee"`` (or ``"ee_current"``) rotates the translational
+            component by the current EE orientation before composing it.
 
     Returns:
         The resolved target pose in world coordinates.
     """
-    start_rot = rotation_from_extrinsic_xyz(*start_pose_world[3:6])
-    delta_rot = rotation_from_extrinsic_xyz(*delta[3:6])
-
     if frame_name == "world":
-        target_rot = delta_rot * start_rot
-        return [
-            float(start_pose_world[0] + delta[0]),
-            float(start_pose_world[1] + delta[1]),
-            float(start_pose_world[2] + delta[2]),
-            *[float(v) for v in euler_xyz_from_rotation(target_rot)],
-        ]
+        return [float(start_pose_world[i] + delta[i]) for i in range(6)]
 
-    if frame_name != "ee":
+    if frame_name not in ("ee", "ee_current"):
         raise ValueError(f"Unsupported delta frame '{frame_name}'.")
 
+    start_rot = rotation_from_extrinsic_xyz(*start_pose_world[3:6])
+    delta_rot = rotation_from_extrinsic_xyz(*delta[3:6])
     translated = start_rot.apply(delta[:3]).tolist()
     target_rot = start_rot * delta_rot
     return [

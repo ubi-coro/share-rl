@@ -254,6 +254,8 @@ class ManipulationPrimitiveNet(gym.Env):
     @staticmethod
     def _default_target_pose_axes(primitive: Any) -> dict[str, list[int]]:
         default_axes: dict[str, list[int]] = {}
+        if not hasattr(primitive, "task_frame") or primitive.task_frame is None:
+            return default_axes
         for name, frame in primitive.task_frame.items():
             axes = [
                 axis

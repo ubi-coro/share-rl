@@ -213,16 +213,7 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                     ...
 
         def on_release(key):
-            for event, mapping_key in self.mapping.items():
-                try:
-                    if self._is_string_key[event]:
-                        if key.char == mapping_key:
-                            self._events[event] = False
-                    else:
-                        if key == mapping_key:
-                            self._events[event] = False
-                except Exception:
-                    ...
+            pass
 
         self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         try:
@@ -284,8 +275,11 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                 new_info[event_name.value] = new_info.get(event_name.value, False) | event_value
             new_info[str(event_name)] = new_info.get(str(event_name), False) | event_value
 
+        # Clear events that were triggered (latch-and-clear consumption pattern)
+        for event_name in self._events:
+            self._events[event_name] = False
+
         if self._stdin_triggered:
-            self._events[TeleopEvents.SUCCESS] = False
             self._stdin_triggered = False
         return new_info
 

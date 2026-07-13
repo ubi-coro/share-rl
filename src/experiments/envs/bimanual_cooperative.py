@@ -53,7 +53,7 @@ def _shared_processor() -> ManipulationPrimitiveProcessorConfig:
         gripper=GripperConfig(enable=True, discretize=True),
         events=EventConfig(
             key_mapping={
-                TeleopEvents.SUCCESS: "s",
+                TeleopEvents.SUCCESS: keyboard.Key.space,
             },
         ),
     )
@@ -84,6 +84,8 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         right_arm_base_pose_in_left_base: list[float] | None = None,
         v_tcp_offset_in_midpoint: list[float] | None = None,
         fps: float = 30.0,
+        enable_translation: bool = True,
+        enable_rotation: bool = True,
     ):
         import copy
         task_frame_copy = copy.deepcopy(task_frame)
@@ -103,6 +105,8 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         self.T_leftbase_rightbase = sixvec_to_homogeneous(right_arm_base_pose_in_left_base)
         self.v_tcp_offset_in_midpoint = v_tcp_offset_in_midpoint
         self.fps = fps
+        self.enable_translation = enable_translation
+        self.enable_rotation = enable_rotation
         self.reset_runtime_state()
 
     def reset_runtime_state(self) -> None:
@@ -153,6 +157,12 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         dry = float(left_cmd.get("ry.ee_pos", 0.0))
         drz = float(left_cmd.get("rz.ee_pos", 0.0))
 
+        # Filter out disabled axes
+        if not self.enable_translation:
+            dx = dy = dz = 0.0
+        if not self.enable_rotation:
+            drx = dry = drz = 0.0
+
         # Apply deadband to prevent joystick center drift
         dx = 0.0 if abs(dx) < 0.005 else dx
         dy = 0.0 if abs(dy) < 0.005 else dy
@@ -163,10 +173,17 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
 
         print(f"\r[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", end="", flush=True)
 
-        # Calculate actual V-TCP position for reference clamping (prevents target runaway/wind-up)
-        p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
-        if self.v_tcp_offset_in_midpoint is not None:
-            p_v_tcp_actual += np.array(self.v_tcp_offset_in_midpoint)
+        # Estimate actual V-TCP position from physical robot positions and V-TCP target orientation
+        # This properly rotates the offset vector so the clamping error is calculated correctly when rotated.
+        if self._T_world_v_tcp is not None:
+            R_v_tcp = self._T_world_v_tcp[:3, :3]
+            p_v_tcp_actual_left = T_world_left[:3, 3] - R_v_tcp @ self._T_v_tcp_left[:3, 3]
+            p_v_tcp_actual_right = T_world_right[:3, 3] - R_v_tcp @ self._T_v_tcp_right[:3, 3]
+            p_v_tcp_actual = 0.5 * (p_v_tcp_actual_left + p_v_tcp_actual_right)
+        else:
+            p_v_tcp_actual = 0.5 * (T_world_left[:3, 3] + T_world_right[:3, 3])
+            if self.v_tcp_offset_in_midpoint is not None:
+                p_v_tcp_actual += np.array(self.v_tcp_offset_in_midpoint)
 
         # Update V-TCP position and orientation (scaled by dt to convert velocities to step displacements)
         dt = 1.0 / self.fps
@@ -175,7 +192,6 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             self._T_world_v_tcp[:3, 3] += np.array([dx, dy, dz]) * dt
             
             # Clamp target position to prevent wind-up ONLY if tracking error exceeds 2cm threshold.
-            # This threshold gate prevents closing a continuous feedback loop and eliminates sensor-induced drift.
             pos_err = self._T_world_v_tcp[:3, 3] - p_v_tcp_actual
             err_norm = np.linalg.norm(pos_err)
             if err_norm > 0.02 and np.linalg.norm([dx, dy, dz]) > 1e-5:
@@ -264,6 +280,8 @@ class SynchronousArmPrimitiveConfig(ManipulationPrimitiveConfig):
     v_tcp_offset_in_midpoint: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
+    enable_translation: bool = True
+    enable_rotation: bool = True
 
     def make(
         self,
@@ -288,6 +306,8 @@ class SynchronousArmPrimitiveConfig(ManipulationPrimitiveConfig):
             right_arm_base_pose_in_left_base=self.right_arm_base_pose_in_left_base,
             v_tcp_offset_in_midpoint=self.v_tcp_offset_in_midpoint,
             fps=self.processor.fps,
+            enable_translation=self.enable_translation,
+            enable_rotation=self.enable_rotation,
         )
 
         env_processor = self.make_env_processor(device)
@@ -375,8 +395,8 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
             notes="Move the right arm independently using the SpaceMouse.",
         )
 
-        # Cooperative controls
-        cooperative_primitive = SynchronousArmPrimitiveConfig(
+        # Cooperative controls - Translation Only
+        cooperative_translation_primitive = SynchronousArmPrimitiveConfig(
             task_frame={
                 "left": TaskFrame(
                     target=[0.0] * 6,
@@ -395,20 +415,49 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
             },
             v_tcp_offset_in_midpoint=[0.0, 0.0, -0.5],
             processor=processor,
-            notes="Move both arms in unison relative to the Virtual TCP.",
+            enable_translation=True,
+            enable_rotation=False,
+            notes="Move both arms in translation relative to the Virtual TCP.",
+        )
+
+        # Cooperative controls - Rotation Only
+        cooperative_rotation_primitive = SynchronousArmPrimitiveConfig(
+            task_frame={
+                "left": TaskFrame(
+                    target=[0.0] * 6,
+                    space=ControlSpace.TASK,
+                    control_mode=[ControlMode.POS] * 6,
+                    policy_mode=[PolicyMode.RELATIVE] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
+                ),
+                "right": TaskFrame(
+                    target=[0.0] * 6,
+                    space=ControlSpace.TASK,
+                    control_mode=[ControlMode.POS] * 6,
+                    policy_mode=[None] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
+                ),
+            },
+            v_tcp_offset_in_midpoint=[0.0, 0.0, -0.5],
+            processor=processor,
+            enable_translation=False,
+            enable_rotation=True,
+            notes="Move both arms in rotation relative to the Virtual TCP.",
         )
 
         self.primitives = {
             "left_arm": left_arm_primitive,
             "right_arm": right_arm_primitive,
-            "cooperative": cooperative_primitive,
+            "cooperative_translation": cooperative_translation_primitive,
+            "cooperative_rotation": cooperative_rotation_primitive,
         }
 
-        # 4. Transitions cycling in a continuous loop: left -> right -> cooperative -> left
+        # 4. Transitions cycling in a continuous loop: left -> right -> cooperative_translation -> cooperative_rotation -> left
         self.transitions = [
             OnSuccess(source="left_arm", target="right_arm"),
-            OnSuccess(source="right_arm", target="cooperative"),
-            OnSuccess(source="cooperative", target="left_arm"),
+            OnSuccess(source="right_arm", target="cooperative_translation"),
+            OnSuccess(source="cooperative_translation", target="cooperative_rotation"),
+            OnSuccess(source="cooperative_rotation", target="left_arm"),
         ]
 
         super().__post_init__()

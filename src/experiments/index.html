@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bimanual V-TCP 3D Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0d0e12;
+            color: #e2e8f0;
+        }
+
+        #container {
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #sidebar {
+            width: 320px;
+            background-color: rgba(18, 20, 28, 0.95);
+            border-right: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 5px 0 25px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            z-index: 10;
+            overflow-y: auto;
+            backdrop-filter: blur(10px);
+        }
+
+        #canvas-container {
+            flex-grow: 1;
+            position: relative;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            margin: 0 0 15px 0;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .section {
+            margin-bottom: 20px;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .section-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #94a3b8;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 4px;
+        }
+
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            margin: 4px 0;
+            font-family: monospace;
+        }
+
+        .data-label {
+            color: #64748b;
+        }
+
+        .data-value {
+            color: #f1f5f9;
+        }
+
+        .left-color { color: #38bdf8; }
+        .right-color { color: #f87171; }
+        .vtcp-color { color: #fbbf24; }
+
+        .controls-list {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            padding-left: 15px;
+            margin: 5px 0;
+            line-height: 1.4;
+        }
+
+        kbd {
+            background-color: #334155;
+            color: #f8fafc;
+            border-radius: 3px;
+            border: 1px solid #475569;
+            padding: 1px 4px;
+            font-size: 0.7rem;
+            font-family: sans-serif;
+            box-shadow: 0 1px 0 rgba(0,0,0,0.2);
+        }
+
+        #status {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            padding: 10px 15px;
+            border-radius: 30px;
+            font-size: 0.8rem;
+            display: flex;
+            align-items: center;
+            backdrop-filter: blur(10px);
+            pointer-events: none;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #10b981;
+            margin-right: 8px;
+            box-shadow: 0 0 8px #10b981;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.6; }
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="sidebar">
+            <h1>Bimanual V-TCP Sim</h1>
+            
+            <div class="section">
+                <div class="section-title" style="color: #a78bfa;">Active Control Mode</div>
+                <div class="data-row" style="font-weight: bold; font-size: 0.95rem; color: #a78bfa; margin-top: 6px;" id="active-mode-display">Left Arm Control</div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Keyboard Teleop Controls</div>
+                <p style="font-size: 0.75rem; margin: 0 0 5px 0; color: #94a3b8;">Click on the 3D view to focus keyboard input.</p>
+                <ul class="controls-list">
+                    <li><strong>Translate X/Y:</strong> <kbd>W</kbd>/<kbd>S</kbd>/<kbd>A</kbd>/<kbd>D</kbd></li>
+                    <li><strong>Translate Z:</strong> <kbd>R</kbd> (Up) / <kbd>F</kbd> (Down)</li>
+                    <li><strong>Pitch (Ry):</strong> <kbd>▲</kbd> / <kbd>▼</kbd> (Arrow keys)</li>
+                    <li><strong>Yaw (Rz):</strong> <kbd>◀</kbd> / <kbd>▶</kbd> (Arrow keys)</li>
+                    <li><strong>Roll (Rx):</strong> <kbd>Q</kbd> / <kbd>E</kbd></li>
+                    <li><strong>Cycle Mode:</strong> <kbd>Spacebar</kbd></li>
+                </ul>
+            </div>
+
+            <div class="section">
+                <div class="section-title vtcp-color">Virtual TCP Target</div>
+                <div class="data-row"><span class="data-label">Pos X:</span><span class="data-value" id="v-x">0.5000</span></div>
+                <div class="data-row"><span class="data-label">Pos Y:</span><span class="data-value" id="v-y">0.0000</span></div>
+                <div class="data-row"><span class="data-label">Pos Z:</span><span class="data-value" id="v-z">0.5000</span></div>
+                <div class="data-row"><span class="data-label">Roll Rx:</span><span class="data-value" id="v-rx">0.0°</span></div>
+                <div class="data-row"><span class="data-label">Pitch Ry:</span><span class="data-value" id="v-ry">0.0°</span></div>
+                <div class="data-row"><span class="data-label">Yaw Rz:</span><span class="data-value" id="v-rz">0.0°</span></div>
+            </div>
+
+            <div class="section">
+                <div class="section-title left-color">Left Arm Target</div>
+                <div class="data-row"><span class="data-label">Pos X:</span><span class="data-value" id="l-x">0.0000</span></div>
+                <div class="data-row"><span class="data-label">Pos Y:</span><span class="data-value" id="l-y">0.0000</span></div>
+                <div class="data-row"><span class="data-label">Pos Z:</span><span class="data-value" id="l-z">1.0000</span></div>
+                <div class="data-row"><span class="data-label">Euler Ry:</span><span class="data-value" id="l-ry">0.0°</span></div>
+            </div>
+
+            <div class="section">
+                <div class="section-title right-color">Right Arm Target</div>
+                <div class="data-row"><span class="data-label">Pos X:</span><span class="data-value" id="r-x">1.0000</span></div>
+                <div class="data-row"><span class="data-label">Pos Y:</span><span class="data-value" id="r-y">0.0000</span></div>
+                <div class="data-row"><span class="data-label">Pos Z:</span><span class="data-value" id="r-z">1.0000</span></div>
+                <div class="data-row"><span class="data-label">Euler Ry:</span><span class="data-value" id="r-ry">0.0°</span></div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Telemetry Info</div>
+                <div class="data-row"><span class="data-label">Bimanual Span:</span><span class="data-value" id="span-dist">1.0000 m</span></div>
+                <div class="data-row"><span class="data-label">V-TCP Offset Z:</span><span class="data-value">-0.50 m</span></div>
+            </div>
+        </div>
+        
+        <div id="canvas-container">
+            <div id="status">
+                <div class="dot"></div>
+                <span>Streaming live coordinates (30 FPS)</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Include Three.js and OrbitControls -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script>
+        // Setup Three.js scene
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0e1017);
+
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+        camera.up.set(0, 0, 1); // Set Z-axis as the UP vector matching robot coordinates
+        camera.position.set(1.8, -1.8, 1.5); // Natural isometric front-right-above view
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0.5, 0.0, 0.7);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight1.position.set(5, 10, 7);
+        scene.add(dirLight1);
+
+        // Grid and Ground
+        const gridHelper = new THREE.GridHelper(10, 20, 0x475569, 0x1e293b);
+        gridHelper.rotation.x = Math.PI / 2; // Orient grid along XY plane (robots base height)
+        gridHelper.position.set(0.5, 0, 0.0);
+        scene.add(gridHelper);
+
+        // Helper function to build coordinate frames
+        function buildAxes(scale) {
+            const group = new THREE.Group();
+            const axes = [
+                { dir: new THREE.Vector3(1,0,0), color: 0xef4444 }, // X (Red)
+                { dir: new THREE.Vector3(0,1,0), color: 0x22c55e }, // Y (Green)
+                { dir: new THREE.Vector3(0,0,1), color: 0x3b82f6 }  // Z (Blue)
+            ];
+            axes.forEach(axis => {
+                const arrow = new THREE.ArrowHelper(axis.dir, new THREE.Vector3(0,0,0), scale, axis.color, scale*0.2, scale*0.1);
+                group.add(arrow);
+            });
+            return group;
+        }
+
+        // 1. Robot Base pedestals (Grey Cylinders)
+        const baseGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.15, 32);
+        const baseMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.5 });
+
+        const leftBase = new THREE.Mesh(baseGeo, baseMat);
+        leftBase.rotation.x = Math.PI / 2;
+        leftBase.position.set(0, 0, 0.075);
+        scene.add(leftBase);
+        scene.add(buildAxes(0.25).position.copy(leftBase.position));
+
+        const rightBase = new THREE.Mesh(baseGeo, baseMat);
+        rightBase.rotation.x = Math.PI / 2;
+        rightBase.position.set(1.0, 0, 0.075);
+        scene.add(rightBase);
+        const rBaseAxes = buildAxes(0.25);
+        rBaseAxes.position.copy(rightBase.position);
+        scene.add(rBaseAxes);
+
+        // 2. End-Effectors (Spheres)
+        const eeGeo = new THREE.SphereGeometry(0.04, 32, 32);
+        const leftEEMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, metalness: 0.1, roughness: 0.2 });
+        const rightEEMat = new THREE.MeshStandardMaterial({ color: 0xf87171, metalness: 0.1, roughness: 0.2 });
+
+        const leftEE = new THREE.Mesh(eeGeo, leftEEMat);
+        const leftEEAxes = buildAxes(0.18);
+        leftEE.add(leftEEAxes);
+        scene.add(leftEE);
+
+        const rightEE = new THREE.Mesh(eeGeo, rightEEMat);
+        const rightEEAxes = buildAxes(0.18);
+        rightEE.add(rightEEAxes);
+        scene.add(rightEE);
+
+        // 3. Virtual TCP (Glow Yellow Sphere)
+        const vtcpGeo = new THREE.SphereGeometry(0.03, 32, 32);
+        const vtcpMat = new THREE.MeshBasicMaterial({ color: 0xfbbf24 });
+        const vtcp = new THREE.Mesh(vtcpGeo, vtcpMat);
+        const vtcpAxes = buildAxes(0.25);
+        vtcp.add(vtcpAxes);
+        scene.add(vtcp);
+
+        // 4. Rigid Rod (Cylinder spanning between EEs)
+        const rodGeo = new THREE.CylinderGeometry(0.015, 0.015, 1.0, 16);
+        const rodMat = new THREE.MeshStandardMaterial({ color: 0x64748b, metalness: 0.8, roughness: 0.3 });
+        const rod = new THREE.Mesh(rodGeo, rodMat);
+        scene.add(rod);
+
+        // Keyboard commands tracking state
+        const keys = {
+            w: false, s: false, a: false, d: false,
+            r: false, f: false, q: false, e: false,
+            shift: false,
+            ArrowUp: false, ArrowDown: false,
+            ArrowLeft: false, ArrowRight: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === ' ') {
+                e.preventDefault();
+                fetch('/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ success: true })
+                }).catch(() => {});
+                return;
+            }
+            let key = e.key.toLowerCase();
+            if (e.key === 'Shift') key = 'shift';
+            if (e.key in keys) {
+                keys[e.key] = true;
+            } else if (key in keys) {
+                keys[key] = true;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === ' ') {
+                e.preventDefault();
+                return;
+            }
+            let key = e.key.toLowerCase();
+            if (e.key === 'Shift') key = 'shift';
+            if (e.key in keys) {
+                keys[e.key] = false;
+            } else if (key in keys) {
+                keys[key] = false;
+            }
+        });
+
+        // Send keyboard commands to Server
+        setInterval(() => {
+            let dx = 0.0;
+            let dy = 0.0;
+            let dz = 0.0;
+            let drx = 0.0;
+            let dry = 0.0;
+            let drz = 0.0;
+
+            // X/Y Translation (relative to world/joystick axes)
+            if (keys.a) dx = 1.0;
+            if (keys.d) dx = -1.0;
+            if (keys.w) dy = 1.0;
+            if (keys.s) dy = -1.0;
+            
+            // Z Translation
+            if (keys.r) dz = 1.0;
+            if (keys.f) dz = -1.0;
+
+            // Roll (Rx)
+            if (keys.q) drx = 1.0;
+            if (keys.e) drx = -1.0;
+
+            // Pitch (Ry)
+            if (keys.ArrowUp) dry = 1.0;
+            if (keys.ArrowDown) dry = -1.0;
+
+            // Yaw (Rz)
+            if (keys.ArrowLeft) drz = 1.0;
+            if (keys.ArrowRight) drz = -1.0;
+
+            // Send command via POST
+            fetch('/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dx, dy, dz, drx, dry, drz })
+            }).catch(() => {});
+        }, 50);
+
+        // Receive telemetry stream via Server-Sent Events (SSE)
+        const eventSource = new EventSource('/stream');
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            // 1. Update Left EE Position and Orientation
+            leftEE.position.set(data.left_pos[0], data.left_pos[1], data.left_pos[2]);
+            
+            // 2. Update Right EE Position and Orientation
+            rightEE.position.set(data.right_pos[0], data.right_pos[1], data.right_pos[2]);
+
+            // 3. Update V-TCP Position and Orientation
+            vtcp.position.set(data.v_tcp_pos[0], data.v_tcp_pos[1], data.v_tcp_pos[2]);
+            const vRot = data.v_tcp_rot;
+            vtcp.rotation.set(
+                vRot[0] * Math.PI / 180,
+                vRot[1] * Math.PI / 180,
+                vRot[2] * Math.PI / 180
+            );
+
+            // 4. Update cylinder (rigid rod) connection span
+            const p1 = leftEE.position;
+            const p2 = rightEE.position;
+            
+            const direction = new THREE.Vector3().subVectors(p2, p1);
+            const distance = direction.length();
+            
+            // default cylinder geometry stands along Y, so align vector is [0, 1, 0]
+            const alignVector = new THREE.Vector3(0, 1, 0);
+            const quaternion = new THREE.Quaternion().setFromUnitVectors(alignVector, direction.clone().normalize());
+            
+            rod.position.copy(p1).add(p2).multiplyScalar(0.5);
+            rod.scale.set(1.0, distance, 1.0);
+            rod.quaternion.copy(quaternion);
+
+            // 5. Update sidebar HTML telemetry text values
+            document.getElementById('v-x').innerText = data.v_tcp_pos[0].toFixed(4);
+            document.getElementById('v-y').innerText = data.v_tcp_pos[1].toFixed(4);
+            document.getElementById('v-z').innerText = data.v_tcp_pos[2].toFixed(4);
+            document.getElementById('v-rx').innerText = data.v_tcp_rot[0].toFixed(1) + '°';
+            document.getElementById('v-ry').innerText = data.v_tcp_rot[1].toFixed(1) + '°';
+            document.getElementById('v-rz').innerText = data.v_tcp_rot[2].toFixed(1) + '°';
+
+            document.getElementById('l-x').innerText = data.left_pos[0].toFixed(4);
+            document.getElementById('l-y').innerText = data.left_pos[1].toFixed(4);
+            document.getElementById('l-z').innerText = data.left_pos[2].toFixed(4);
+            document.getElementById('l-ry').innerText = data.left_rot[1].toFixed(1) + '°';
+
+            document.getElementById('r-x').innerText = data.right_pos[0].toFixed(4);
+            document.getElementById('r-y').innerText = data.right_pos[1].toFixed(4);
+            document.getElementById('r-z').innerText = data.right_pos[2].toFixed(4);
+            document.getElementById('r-ry').innerText = data.right_rot[1].toFixed(1) + '°';
+
+            document.getElementById('span-dist').innerText = distance.toFixed(4) + ' m';
+
+            // Update active primitive mode text
+            const modeTextMap = {
+                "left_arm": "Left Arm Control",
+                "right_arm": "Right Arm Control",
+                "cooperative_translation": "Coop Translation (Rotation Locked)",
+                "cooperative_rotation": "Coop Rotation (Translation Locked)"
+            };
+            document.getElementById('active-mode-display').innerText = modeTextMap[data.active_primitive] || data.active_primitive;
+        };
+
+        // Window resize handler
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        });
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
