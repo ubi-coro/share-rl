@@ -433,18 +433,11 @@ class ManipulationPrimitiveNet(gym.Env):
                             if t_name == name:
                                 target_robot = r_name
                                 break
-                    obs_key = f"{target_robot}.gripper.pos"
-                    if obs_key in raw_obs:
-                        val = raw_obs[obs_key]
-                        if hasattr(val, "item"):
-                            obs_pos = float(val.item())
-                        elif hasattr(val, "reshape"):
-                            obs_pos = float(val.reshape(-1)[0])
-                        else:
-                            obs_pos = float(val)
-                        # Both observation space and action space use 0.0 for open and 1.0 for closed.
-                        sync_pos = obs_pos
-                        teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
+                    
+                    # Read from our persistent state dict instead of raw physical observations
+                    # to avoid issues when the gripper is holding an object (which limits physical travel).
+                    sync_pos = self._gripper_states.get(target_robot, 0.0)
+                    teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
 
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
