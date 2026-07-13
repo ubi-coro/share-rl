@@ -260,10 +260,11 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             "right": right_act_dict,
         }
 
-        # Command both grippers in sync using the left arm's teleoperated gripper action
+        # Command both grippers independently using their respective actions
         if "gripper.pos" in action.get("left", {}):
             cooperative_action["left"]["gripper.pos"] = action["left"]["gripper.pos"]
-            cooperative_action["right"]["gripper.pos"] = action["left"]["gripper.pos"]
+        if "gripper.pos" in action.get("right", {}):
+            cooperative_action["right"]["gripper.pos"] = action["right"]["gripper.pos"]
 
         obs, reward, terminated, truncated, info = super().step(cooperative_action)
         # Inject custom telemetry into info dict for clean record.py printing

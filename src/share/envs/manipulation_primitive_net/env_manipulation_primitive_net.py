@@ -28,6 +28,7 @@ class ManipulationPrimitiveNet(gym.Env):
     def __init__(self, config: ManipulationPrimitiveNetConfig):
 
         self.config = config
+        self._gripper_states = {"left": 0.0, "right": 0.0}
 
         # initialize hardware environments
         self.robot_dict, self.teleop_dict, self.cameras = self.connect()
@@ -90,12 +91,20 @@ class ManipulationPrimitiveNet(gym.Env):
         for name in self.config.robot:
             robot_dict[name] = make_robot_from_config(self.config.robot[name])
             robot_dict[name].connect()
+            if hasattr(robot_dict[name], "send_gripper_action"):
+                try:
+                    # In action space, 0.0 is open, 1.0 is closed.
+                    robot_dict[name].send_gripper_action(0.0)
+                except Exception:
+                    pass
 
         # Handle multi teleop configuration
         teleop_dict = {}
         for name in self.config.teleop:
             teleop_dict[name] = make_teleoperator_from_config(self.config.teleop[name])
             teleop_dict[name].connect()
+            if hasattr(teleop_dict[name], "_gripper_state"):
+                teleop_dict[name]._gripper_state = 1
 
         # Handle cameras
         cameras = make_cameras_from_configs(self.config.cameras)
@@ -186,6 +195,45 @@ class ManipulationPrimitiveNet(gym.Env):
 
         if processed_action_transition[TransitionKey.INFO].get(TeleopEvents.INTERVENTION_COMPLETED, False):
             return processed_action_transition
+
+        # Gripper state persistence tracking
+        action_dict = processed_action_transition[TransitionKey.ACTION]
+        if isinstance(action_dict, dict):
+            # In coop modes, "active" starts with "cooperative_".
+            is_cooperative = active.startswith("cooperative")
+            
+            # Retrieve teleoperated SpaceMouse gripper command if available
+            teleop_gripper_val = None
+            if is_cooperative:
+                # Cooperative modes use "left" arm as the primary teleoperated arm
+                if "left" in action_dict and "gripper.pos" in action_dict["left"]:
+                    teleop_gripper_val = action_dict["left"]["gripper.pos"]
+            else:
+                # Independent modes: check the active arm's gripper command
+                arm = "left" if active == "left_arm" else "right"
+                if arm in action_dict and "gripper.pos" in action_dict[arm]:
+                    teleop_gripper_val = action_dict[arm]["gripper.pos"]
+
+            if teleop_gripper_val is not None:
+                # We have a valid teleoperated command from the SpaceMouse.
+                # Update persistent gripper states.
+                if is_cooperative:
+                    # In cooperative mode: if SpaceMouse output has CHANGED compared to the
+                    # current persistent state of the "left" gripper, propagate it to BOTH grippers.
+                    # Otherwise, keep both grippers at their independent persistent states.
+                    prev_left = self._gripper_states.get("left", 0.0)
+                    if abs(teleop_gripper_val - prev_left) > 0.5:
+                        self._gripper_states["left"] = teleop_gripper_val
+                        self._gripper_states["right"] = teleop_gripper_val
+                else:
+                    # Independent modes: update only the active arm's persistent state
+                    arm = "left" if active == "left_arm" else "right"
+                    self._gripper_states[arm] = teleop_gripper_val
+
+            # Apply the persistent gripper states to the commanded action dict
+            for arm in ["left", "right"]:
+                if arm in action_dict and "gripper.pos" in action_dict[arm]:
+                    action_dict[arm]["gripper.pos"] = self._gripper_states.get(arm, 0.0)
 
         # 2) Step environment
         raw_obs, reward, terminated, truncated, info = self._envs[active].step(processed_action_transition[TransitionKey.ACTION])
@@ -313,6 +361,7 @@ class ManipulationPrimitiveNet(gym.Env):
             active when user-facing stepping resumes.
         """
         self._pending_entry_context = None
+        self._gripper_states = {"left": 0.0, "right": 0.0}
         self._active = self.config.reset_primitive
         for name, primitive in self.config.primitives.items():
             if name == self._active:
@@ -364,27 +413,30 @@ class ManipulationPrimitiveNet(gym.Env):
         )
         self._latest_raw_obs = raw_obs
 
-        # Determine if any physical gripper is closed (obs value < 0.5 where 0.0 is closed and 1.0 is open)
-        any_closed = False
-        for k, val in raw_obs.items():
-            if k.endswith(".gripper.pos"):
-                if hasattr(val, "item"):
-                    pos = float(val.item())
-                elif hasattr(val, "reshape"):
-                    pos = float(val.reshape(-1)[0])
-                else:
-                    pos = float(val)
-                if pos < 0.5:
-                    any_closed = True
-                    break
-
-        # Synchronize all teleoperators to the closed state if any gripper is closed,
-        # otherwise to the open state.
-        sync_pos = 1.0 if any_closed else 0.0
+        # Synchronize teleoperator gripper states to the physical state of the actively controlled robot
+        # at the transition boundary to ensure the state is persisted when taking control.
         teleop_dict = getattr(self, "teleop_dict", None) or {}
-        for teleop in teleop_dict.values():
+        for name, teleop in teleop_dict.items():
             if hasattr(teleop, "send_feedback"):
-                teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
+                # Determine target robot for this teleoperator
+                target_robot = name
+                if hasattr(primitive, "teleop_mapping"):
+                    for r_name, t_name in primitive.teleop_mapping.items():
+                        if t_name == name:
+                            target_robot = r_name
+                            break
+                obs_key = f"{target_robot}.gripper.pos"
+                if obs_key in raw_obs:
+                    val = raw_obs[obs_key]
+                    if hasattr(val, "item"):
+                        obs_pos = float(val.item())
+                    elif hasattr(val, "reshape"):
+                        obs_pos = float(val.reshape(-1)[0])
+                    else:
+                        obs_pos = float(val)
+                    # Convert observation space (0.0=closed, 1.0=open) to action space (1.0=closed, 0.0=open)
+                    sync_pos = 1.0 - obs_pos
+                    teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
 
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
