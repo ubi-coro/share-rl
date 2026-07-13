@@ -363,6 +363,29 @@ class ManipulationPrimitiveNet(gym.Env):
             options={} if options is None else dict(options),
         )
         self._latest_raw_obs = raw_obs
+
+        # Synchronize teleoperator gripper states to physical gripper observations
+        # to ensure that mode switches don't start with mismatched/competing actions.
+        teleop_dict = getattr(self, "teleop_dict", None) or {}
+        for name, teleop in teleop_dict.items():
+            if hasattr(teleop, "send_feedback"):
+                target_robot = name
+                if hasattr(primitive, "teleop_mapping"):
+                    for r_name, t_name in primitive.teleop_mapping.items():
+                        if t_name == name:
+                            target_robot = r_name
+                            break
+                obs_key = f"{target_robot}.gripper.pos"
+                if obs_key in raw_obs:
+                    val = raw_obs[obs_key]
+                    if hasattr(val, "item"):
+                        pos = float(val.item())
+                    elif hasattr(val, "reshape"):
+                        pos = float(val.reshape(-1)[0])
+                    else:
+                        pos = float(val)
+                    teleop.send_feedback({"gripper.pos": pos, "gripper": pos})
+
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
         processed_obs = processed_transition[TransitionKey.OBSERVATION]

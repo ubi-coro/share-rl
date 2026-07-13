@@ -427,6 +427,12 @@ class InterventionActionProcessorStep(ProcessorStep):
             key = aliases.get(feature_name, feature_name)
             if key in robot_action:
                 teleop_action[feature_name] = robot_action[key]
+
+        # Also map gripper position if it exists in robot_action and is supported by teleoperator feedback
+        feedback_features = getattr(self.teleoperators[name], "feedback_features", {})
+        if "gripper.pos" in feedback_features and f"{GRIPPER_KEY}.pos" in robot_action:
+            teleop_action["gripper.pos"] = robot_action[f"{GRIPPER_KEY}.pos"]
+
         return teleop_action
 
     def _decode_absolute_rotation(self, absolute_rot_axes: list[int], raw: list[float]) -> tuple[list[float], int]:

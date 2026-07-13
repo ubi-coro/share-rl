@@ -239,8 +239,9 @@ class SpaceMouse(Teleoperator, HasTeleopEvents):
             time.sleep(0.002)
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        if "gripper.pos" in feedback:
-            self._gripper_state = 1 - round(feedback["gripper.pos"])
+        gripper_val = feedback.get("gripper.pos", feedback.get("gripper"))
+        if gripper_val is not None:
+            self._gripper_state = 1 - round(float(gripper_val))
 
     def disconnect(self) -> None:
         if not self.is_connected:
