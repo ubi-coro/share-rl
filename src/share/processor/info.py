@@ -191,110 +191,129 @@ class AddFootswitchEventsAsInfoStep(InfoProcessorStep):
 class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
     mapping: dict[TeleopEvents, Any] = field(default_factory=dict)
 
+    # Class-level shared states to prevent thread competition
+    _shared_events_dict: dict[TeleopEvents, bool] = field(default_factory=dict, init=False)
+    _mappings_registry_list: list["AddKeyboardEventsAsInfoStep"] = field(default_factory=list, init=False)
+    _shared_listener: Any = None
+    _shared_stdin_thread: Any = None
+
     def __post_init__(self):
-        self._events = {event: False for event in self.mapping}
-        self._is_string_key = {event: isinstance(mapping_key, str) for event, mapping_key in self.mapping.items()}
-        self._stdin_triggered = False
+        # Register this instance's mapping
+        if not hasattr(AddKeyboardEventsAsInfoStep, "_shared_events_dict_init"):
+            AddKeyboardEventsAsInfoStep._shared_events_dict_init = True
+            AddKeyboardEventsAsInfoStep._shared_events_dict = {}
+            AddKeyboardEventsAsInfoStep._mappings_registry_list = []
+            
+        AddKeyboardEventsAsInfoStep._mappings_registry_list.append(self)
+        for event in self.mapping:
+            if event not in AddKeyboardEventsAsInfoStep._shared_events_dict:
+                AddKeyboardEventsAsInfoStep._shared_events_dict[event] = False
 
         from pynput import keyboard
         import sys
         import threading
 
-        def on_press(key):
-            for event, mapping_key in self.mapping.items():
-                try:
-                    if self._is_string_key[event]:
-                        if key.char == mapping_key:
-                            self._events[event] = True
-                    else:
-                        if key == mapping_key:
-                            self._events[event] = True
-                except Exception:
-                    ...
+        # Start pynput listener ONLY ONCE globally
+        if AddKeyboardEventsAsInfoStep._shared_listener is None:
+            def on_press(key):
+                for step_instance in AddKeyboardEventsAsInfoStep._mappings_registry_list:
+                    for event, mapping_key in step_instance.mapping.items():
+                        try:
+                            if isinstance(mapping_key, str):
+                                if key.char == mapping_key:
+                                    AddKeyboardEventsAsInfoStep._shared_events_dict[event] = True
+                            else:
+                                if key == mapping_key:
+                                    AddKeyboardEventsAsInfoStep._shared_events_dict[event] = True
+                        except Exception:
+                            pass
 
-        def on_release(key):
-            pass
+            def on_release(key):
+                pass
 
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        try:
-            self._listener.start()
-        except Exception:
-            pass
-
-        # Determine the key character to listen to on stdin for TeleopEvents.SUCCESS
-        success_char = "s"  # default fallback
-        if TeleopEvents.SUCCESS in self.mapping:
-            mapping_key = self.mapping[TeleopEvents.SUCCESS]
-            if isinstance(mapping_key, str):
-                success_char = mapping_key
-            elif hasattr(mapping_key, "name") and mapping_key.name == "space":
-                success_char = " "
-
-        def listen_stdin():
-            import select
+            AddKeyboardEventsAsInfoStep._shared_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
             try:
-                import termios
-                import tty
-                fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
-                has_tty = True
-            except Exception:
-                has_tty = False
-
-            if not has_tty:
-                # Fallback for non-TTY environments (Jupyter, IDE run windows)
-                while True:
-                    try:
-                        line = sys.stdin.readline()
-                        if not line:
-                            break
-                        if success_char == " ":
-                            triggered = (" " in line) or (line.strip() == "")
-                        else:
-                            triggered = (success_char in line)
-                        
-                        if triggered:
-                            self._events[TeleopEvents.SUCCESS] = True
-                            self._stdin_triggered = True
-                    except Exception:
-                        break
-                return
-
-            # TTY raw keypress loop
-            try:
-                tty.setcbreak(fd)
-                while True:
-                    rlist, _, _ = select.select([fd], [], [], 0.1)
-                    if rlist:
-                        ch = sys.stdin.read(1)
-                        if ch == success_char or (success_char == " " and ch in (" ", "\r", "\n")):
-                            self._events[TeleopEvents.SUCCESS] = True
-                            self._stdin_triggered = True
+                AddKeyboardEventsAsInfoStep._shared_listener.start()
             except Exception:
                 pass
-            finally:
+
+        # Start stdin thread ONLY ONCE globally
+        if AddKeyboardEventsAsInfoStep._shared_stdin_thread is None:
+            def listen_stdin():
+                import select
                 try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    import termios
+                    import tty
+                    fd = sys.stdin.fileno()
+                    old_settings = termios.tcgetattr(fd)
+                    has_tty = True
+                except Exception:
+                    has_tty = False
+
+                if not has_tty:
+                    # Fallback for non-TTY environments (Jupyter, IDE run windows)
+                    while True:
+                        try:
+                            line = sys.stdin.readline()
+                            if not line:
+                                break
+                            # Check if success is triggered on any registered mapping
+                            triggered = False
+                            for step_instance in AddKeyboardEventsAsInfoStep._mappings_registry_list:
+                                if TeleopEvents.SUCCESS in step_instance.mapping:
+                                    mapping_key = step_instance.mapping[TeleopEvents.SUCCESS]
+                                    if isinstance(mapping_key, str) and (mapping_key in line):
+                                        triggered = True
+                                    elif hasattr(mapping_key, "name") and mapping_key.name == "space" and ((" " in line) or (line.strip() == "")):
+                                        triggered = True
+                            if triggered:
+                                AddKeyboardEventsAsInfoStep._shared_events_dict[TeleopEvents.SUCCESS] = True
+                        except Exception:
+                            break
+                    return
+
+                # TTY raw keypress loop
+                try:
+                    tty.setcbreak(fd)
+                    while True:
+                        rlist, _, _ = select.select([fd], [], [], 0.1)
+                        if rlist:
+                            ch = sys.stdin.read(1)
+                            # Check if success is triggered on any registered mapping
+                            triggered = False
+                            for step_instance in AddKeyboardEventsAsInfoStep._mappings_registry_list:
+                                if TeleopEvents.SUCCESS in step_instance.mapping:
+                                    mapping_key = step_instance.mapping[TeleopEvents.SUCCESS]
+                                    if isinstance(mapping_key, str) and ch == mapping_key:
+                                        triggered = True
+                                    elif hasattr(mapping_key, "name") and mapping_key.name == "space" and ch in (" ", "\r", "\n"):
+                                        triggered = True
+                            if triggered:
+                                AddKeyboardEventsAsInfoStep._shared_events_dict[TeleopEvents.SUCCESS] = True
                 except Exception:
                     pass
+                finally:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    except Exception:
+                        pass
 
-        self._stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
-        self._stdin_thread.start()
+            AddKeyboardEventsAsInfoStep._shared_stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
+            AddKeyboardEventsAsInfoStep._shared_stdin_thread.start()
 
     def info(self, info: dict) -> dict:
         new_info = dict(info)
-        for event_name, event_value in self._events.items():
+        shared_dict = getattr(AddKeyboardEventsAsInfoStep, "_shared_events_dict", {})
+        for event_name in self.mapping:
+            event_value = shared_dict.get(event_name, False)
             new_info[event_name] = new_info.get(event_name, False) | event_value
             if hasattr(event_name, "value"):
                 new_info[event_name.value] = new_info.get(event_name.value, False) | event_value
             new_info[str(event_name)] = new_info.get(str(event_name), False) | event_value
 
-        # Clear events that were triggered (latch-and-clear consumption pattern)
-        for event_name in self._events:
-            self._events[event_name] = False
+            # Clear events that were triggered (latch-and-clear consumption pattern)
+            shared_dict[event_name] = False
 
-        if self._stdin_triggered:
-            self._stdin_triggered = False
         return new_info
 
     def transform_features(
@@ -303,10 +322,9 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         return features
 
     def reset(self) -> None:
-        self._events = {event: False for event in self.mapping}
+        shared_dict = getattr(AddKeyboardEventsAsInfoStep, "_shared_events_dict", {})
+        for event in self.mapping:
+            shared_dict[event] = False
 
     def __del__(self):
-        try:
-            self._listener.stop()
-        except Exception:
-            pass
+        pass
