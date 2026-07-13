@@ -58,6 +58,7 @@ class ManipulationPrimitiveNet(gym.Env):
         self._episode_step_count = 0
         self._primitive_step_count = 0
         self._needs_full_reset = True
+        self._latest_raw_obs = None
 
     @property
     def active_primitive(self) -> str:
@@ -179,7 +180,8 @@ class ManipulationPrimitiveNet(gym.Env):
         if primitive.policy is None and not getattr(self._envs[active], "uses_autonomous_step", False):
             info[TeleopEvents.IS_INTERVENTION] = True
 
-        action_transition = create_transition(action=action, info=info)
+        latest_obs = getattr(self, "_latest_raw_obs", None)
+        action_transition = create_transition(action=action, observation=latest_obs, info=info)
         processed_action_transition = self._action_processors[active](action_transition)
 
         if processed_action_transition[TransitionKey.INFO].get(TeleopEvents.INTERVENTION_COMPLETED, False):
@@ -187,6 +189,7 @@ class ManipulationPrimitiveNet(gym.Env):
 
         # 2) Step environment
         raw_obs, reward, terminated, truncated, info = self._envs[active].step(processed_action_transition[TransitionKey.ACTION])
+        self._latest_raw_obs = raw_obs
 
         # 3) Read out info and possibly overwrite action
         complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
@@ -359,6 +362,7 @@ class ManipulationPrimitiveNet(gym.Env):
             seed=env_seed,
             options={} if options is None else dict(options),
         )
+        self._latest_raw_obs = raw_obs
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
         processed_obs = processed_transition[TransitionKey.OBSERVATION]
