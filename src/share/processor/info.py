@@ -262,8 +262,8 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
 
             # TTY raw keypress loop
             try:
+                tty.setcbreak(fd)
                 while True:
-                    tty.setcbreak(fd)
                     rlist, _, _ = select.select([fd], [], [], 0.1)
                     if rlist:
                         ch = sys.stdin.read(1)
