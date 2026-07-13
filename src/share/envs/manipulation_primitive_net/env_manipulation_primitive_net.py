@@ -364,27 +364,27 @@ class ManipulationPrimitiveNet(gym.Env):
         )
         self._latest_raw_obs = raw_obs
 
-        # Synchronize teleoperator gripper states to physical gripper observations
-        # to ensure that mode switches don't start with mismatched/competing actions.
+        # Determine if any physical gripper is closed (obs value < 0.5 where 0.0 is closed and 1.0 is open)
+        any_closed = False
+        for k, val in raw_obs.items():
+            if k.endswith(".gripper.pos"):
+                if hasattr(val, "item"):
+                    pos = float(val.item())
+                elif hasattr(val, "reshape"):
+                    pos = float(val.reshape(-1)[0])
+                else:
+                    pos = float(val)
+                if pos < 0.5:
+                    any_closed = True
+                    break
+
+        # Synchronize all teleoperators to the closed state if any gripper is closed,
+        # otherwise to the open state.
+        sync_pos = 1.0 if any_closed else 0.0
         teleop_dict = getattr(self, "teleop_dict", None) or {}
-        for name, teleop in teleop_dict.items():
+        for teleop in teleop_dict.values():
             if hasattr(teleop, "send_feedback"):
-                target_robot = name
-                if hasattr(primitive, "teleop_mapping"):
-                    for r_name, t_name in primitive.teleop_mapping.items():
-                        if t_name == name:
-                            target_robot = r_name
-                            break
-                obs_key = f"{target_robot}.gripper.pos"
-                if obs_key in raw_obs:
-                    val = raw_obs[obs_key]
-                    if hasattr(val, "item"):
-                        pos = float(val.item())
-                    elif hasattr(val, "reshape"):
-                        pos = float(val.reshape(-1)[0])
-                    else:
-                        pos = float(val)
-                    teleop.send_feedback({"gripper.pos": pos, "gripper": pos})
+                teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
 
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
