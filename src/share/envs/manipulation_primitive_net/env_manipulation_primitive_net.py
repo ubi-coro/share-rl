@@ -91,6 +91,11 @@ class ManipulationPrimitiveNet(gym.Env):
         for name in self.config.robot:
             robot_dict[name] = make_robot_from_config(self.config.robot[name])
             robot_dict[name].connect()
+
+        # Let connection settle before calling gripper commands to avoid socket exceptions
+        time.sleep(0.5)
+
+        for name in robot_dict:
             if hasattr(robot_dict[name], "send_gripper_action"):
                 try:
                     # In action space, 0.0 is open, 1.0 is closed.
@@ -415,28 +420,31 @@ class ManipulationPrimitiveNet(gym.Env):
 
         # Synchronize teleoperator gripper states to the physical state of the actively controlled robot
         # at the transition boundary to ensure the state is persisted when taking control.
-        teleop_dict = getattr(self, "teleop_dict", None) or {}
-        for name, teleop in teleop_dict.items():
-            if hasattr(teleop, "send_feedback"):
-                # Determine target robot for this teleoperator
-                target_robot = name
-                if hasattr(primitive, "teleop_mapping"):
-                    for r_name, t_name in primitive.teleop_mapping.items():
-                        if t_name == name:
-                            target_robot = r_name
-                            break
-                obs_key = f"{target_robot}.gripper.pos"
-                if obs_key in raw_obs:
-                    val = raw_obs[obs_key]
-                    if hasattr(val, "item"):
-                        obs_pos = float(val.item())
-                    elif hasattr(val, "reshape"):
-                        obs_pos = float(val.reshape(-1)[0])
-                    else:
-                        obs_pos = float(val)
-                    # Convert observation space (0.0=closed, 1.0=open) to action space (1.0=closed, 0.0=open)
-                    sync_pos = 1.0 - obs_pos
-                    teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
+        # Skip this on the very first startup reset to allow both grippers to open properly without
+        # being overridden by initial un-opened physical state readings.
+        if getattr(self, "_episode_step_count", 0) > 0:
+            teleop_dict = getattr(self, "teleop_dict", None) or {}
+            for name, teleop in teleop_dict.items():
+                if hasattr(teleop, "send_feedback"):
+                    # Determine target robot for this teleoperator
+                    target_robot = name
+                    if hasattr(primitive, "teleop_mapping"):
+                        for r_name, t_name in primitive.teleop_mapping.items():
+                            if t_name == name:
+                                target_robot = r_name
+                                break
+                    obs_key = f"{target_robot}.gripper.pos"
+                    if obs_key in raw_obs:
+                        val = raw_obs[obs_key]
+                        if hasattr(val, "item"):
+                            obs_pos = float(val.item())
+                        elif hasattr(val, "reshape"):
+                            obs_pos = float(val.reshape(-1)[0])
+                        else:
+                            obs_pos = float(val)
+                        # Convert observation space (0.0=closed, 1.0=open) to action space (1.0=closed, 0.0=open)
+                        sync_pos = 1.0 - obs_pos
+                        teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
 
         transition = create_transition(observation=raw_obs, info=raw_info)
         processed_transition = self._env_processors[self._active](transition)
