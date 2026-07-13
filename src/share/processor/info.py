@@ -221,6 +221,15 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         except Exception:
             pass
 
+        # Determine the key character to listen to on stdin for TeleopEvents.SUCCESS
+        success_char = "s"  # default fallback
+        if TeleopEvents.SUCCESS in self.mapping:
+            mapping_key = self.mapping[TeleopEvents.SUCCESS]
+            if isinstance(mapping_key, str):
+                success_char = mapping_key
+            elif hasattr(mapping_key, "name") and mapping_key.name == "space":
+                success_char = " "
+
         def listen_stdin():
             import select
             try:
@@ -239,7 +248,12 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                         line = sys.stdin.readline()
                         if not line:
                             break
-                        if "s" in line or line.strip() == "":
+                        if success_char == " ":
+                            triggered = (" " in line) or (line.strip() == "")
+                        else:
+                            triggered = (success_char in line)
+                        
+                        if triggered:
                             self._events[TeleopEvents.SUCCESS] = True
                             self._stdin_triggered = True
                     except Exception:
@@ -253,7 +267,7 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                     rlist, _, _ = select.select([fd], [], [], 0.1)
                     if rlist:
                         ch = sys.stdin.read(1)
-                        if ch == "s":
+                        if ch == success_char or (success_char == " " and ch in (" ", "\r", "\n")):
                             self._events[TeleopEvents.SUCCESS] = True
                             self._stdin_triggered = True
             except Exception:
