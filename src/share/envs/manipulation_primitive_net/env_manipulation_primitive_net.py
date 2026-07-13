@@ -442,8 +442,8 @@ class ManipulationPrimitiveNet(gym.Env):
                             obs_pos = float(val.reshape(-1)[0])
                         else:
                             obs_pos = float(val)
-                        # Convert observation space (0.0=closed, 1.0=open) to action space (1.0=closed, 0.0=open)
-                        sync_pos = 1.0 - obs_pos
+                        # Both observation space and action space use 0.0 for open and 1.0 for closed.
+                        sync_pos = obs_pos
                         teleop.send_feedback({"gripper.pos": sync_pos, "gripper": sync_pos})
 
         transition = create_transition(observation=raw_obs, info=raw_info)
