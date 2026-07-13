@@ -170,8 +170,7 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
         drx = 0.0 if abs(drx) < 0.005 else drx
         dry = 0.0 if abs(dry) < 0.005 else dry
         drz = 0.0 if abs(drz) < 0.005 else drz
-
-        print(f"\r[DEBUG COOP STEP] dx={dx:.5f}, dy={dy:.5f}, dz={dz:.5f} | left_obs_x={left_obs['x.ee_pos']:.4f}, right_obs_x={right_obs['x.ee_pos']:.4f}", end="", flush=True)
+        # Extracted commands are filtered and deadband is applied.
 
         # Estimate actual V-TCP position from physical robot positions and V-TCP target orientation
         # This properly rotates the offset vector so the clamping error is calculated correctly when rotated.
@@ -266,7 +265,10 @@ class SynchronousArmPrimitive(ManipulationPrimitive):
             cooperative_action["left"]["gripper.pos"] = action["left"]["gripper.pos"]
             cooperative_action["right"]["gripper.pos"] = action["left"]["gripper.pos"]
 
-        return super().step(cooperative_action)
+        obs, reward, terminated, truncated, info = super().step(cooperative_action)
+        # Inject custom telemetry into info dict for clean record.py printing
+        info["coop_debug"] = f"dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f} | left_x={left_obs['x.ee_pos']:.3f}, right_x={right_obs['x.ee_pos']:.3f}"
+        return obs, reward, terminated, truncated, info
 
 
 @ManipulationPrimitiveConfig.register_subclass("synchronous_arm")

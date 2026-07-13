@@ -175,13 +175,17 @@ def record_loop(
         precise_sleep(1 / mp_net.config.fps - dt_load)
         dt_loop = time.perf_counter() - start_loop_t
         import sys
+        coop_debug = info.get("coop_debug")
         telemetry_msg = (
             f"[{task}] "
             f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
             f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
         )
+        if coop_debug:
+            telemetry_msg += f" | {coop_debug}"
+
         if sys.stdout.isatty():
-            sys.stdout.write(f"\r{telemetry_msg}")
+            sys.stdout.write(f"\r{telemetry_msg:<130}")
             sys.stdout.flush()
         else:
             if info.get("episode_step", 0) % 90 == 0:
