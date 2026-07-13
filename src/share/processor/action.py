@@ -329,7 +329,19 @@ class InterventionActionProcessorStep(ProcessorStep):
             for name in self.task_frame:
                 if name not in source_actions:
                     source_actions[name] = dict(policy_actions.get(name, {}))
-                    source_actions[name].pop(f"{GRIPPER_KEY}.pos", None)
+                    # Set the command to the current observed position to satisfy the flattener
+                    # while preserving the physical state of the gripper.
+                    obs = transition.get(TransitionKey.OBSERVATION, {})
+                    obs_key = f"{name}.{GRIPPER_KEY}.pos"
+                    if obs_key in obs:
+                        obs_val = obs[obs_key]
+                        if hasattr(obs_val, "item"):
+                            current_pos = float(obs_val.item())
+                        elif hasattr(obs_val, "reshape"):
+                            current_pos = float(obs_val.reshape(-1)[0])
+                        else:
+                            current_pos = float(obs_val)
+                        source_actions[name][f"{GRIPPER_KEY}.pos"] = current_pos
         else:
             source_actions = policy_actions
             if self._intervention_occurred:
