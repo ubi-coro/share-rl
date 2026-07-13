@@ -328,7 +328,8 @@ class InterventionActionProcessorStep(ProcessorStep):
                     self.teleoperators[name].disable_torque()
             for name in self.task_frame:
                 if name not in source_actions:
-                    source_actions[name] = policy_actions.get(name, {})
+                    source_actions[name] = dict(policy_actions.get(name, {}))
+                    source_actions[name].pop(f"{GRIPPER_KEY}.pos", None)
         else:
             source_actions = policy_actions
             if self._intervention_occurred:
