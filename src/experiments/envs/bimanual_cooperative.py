@@ -448,19 +448,46 @@ class DemoURBimanualCooperativeEnvConfig(ManipulationPrimitiveNetConfig):
             notes="Move both arms in rotation relative to the Virtual TCP.",
         )
 
+        # Cooperative controls - Translation and Rotation
+        cooperative_both_primitive = SynchronousArmPrimitiveConfig(
+            task_frame={
+                "left": TaskFrame(
+                    target=[0.0] * 6,
+                    space=ControlSpace.TASK,
+                    control_mode=[ControlMode.POS] * 6,
+                    policy_mode=[PolicyMode.RELATIVE] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
+                ),
+                "right": TaskFrame(
+                    target=[0.0] * 6,
+                    space=ControlSpace.TASK,
+                    control_mode=[ControlMode.POS] * 6,
+                    policy_mode=[None] * 6,
+                    controller_overrides={"kp": [800, 800, 800, 150, 150, 150]},
+                ),
+            },
+            v_tcp_offset_in_midpoint=[0.0, 0.0, 0.0],
+            processor=processor,
+            enable_translation=True,
+            enable_rotation=True,
+            notes="Move both arms in translation and rotation relative to the Virtual TCP.",
+        )
+
         self.primitives = {
             "left_arm": left_arm_primitive,
             "right_arm": right_arm_primitive,
             "cooperative_translation": cooperative_translation_primitive,
             "cooperative_rotation": cooperative_rotation_primitive,
+            "cooperative_both": cooperative_both_primitive,
         }
 
-        # 4. Transitions cycling in a continuous loop: left -> right -> cooperative_translation -> cooperative_rotation -> left
+        # 4. Transitions cycling in a continuous loop: left -> right -> cooperative_translation -> cooperative_rotation -> cooperative_both -> left
         self.transitions = [
             OnSuccess(source="left_arm", target="right_arm"),
             OnSuccess(source="right_arm", target="cooperative_translation"),
             OnSuccess(source="cooperative_translation", target="cooperative_rotation"),
-            OnSuccess(source="cooperative_rotation", target="left_arm"),
+            OnSuccess(source="cooperative_rotation", target="cooperative_both"),
+            OnSuccess(source="cooperative_both", target="left_arm"),
         ]
 
         super().__post_init__()
