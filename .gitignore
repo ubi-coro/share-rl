@@ -177,6 +177,3 @@ outputs/
 *.urdf
 *.xml
 *.part
-
-# Experiments
-/src/experiments/
