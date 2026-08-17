@@ -56,6 +56,213 @@ def policy_action_keys_for_robot(frame: "TaskFrame", gripper_enable: bool) -> li
     return keys
 
 
+# Special keys with a direct pynput.keyboard.Key equivalent -- keep this list in sync with
+# what env configs actually map (grep key_mapping= across experiments/envs).
+_EVDEV_SPECIAL_KEY_NAMES: dict[int, str] = {
+    evdev.ecodes.KEY_SPACE: "space",
+    evdev.ecodes.KEY_LEFT: "left",
+    evdev.ecodes.KEY_RIGHT: "right",
+    evdev.ecodes.KEY_UP: "up",
+    evdev.ecodes.KEY_DOWN: "down",
+    evdev.ecodes.KEY_ENTER: "enter",
+    evdev.ecodes.KEY_LEFTSHIFT: "shift",
+    evdev.ecodes.KEY_RIGHTSHIFT: "shift_r",
+    evdev.ecodes.KEY_LEFTCTRL: "ctrl_l",
+    evdev.ecodes.KEY_RIGHTCTRL: "ctrl_r",
+}
+
+
+def _evdev_code_to_pynput_key(code: int) -> Any:
+    """Translate one evdev keycode into the same pynput Key/KeyCode object
+    EventConfig.key_mapping already uses, so callers don't care which backend fired."""
+    from pynput import keyboard
+
+    special_name = _EVDEV_SPECIAL_KEY_NAMES.get(code)
+    if special_name is not None:
+        return getattr(keyboard.Key, special_name)
+
+    key_name = evdev.ecodes.KEY.get(code)
+    if isinstance(key_name, list):
+        key_name = key_name[0] if key_name else None
+    if isinstance(key_name, str) and key_name.startswith("KEY_") and len(key_name) == 5:
+        return keyboard.KeyCode.from_char(key_name[-1].lower())
+    return None
+
+
+def _is_keyboard_like(device: "evdev.InputDevice") -> bool:
+    keys = device.capabilities().get(evdev.ecodes.EV_KEY, [])
+    return evdev.ecodes.KEY_SPACE in keys and evdev.ecodes.KEY_A in keys
+
+
+class EvdevKeyboardListener:
+    """pynput.keyboard.Listener-compatible keyboard watcher backed by raw evdev events.
+
+    pynput's global listener needs X11 (or a compositor that forwards it) -- on Wayland it
+    silently receives nothing, no error. evdev reads /dev/input/eventN directly, below the
+    display server, so it works on both -- same technique as FootSwitchHandler above. Needs
+    the user in the `input` group (`sudo usermod -aG input $USER`, then re-login) to read the
+    device files; falls back to a logged warning (not a crash) if none are accessible.
+    """
+
+    def __init__(self, on_press=None, on_release=None, device_paths: list[str] | None = None):
+        self.on_press = on_press
+        self.on_release = on_release
+        self.daemon = True
+        self._device_paths = device_paths
+        self._threads: list[threading.Thread] = []
+        self._running = True
+
+    def _discover_devices(self) -> list[str]:
+        paths = []
+        for path in evdev.list_devices():
+            try:
+                if _is_keyboard_like(evdev.InputDevice(path)):
+                    paths.append(path)
+            except Exception:
+                continue
+        return paths
+
+    def start(self) -> None:
+        device_paths = self._device_paths if self._device_paths is not None else self._discover_devices()
+        if not device_paths:
+            logging.warning(
+                "EvdevKeyboardListener found no keyboard-like /dev/input device -- keyboard "
+                "shortcuts (space/left/down/...) won't work. Check you're in the 'input' "
+                "group: sudo usermod -aG input $USER, then log out and back in."
+            )
+        for path in device_paths:
+            thread = threading.Thread(target=self._run, args=(path,), daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def _run(self, device_path: str) -> None:
+        try:
+            device = evdev.InputDevice(device_path)
+        except Exception:
+            logging.warning(f"EvdevKeyboardListener could not open {device_path}", exc_info=True)
+            return
+        self._run_with_device(device)
+
+    def _run_with_device(self, device: Any) -> None:
+        for event in device.read_loop():
+            if not self._running:
+                break
+            if event.type != evdev.ecodes.EV_KEY or event.value not in (0, 1):
+                continue
+            key = _evdev_code_to_pynput_key(event.code)
+            if key is None:
+                continue
+            callback = self.on_press if event.value == 1 else self.on_release
+            if callback is not None:
+                callback(key)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def join(self, timeout: float | None = None) -> None:
+        for thread in self._threads:
+            thread.join(timeout=timeout)
+
+
+class StdinKeyboardListener:
+    """pynput.keyboard.Listener-compatible keyboard watcher reading this process's own
+    terminal in raw/cbreak mode -- needs no special permissions (unlike evdev's
+    /dev/input access), just an interactive terminal. Only sees keys typed while that
+    terminal has focus (not a true OS-global listener), and there is no separate release
+    event -- on_release never fires.
+    """
+
+    _ARROW_KEY_BY_FINAL_BYTE = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+    def __init__(self, on_press=None, on_release=None):
+        self.on_press = on_press
+        self.on_release = on_release
+        self.daemon = True
+        self._running = True
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        import sys
+
+        if not sys.stdin.isatty():
+            logging.warning("StdinKeyboardListener: stdin is not a terminal, keyboard shortcuts disabled.")
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        import select
+        import sys
+        import termios
+        import tty
+
+        from pynput import keyboard
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while self._running:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not ready:
+                    continue
+                char = sys.stdin.read(1)
+                key = self._read_key(char, keyboard)
+                if key is not None and self.on_press is not None:
+                    self.on_press(key)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _read_key(self, char: str, keyboard: Any) -> Any:
+        import sys
+
+        if char == "\x1b":  # possible arrow-key escape sequence: ESC [ <A|B|C|D>
+            import select
+
+            if not select.select([sys.stdin], [], [], 0.05)[0]:
+                return None  # bare Escape
+            if sys.stdin.read(1) != "[":
+                return None
+            final_byte = sys.stdin.read(1)
+            name = self._ARROW_KEY_BY_FINAL_BYTE.get(final_byte)
+            return getattr(keyboard.Key, name) if name is not None else None
+        if char == " ":
+            return keyboard.Key.space
+        if char in ("\n", "\r"):
+            return keyboard.Key.enter
+        if char.isprintable():
+            return keyboard.KeyCode.from_char(char)
+        return None
+
+    def stop(self) -> None:
+        self._running = False
+
+    def join(self, timeout: float | None = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+
+class CompositeKeyboardListener:
+    """Runs several pynput.keyboard.Listener-compatible backends in parallel, feeding the
+    same callbacks -- e.g. evdev when available, stdin as a permission-free fallback."""
+
+    def __init__(self, listeners: list[Any]) -> None:
+        self._listeners = listeners
+        self.daemon = True
+
+    def start(self) -> None:
+        for listener in self._listeners:
+            listener.start()
+
+    def stop(self) -> None:
+        for listener in self._listeners:
+            listener.stop()
+
+    def join(self, timeout: float | None = None) -> None:
+        for listener in self._listeners:
+            listener.join(timeout=timeout)
+
+
 class FootSwitchHandler:
     def __init__(self, device_path="/dev/input/event0", event_names: tuple[str] = (TeleopEvents.SUCCESS, ), toggle: bool = False):
         self.device = evdev.InputDevice(device_path)

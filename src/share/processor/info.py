@@ -7,7 +7,7 @@ from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.processor import InfoProcessorStep, ProcessorStepRegistry, TransitionKey, EnvTransition, ProcessorStep
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY, _check_teleop_with_events
 
-from share.processor.utils import FootSwitchHandler
+from share.processor.utils import CompositeKeyboardListener, EvdevKeyboardListener, FootSwitchHandler, StdinKeyboardListener
 from share.teleoperators import TeleopEvents
 
 for _registry_name in (
@@ -194,10 +194,12 @@ def _ensure_keyboard_listener() -> None:
     with _keyboard_listener_lock:
         if _keyboard_listener is not None:
             return
-        from pynput import keyboard
-
-        listener = keyboard.Listener(on_press=_dispatch_keyboard_press, on_release=_dispatch_keyboard_release)
-        listener.daemon = True
+        # evdev needs /dev/input access (input group); stdin needs none but only sees keys
+        # while this process's terminal has focus. Run both -- whichever actually works wins.
+        listener = CompositeKeyboardListener([
+            EvdevKeyboardListener(on_press=_dispatch_keyboard_press, on_release=_dispatch_keyboard_release),
+            StdinKeyboardListener(on_press=_dispatch_keyboard_press, on_release=_dispatch_keyboard_release),
+        ])
         listener.start()
         _keyboard_listener = listener
 

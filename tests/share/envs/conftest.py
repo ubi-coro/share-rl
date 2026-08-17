@@ -41,6 +41,27 @@ def _install_pynput_keyboard_stub() -> None:
 
     keyboard_module.Key = Key
 
+    class KeyCode:
+        """Stand-in for pynput.keyboard.KeyCode -- character keys, compared by .char."""
+
+        def __init__(self, char: str | None = None):
+            self.char = char
+
+        @classmethod
+        def from_char(cls, char: str) -> "KeyCode":
+            return cls(char=char)
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, KeyCode) and other.char == self.char
+
+        def __hash__(self) -> int:
+            return hash(("KeyCode", self.char))
+
+        def __repr__(self) -> str:
+            return f"KeyCode.from_char({self.char!r})"
+
+    keyboard_module.KeyCode = KeyCode
+
     class Listener:
         """Inert stand-in for pynput.keyboard.Listener -- no real OS hook, no thread."""
 
