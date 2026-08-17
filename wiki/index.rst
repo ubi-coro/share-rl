@@ -12,5 +12,6 @@ happening.
 
    quickstart
    architecture
+   connector_setup
    examples
    open_problems

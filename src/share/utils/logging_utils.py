@@ -22,7 +22,12 @@ def log_runtime_frequency(
     """Log a compact runtime timing line shared by record and actor loops."""
 
     task_fragment = f" task={task}" if task is not None else ""
-    logging.info(
+    # DEBUG, not INFO: this fires once per control-loop step (up to fps Hz), so at INFO it
+    # floods the console with a full line every step -- right below the \r-overwriting status
+    # line that already shows the same Hz live. init_logging's file handler stays at DEBUG by
+    # default, so the full per-step trace is still captured for post-hoc debugging; only the
+    # live console (default INFO) is decluttered.
+    logging.debug(
         "[%s] primitive=%s%s loop=%5.2fms (%3.1fhz) %s=%5.2fms (%3.1fhz)",
         prefix,
         primitive,

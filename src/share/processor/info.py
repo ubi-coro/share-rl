@@ -170,9 +170,11 @@ class AddFootswitchEventsAsInfoStep(InfoProcessorStep):
 @dataclass
 class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
     mapping: dict[TeleopEvents, Any] = field(default_factory=dict)
+    pulse_events: tuple[TeleopEvents | str, ...] = ()
 
     def __post_init__(self):
         self._events = {event: False for event in self.mapping}
+        self._pressed = {event: False for event in self.mapping}
         self._is_string_key = {event: isinstance(mapping_key, str) for event, mapping_key in self.mapping.items()}
 
         from pynput import keyboard
@@ -182,10 +184,14 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                 try:
                     if self._is_string_key[event]:
                         if key.char == mapping_key:
-                            self._events[event] = True
+                            if event not in self.pulse_events or not self._pressed[event]:
+                                self._events[event] = True
+                            self._pressed[event] = True
                     else:
                         if key == mapping_key:
-                            self._events[event] = True
+                            if event not in self.pulse_events or not self._pressed[event]:
+                                self._events[event] = True
+                            self._pressed[event] = True
                 except Exception:
                     ...
 
@@ -194,10 +200,14 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
                 try:
                     if self._is_string_key[event]:
                         if key.char == mapping_key:
-                            self._events[event] = False
+                            self._pressed[event] = False
+                            if event not in self.pulse_events:
+                                self._events[event] = False
                     else:
                         if key == mapping_key:
-                            self._events[event] = False
+                            self._pressed[event] = False
+                            if event not in self.pulse_events:
+                                self._events[event] = False
                 except Exception:
                     ...
 
@@ -208,6 +218,8 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         new_info = dict(info)
         for event_name, event_value in self._events.items():
             new_info[event_name] = new_info.get(event_name, False) | event_value
+            if event_name in self.pulse_events and event_value:
+                self._events[event_name] = False
         return new_info
 
     def transform_features(
@@ -217,7 +229,7 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
 
     def reset(self) -> None:
         self._events = {event: False for event in self.mapping}
+        self._pressed = {event: False for event in self.mapping}
 
     def __del__(self):
-        for l in self._listener.values():
-            l.stop()
+        self._listener.stop()

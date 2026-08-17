@@ -1,0 +1,4 @@
+from share.policies.reward_classifier.configuration_state_reward_classifier import StateRewardClassifierConfig
+from share.policies.reward_classifier.modeling_state_reward_classifier import StateRewardClassifier
+
+__all__ = ["StateRewardClassifier", "StateRewardClassifierConfig"]

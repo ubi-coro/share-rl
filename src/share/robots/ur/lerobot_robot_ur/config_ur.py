@@ -18,10 +18,13 @@ from dataclasses import dataclass, field
 from multiprocessing.managers import SharedMemoryManager
 from typing import Literal, Optional, Sequence
 
+import draccus
 import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.robots import RobotConfig
+
+draccus.encode.register(SharedMemoryManager, lambda _: None)
 
 @RobotConfig.register_subclass("ur")
 @dataclass
@@ -50,14 +53,16 @@ class URConfig(RobotConfig):
     shm_manager: Optional[SharedMemoryManager] = None
     ft_filter_cutoff_hz: Optional[float] = None  # Hz, EMA low-pass cutoff for f/t sensor
     force_mode_gain_scaling: float = 1.0
+    force_mode_damping: Optional[float] = None  # None keeps the UR controller default.
     use_force_mode: bool = True  # Set False to use direct pose servoing instead of UR force mode.
     simple_pose_use_servo: bool = False  # True → servoL (streaming 1 kHz), False → moveL (default)
     simple_pose_servo_time: float = 0.002  # [s] servoL control duration per command.
     simple_pose_lookahead_time: float = 0.2  # [s] range [0.03, 0.2], larger is smoother/slower.
     simple_pose_gain: float = 100.0  # range [100, 2000], lower is gentler/slower.
-    simple_pose_max_speed: list[float] = field(default_factory=lambda: [0.1, 0.1, 0.1, 0.3, 0.3, 0.3])  # [m/s, m/s, m/s, rad/s, rad/s, rad/s] — only used for servoL
-    simple_pose_move_speed: float = 0.05  # [m/s] moveL translation speed
+    simple_pose_max_speed: list[float] = field(default_factory=lambda: [0.2, 0.2, 0.2, 0.3, 0.3, 0.3])  # [m/s, m/s, m/s, rad/s, rad/s, rad/s] — only used for servoL
+    simple_pose_move_speed: float = 0.2  # [m/s] moveL translation speed
     simple_pose_move_accel: float = 0.1   # [m/s²] moveL acceleration
+    simple_pose_stop_accel: float = 0.5  # [m/s²] stopL deceleration when leaving moveL
     kp: list[float] = field(default_factory=lambda: [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])
     kd: list[float] = field(default_factory=lambda: [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])
 
@@ -79,9 +84,23 @@ class URConfig(RobotConfig):
     verbose: bool = False
     mock: bool = False
     debug: bool = False
+    debug_hz: float = 10.0
     debug_axis: int = 0
 
+    # Asynchronous controller-rate wrench visualization.
+    wrench_monitor_enabled: bool = False
+    wrench_monitor_refresh_hz: float = 30.0
+    wrench_monitor_history_s: float = 10.0
+
     def __post_init__(self):
+        if float(self.debug_hz) <= 0.0:
+            raise ValueError("URConfig.debug_hz must be > 0.")
+        if float(self.wrench_monitor_refresh_hz) <= 0.0:
+            raise ValueError("URConfig.wrench_monitor_refresh_hz must be > 0.")
+        if float(self.wrench_monitor_history_s) <= 0.0:
+            raise ValueError("URConfig.wrench_monitor_history_s must be > 0.")
+        if self.force_mode_damping is not None and not (0.0 <= float(self.force_mode_damping) <= 1.0):
+            raise ValueError("URConfig.force_mode_damping must be in [0, 1].")
         if not (0.03 <= float(self.simple_pose_lookahead_time) <= 0.2):
             raise ValueError("URConfig.simple_pose_lookahead_time must be in [0.03, 0.2].")
         if not (100.0 <= float(self.simple_pose_gain) <= 2000.0):

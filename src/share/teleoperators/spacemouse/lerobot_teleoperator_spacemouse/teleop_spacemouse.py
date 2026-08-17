@@ -11,6 +11,7 @@ from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from share.envs.manipulation_primitive.task_frame import TASK_FRAME_AXIS_NAMES
+from share.teleoperators import TeleopEvents
 from share.teleoperators.spacemouse.lerobot_teleoperator_spacemouse import pyspacemouse
 
 
@@ -196,7 +197,10 @@ class SpaceMouse(Teleoperator, HasTeleopEvents):
                     self._event_states[event] = not self._event_states.get(event, False)
 
             else:
-                self._event_states[event] = current
+                self._event_states[event] = (
+                    current == 1 and self._prev_button_states.get(event, 0) == 0
+                    if event == TeleopEvents.SUCCESS else current
+                )
 
             # Update previous state
             self._prev_button_states[event] = current

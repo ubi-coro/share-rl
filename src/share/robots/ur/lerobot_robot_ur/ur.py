@@ -33,8 +33,10 @@ from share.robots.ur.lerobot_robot_ur.controller import (
     TaskFrameCommand,
     RTDETaskFrameController,
 )
+from share.robots.ur.lerobot_robot_ur.wrench_monitor import WrenchMonitorProcess
 
 from share.grippers.robotiq_controller import RTDERobotiqController
+from share.utils.transformation_utils import euler_xyz_from_rotvec
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class UR(Robot):
         config.shm_manager = self.shm
 
         self.controller = RTDETaskFrameController(config)
+        self.wrench_monitor = None
 
         if self.config.use_gripper:
             gripper_range = self._gripper_range_from_calibration()
@@ -156,6 +159,15 @@ class UR(Robot):
 
         self.controller.start()
         self.controller.zero_ft()
+        if self.config.wrench_monitor_enabled:
+            self.wrench_monitor = WrenchMonitorProcess(
+                self.controller.wrench_monitor_rb,
+                controller_unexpected_exit_event=self.controller.unexpected_exit_event,
+                wrench_monitor_refresh_hz=self.config.wrench_monitor_refresh_hz,
+                wrench_monitor_history_s=self.config.wrench_monitor_history_s,
+                wrench_monitor_sample_hz=self.config.frequency,
+            )
+            self.wrench_monitor.start()
         if self.gripper is not None:
             self.gripper.auto_calibrate = calibrate and not self.is_calibrated
             self.gripper.start()
@@ -218,10 +230,19 @@ class UR(Robot):
         obs_dict = {}
         controller_data = self.controller.get_robot_state()
 
+        origin = controller_data.get("TaskFrameOrigin")
+        origin_rpy = None
+        if origin is not None:
+            origin_rpy = [*origin[:3], *euler_xyz_from_rotvec(origin[3:6])]
+
         for i, ax in enumerate(TASK_FRAME_AXIS_NAMES):
             obs_dict[f"{ax}.ee_pos"] = controller_data['ActualTCPPose'][i]
             obs_dict[f"{ax}.ee_vel"] = controller_data['ActualTCPSpeed'][i]
             obs_dict[f"{ax}.ee_wrench"] = controller_data['ActualTCPForce'][i]
+            if origin_rpy is not None:
+                # Origin the pose sample is expressed in (same ring-buffer sample),
+                # so pose and frame stay consistent across task-frame switches.
+                obs_dict[f"{ax}.task_frame_origin"] = float(origin_rpy[i])
 
         for i, joint_name in enumerate(self.joint_names):
             obs_dict[f"{joint_name}.pos"] = controller_data['ActualQ'][i]
@@ -315,7 +336,7 @@ class UR(Robot):
         return command
 
     def _default_controller_overrides(self) -> dict[str, Any]:
-        return {
+        overrides = {
             "kp": list(self.config.kp),
             "kd": list(self.config.kd),
             "min_pose": list(self.config.min_pose_rpy),
@@ -326,6 +347,10 @@ class UR(Robot):
             "compliance_desired_wrench": list(self.config.compliance_desired_wrench),
             "compliance_adaptive_limit_min": list(self.config.compliance_adaptive_limit_min),
         }
+        if getattr(self.config, "force_mode_damping", None) is not None:
+            overrides["force_mode_damping"] = float(self.config.force_mode_damping)
+        return overrides
+
 
     def _merged_controller_overrides(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
         unknown = set(overrides or {}) - TaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
@@ -373,6 +398,9 @@ class UR(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        if self.wrench_monitor is not None:
+            self.wrench_monitor.stop()
+            self.wrench_monitor = None
         self.controller.stop()
         if self.gripper is not None:
             self.gripper.stop()

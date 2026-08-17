@@ -55,7 +55,7 @@ class _CompositeShutdownEvent:
 
 @parser.wrap()
 def actor_cli(cfg: MPNetTrainRLServerPipelineConfig):
-    cfg.validate()
+    cfg.validate(output_role="actor")
     run_actor(cfg)
 
 
@@ -209,9 +209,11 @@ def act_with_policy(
             "total_steps": 0,
             "policy_inference_dts": [],
             "pending_transitions": [],
+            # Sticky success flag so we can report whether the segment solved the task.
+            "success": False,
         }
 
-    def publish_segment(active_primitive: str) -> None:
+    def publish_segment(active_primitive: str, variant: str) -> None:
         push_transitions_to_transport_queue(
             transitions=segment_state["pending_transitions"],
             transitions_queue=transitions_queue,
@@ -219,14 +221,25 @@ def act_with_policy(
         if segment_state["total_steps"] > 0:
             stats = get_frequency_stats(segment_state["policy_inference_dts"])
             intervention_rate = segment_state["intervention_steps"] / segment_state["total_steps"]
+            # Nominal duration of the policy-controlled primitive: policy steps divided by the
+            # control rate. Step-count based (not wall-clock) so it is deterministic and free of
+            # stall/wait noise -- the metric for "are we solving the task faster".
+            cycle_time_s = (
+                segment_state["total_steps"] / cfg.env.fps if cfg.env.fps else 0.0
+            )
             interactions_queue.put(
                 python_object_to_bytes(
                     {
                         "Primitive": active_primitive,
+                        # "Variant" carries the task-field variant id for future methods; for
+                        # now it is the primitive's task_description (falling back to its name).
+                        "Variant": variant,
                         "Interaction step": collection_counts[active_primitive],
                         "Episodic reward": segment_state["reward_sum"],
+                        "Episode success": int(segment_state["success"]),
                         "Episode intervention": int(segment_state["intervention_steps"] > 0),
                         "Intervention rate": intervention_rate,
+                        "Cycle time [s]": cycle_time_s,
                         **stats,
                     }
                 )
@@ -354,6 +367,7 @@ def act_with_policy(
                 segment_state["reward_sum"] += reward
                 segment_state["total_steps"] += 1
                 collection_counts[active_primitive] += 1
+                segment_state["success"] = segment_state["success"] or has_event(info, TeleopEvents.SUCCESS)
 
                 intervention_active = is_intervention(info)
                 if intervention_active:
@@ -385,11 +399,15 @@ def act_with_policy(
                 if policy is not None and rerecord_requested:
                     collection_counts[active_primitive] -= segment_state["total_steps"]
                 elif policy is not None:
-                    publish_segment(active_primitive)
+                    # Success may only be asserted on the terminal step; fold it in before publishing.
+                    segment_state["success"] = segment_state["success"] or has_event(info, TeleopEvents.SUCCESS)
+                    variant = env.config.primitives[active_primitive].task_description or active_primitive
+                    publish_segment(active_primitive, variant)
                     logging.info(
-                        "[ACTOR] adaptive_episode primitive=%s success=%s reward=%.3f length=%d",
+                        "[ACTOR] adaptive_episode primitive=%s variant=%s success=%s reward=%.3f length=%d",
                         active_primitive,
-                        has_event(info, TeleopEvents.SUCCESS),
+                        variant,
+                        segment_state["success"],
                         segment_state["reward_sum"],
                         segment_state["total_steps"],
                     )
@@ -408,6 +426,13 @@ def act_with_policy(
                 dt = time.perf_counter() - step_start_t
                 precise_sleep(max(1 / cfg.env.fps - dt, 0.0))
             dt_loop = time.perf_counter() - step_start_t
+            hz = 1.0 / dt_loop if dt_loop > 0 else 0.0
+            status = f"[ACTOR] {env.active_primitive}  {hz:5.1f} Hz"
+            extra = info.get("record_status")
+            if extra:
+                status += f"  |  {extra}"
+            print(f"\r{status}\033[K", end="", flush=True)
+
             log_runtime_frequency(
                 prefix="ACTOR",
                 primitive=active_primitive,

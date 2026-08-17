@@ -13,6 +13,7 @@ import draccus
 
 from share.envs.manipulation_primitive_net.transitions import (
     Always,
+    OnEvent,
     OnObservationThreshold,
     OnSuccess,
     OnTargetPoseReached,
@@ -209,6 +210,7 @@ except Exception:  # noqa: BLE001
 
 TRANSITION_TYPES: dict[str, type[Transition]] = {
     "always": Always,
+    "on_event": OnEvent,
     "on_success": OnSuccess,
     "on_observation_threshold": OnObservationThreshold,
     "on_time_limit": OnTimeLimit,
@@ -543,6 +545,8 @@ def _transition_condition_summary(transition: Transition) -> str:
     if transition_type == "on_success":
         success_key = getattr(transition, "success_key", "success")
         return f"info.{success_key} == True"
+    if transition_type == "on_event":
+        return f"info.{getattr(transition, 'event_key', '')} == True"
     if transition_type == "on_observation_threshold":
         return (
             f"obs.{getattr(transition, 'obs_key', '')} "
@@ -559,7 +563,7 @@ def _transition_condition_summary(transition: Transition) -> str:
         return f"target pose reached robot={robot} axes={list(axes)} tol={getattr(transition, 'tolerance', 0.0)}"
     if transition_type == "reward_classifier":
         return (
-            f"{getattr(transition, 'metric_key', 'success')} "
+            f"classifier({getattr(transition, 'pretrained_path', '')}) "
             f"{getattr(transition, 'operator', 'ge')} {getattr(transition, 'threshold', 0.0)}"
         )
     return transition_type

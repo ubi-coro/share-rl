@@ -18,7 +18,7 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import Prim
 from share.envs.manipulation_primitive.task_frame import ControlMode
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
 from share.envs.manipulation_primitive_net.transitions import DEFAULT_TARGET_POSE_AXES_INFO_KEY
-from share.envs.utils import task_frame_origins
+from share.envs.utils import observed_task_frame_origins, task_frame_origins
 from share.teleoperators import TeleopEvents
 
 
@@ -253,11 +253,17 @@ class ManipulationPrimitiveNet(gym.Env):
                 source_primitive=active,
                 target_primitive=target,
                 observation=dict(processed_obs),
-                task_frame_origin=task_frame_origins(primitive),
+                # Prefer the origin published with the pose sample: right after an
+                # origin switch, the controller may not have applied the source
+                # primitive's frame yet when this observation was taken.
+                task_frame_origin=observed_task_frame_origins(
+                    processed_obs, task_frame_origins(primitive)
+                ),
+                reason=result.reason,
             )
             self._primitive_step_count = 0
             self._active = target
-            self._enter_active_primitive(None, None, None)
+            self._enter_active_primitive(None, None, self._pending_entry_context)
 
             processed_transition[TransitionKey.REWARD] += result.reward
             processed_transition[TransitionKey.DONE] |= result.terminated
@@ -381,11 +387,19 @@ class ManipulationPrimitiveNet(gym.Env):
         processed_transition = self._env_processors[self._active](transition)
         processed_obs = processed_transition[TransitionKey.OBSERVATION]
         if entry_context is None:
+            # The observation just read is still expressed in the task frame of the
+            # primitive that stepped last: the entered primitive's frame is only sent
+            # to the robot on its first send_action. Tag the context with the origin
+            # published alongside the pose sample (falling back to the last-stepped
+            # primitive's origin), so entry poses are transformed between the frames.
+            origin_primitive = self.config.primitives.get(self._last_stepped_primitive, primitive)
             entry_context = PrimitiveEntryContext(
-                source_primitive=None,
+                source_primitive=self._last_stepped_primitive,
                 target_primitive=self._active,
                 observation=dict(processed_obs),
-                task_frame_origin=task_frame_origins(primitive),
+                task_frame_origin=observed_task_frame_origins(
+                    processed_obs, task_frame_origins(origin_primitive)
+                ),
             )
 
         self._envs[self._active].reset_runtime_state()

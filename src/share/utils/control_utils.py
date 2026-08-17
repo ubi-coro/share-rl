@@ -11,11 +11,49 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.processor.rename_processor import rename_stats
+from lerobot.processor.rename_processor import RenameObservationsProcessorStep, rename_stats
+from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from share.configs.record import RecordConfig
+from share.rl.runtime import resolve_policy_dataset_stats
 from share.envs.manipulation_primitive.config_manipulation_primitive import ManipulationPrimitiveConfig
 from share.envs.utils import env_to_dataset_features
+
+try:
+    import batch_rl.policies  # noqa: F401  (registers ditflow/chunk_critic policy types)
+except ImportError:
+    pass
+
+
+_OFFLINE_VISION_CACHE_PREFIX = "observation.cache."
+_LIVE_IMAGE_PREFIX = "observation.images."
+
+
+def _remove_redundant_offline_cache_features(policy_cfg, env_features: dict) -> None:
+    """Drop saved vision-cache inputs when the equivalent live image is available."""
+    input_features = policy_cfg.input_features or {}
+    env_keys = set(env_features)
+    removable = []
+    unavailable = []
+    for key in input_features:
+        if not key.startswith(_OFFLINE_VISION_CACHE_PREFIX) or key in env_keys:
+            continue
+        camera_name = key.removeprefix(_OFFLINE_VISION_CACHE_PREFIX)
+        image_key = f"{_LIVE_IMAGE_PREFIX}{camera_name}"
+        if image_key in input_features and image_key in env_keys:
+            removable.append(key)
+        else:
+            unavailable.append(key)
+    if unavailable:
+        raise ValueError(
+            "Policy requires offline-only vision cache features without equivalent "
+            f"live images: {unavailable}"
+        )
+    if removable:
+        policy_cfg.input_features = {
+            key: feature for key, feature in input_features.items() if key not in removable
+        }
+        logging.info("Ignoring offline-only policy cache features at deployment: %s", removable)
 
 
 def make_policies_and_datasets(cfg: RecordConfig):
@@ -45,6 +83,12 @@ def make_policies_and_datasets(cfg: RecordConfig):
                         image_writer_processes=cfg.dataset.num_image_writer_processes,
                         image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
                     )
+                    if "rl.is_intervention" not in datasets[name].features:
+                        logging.warning(
+                            f"Resumed dataset '{repo_id}' was recorded before the 'rl.is_intervention' "
+                            f"feature was added; adding frames with this feature will fail. "
+                            f"Record into a fresh dataset instead."
+                        )
 
                 else:
                     datasets[name] = LeRobotDataset.create(
@@ -77,19 +121,38 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 p.policy = PreTrainedConfig.from_pretrained(p.policy.pretrained_path)
                 p.policy = replace(p.policy, **p.policy_overwrites)
                 p.policy.pretrained_path = policy_path
+                _remove_redundant_offline_cache_features(p.policy, p.features or {})
 
             policies[name] = make_policy(cfg=p.policy, env_cfg=p)
             policies[name] = policies[name].eval()
 
+            # Checkpoints saved by our learner do not include processor pipelines, so
+            # rebuild them from the policy config the same way training did instead of
+            # loading them from the checkpoint.
+            processor_path = p.policy.pretrained_path
+            if processor_path is not None and not (
+                Path(processor_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+            ).exists():
+                processor_path = None
+                config_stats = resolve_policy_dataset_stats(p.policy)
+                if config_stats is not None:
+                    stats = config_stats
+
             pre, post = make_pre_post_processors(
                 policy_cfg=p.policy,
-                pretrained_path=p.policy.pretrained_path,
+                pretrained_path=processor_path,
                 dataset_stats=stats,
                 preprocessor_overrides={
                     "device_processor": {"device": p.policy.device},
                     "rename_observations_processor": {"rename_map": rename_map},
                 },
             )
+            if processor_path is None:
+                # Freshly built pipelines ignore `preprocessor_overrides`, so apply the
+                # record-time rename map to the fresh preprocessor directly.
+                for step in pre.steps:
+                    if isinstance(step, RenameObservationsProcessorStep):
+                        step.rename_map = rename_map
             preprocessors[name] = pre
             postprocessors[name] = post
 

@@ -24,6 +24,7 @@ from share.envs.manipulation_primitive.env_manipulation_primitive import (
 )
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, TaskFrame, TASK_FRAME_AXIS_NAMES
 from share.envs.utils import (
+    axis_to_index,
     check_task_frame_robot,
     check_delta_teleoperator,
     is_union_with_dict,
@@ -67,6 +68,10 @@ class PrimitiveEntryContext:
     target_primitive: str | None = None
     observation: dict[str, Any] = field(default_factory=dict)
     task_frame_origin: dict[str, list[float] | None] = field(default_factory=dict)
+    # Reason of the transition that caused this entry (e.g. "success", "time_limit"),
+    # or None for the initial episode-reset entry. Lets a primitive's on_entry branch
+    # on *why* it was entered without the generic net needing to know about it.
+    reason: str | None = None
 
 
 @dataclass
@@ -130,6 +135,7 @@ class EventConfig:
     """Mappings from teleop inputs to structured intervention events."""
 
     key_mapping: dict[TeleopEvents, dict | keyboard.Key] = field(default_factory=lambda: {})
+    pulse_events: tuple[TeleopEvents | str, ...] = ()
     foot_switch_mapping: dict[tuple[TeleopEvents], dict] = field(default_factory=lambda: {})
 
 
@@ -251,7 +257,12 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
 
         # events
         if self.processor.events.key_mapping:
-            action_pipeline_steps.append(AddKeyboardEventsAsInfoStep(mapping=self.processor.events.key_mapping))
+            action_pipeline_steps.append(
+                AddKeyboardEventsAsInfoStep(
+                    mapping=self.processor.events.key_mapping,
+                    pulse_events=self.processor.events.pulse_events,
+                )
+            )
 
         if self.processor.events.foot_switch_mapping:
             action_pipeline_steps.append(AddFootswitchEventsAsInfoStep(mapping=self.processor.events.foot_switch_mapping))
@@ -553,7 +564,8 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         # get initial obs features from robot_dict instead
         initial_features = {}
         for cam_key, cam in cameras.items():
-            initial_features[f"{OBS_IMAGES}.{cam_key}"] = PolicyFeature(type=FeatureType.VISUAL, shape=cam.async_read().shape)
+            img = cam.async_read(timeout_ms=10_000)
+            initial_features[f"{OBS_IMAGES}.{cam_key}"] = PolicyFeature(type=FeatureType.VISUAL, shape=img.shape)
 
         for name in robot_dict:
             for k, v in robot_dict[name].get_observation().items():
@@ -635,7 +647,13 @@ ManipulationPrimitiveConfig.register_subclass("primitive", ManipulationPrimitive
 @ManipulationPrimitiveConfig.register_subclass("zero_ft")
 @dataclass
 class ZeroFTPrimitiveConfig(ManipulationPrimitiveConfig):
-    """Scripted primitive that holds the entry pose, re-zeros F/T, and exits."""
+    """Scripted primitive that holds the entry pose, re-zeros F/T, and exits.
+
+    This is a dumb reusable node: entering it always re-zeros the sensor. Whether it
+    is entered at all is a graph decision -- e.g. route through it only on an operator
+    key press (see ``OnEvent``) so a reset while the arm is in lateral contact does not
+    null out the contact load and "stick" the arm to the geometry it was pushed against.
+    """
 
     settle_duration_s: float = 0.3
 
@@ -679,6 +697,10 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
 
     delta: list[float] | dict[str, list[float]] = field(default_factory=lambda: [0.0] * 6)
     delta_frame: Literal["world", "ee"] | dict[str, Literal["world", "ee_current"]] = "world"
+    # Axes that skip delta resolution and keep the task frame's configured (absolute)
+    # target instead, e.g. absolute_axes=["z", "rx", "ry", "rz"] with delta=0 moves
+    # straight down to a fixed z/orientation while holding the entry x/y.
+    absolute_axes: list[int | str] | dict[str, list[int | str]] = field(default_factory=list)
     publish_target_info: bool | dict[str, bool] = True
 
     def validate(self, robot_dict, teleop_dict):
@@ -692,6 +714,7 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
         robot_names = list(robot_dict)
         self.delta = copy_per_robot(self.delta, robot_names)
         self.delta_frame = copy_per_robot(self.delta_frame, robot_names)
+        self.absolute_axes = copy_per_robot(self.absolute_axes, robot_names)
         self.publish_target_info = copy_per_robot(self.publish_target_info, robot_names)
 
         for name, frame in self.task_frame.items():
@@ -699,6 +722,7 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
                 raise ValueError(f"move_delta primitives require TASK-space task frames, got '{name}'.")
             if len(self.delta[name]) != 6:
                 raise ValueError(f"move_delta delta for '{name}' must be a 6-vector.")
+            self.absolute_axes[name] = [axis_to_index(axis) for axis in self.absolute_axes[name]]
 
     def on_entry(self, env: ManipulationPrimitive, entry_context: PrimitiveEntryContext | None) -> None:
         """Resolve entry-time delta targets and publish them into the env.
@@ -726,8 +750,8 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
 
         Returns:
             A pair ``(start_pose, target_pose)`` in this primitive's task frame.
-            Fixed ``POS`` axes resolve from ``entry_pose + delta``; learnable
-            and non-``POS`` axes keep their configured targets.
+            Fixed ``POS`` axes resolve from ``entry_pose + delta``; learnable,
+            non-``POS``, and ``absolute_axes`` axes keep their configured targets.
         """
 
         # start pose (last obs from the previous primitive)
@@ -742,7 +766,7 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
             )
             resolved_target = world_pose_to_task_pose(target_world, frame.origin)
             target_pose[name] = [float(v) for v in frame.target]
-            fixed_pos_axes = self._fixed_pos_axes(frame)
+            fixed_pos_axes = [axis for axis in self._fixed_pos_axes(frame) if axis not in self.absolute_axes[name]]
             fixed_rotation_axes = [axis for axis in fixed_pos_axes if axis >= 3]
             for axis in fixed_pos_axes:
                 if axis >= 3 and len(fixed_rotation_axes) < 3:

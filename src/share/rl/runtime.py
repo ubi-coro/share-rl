@@ -134,23 +134,46 @@ def ensure_identity_features_map(primitive: Any) -> None:
         primitive.features_map.setdefault(key, key)
 
 
+def _drop_policy_excluded_images(primitive: Any, excluded_keys: tuple[str, ...]) -> None:
+    """Remove observation-only image keys from a primitive's policy features.
+
+    Some cameras are produced by the env for reasons other than the policy (e.g. the side
+    camera the LED success classifier reads). Envs list those keys via
+    ``policy_excluded_image_keys``; dropping them from ``features``/``features_map`` before the
+    policy is built keeps them out of the policy's input features -- and thus out of the encoder,
+    the replay-buffer state, and the actor's per-step policy observation -- while the env keeps
+    emitting them for the success detector.
+    """
+    if not excluded_keys:
+        return
+    features = getattr(primitive, "features", None)
+    features_map = getattr(primitive, "features_map", None)
+    for key in excluded_keys:
+        if features is not None:
+            features.pop(key, None)
+        if features_map is not None:
+            features_map.pop(key, None)
+
+
 def make_policies_for_registry(
     env_cfg: ManipulationPrimitiveNetConfig,
     registry: AdaptivePrimitiveRegistry,
     *,
     train_mode: bool,
 ) -> dict[str, SACPolicy]:
+    excluded_image_keys = tuple(getattr(env_cfg, "policy_excluded_image_keys", ()) or ())
     policies: dict[str, SACPolicy] = {}
     for primitive_id in registry.adaptive_ids:
         primitive = env_cfg.primitives[primitive_id]
         ensure_identity_features_map(primitive)
+        _drop_policy_excluded_images(primitive, excluded_image_keys)
         policy_cfg = copy.deepcopy(registry.policy_cfgs[primitive_id])
         policy = make_policy(cfg=policy_cfg, env_cfg=primitive)
         # `make_policy(..., env_cfg=...)` does not thread manual dataset stats into the
         # policy config, so we normalize that config here before any processor is built.
         resolved_dataset_stats = resolve_policy_dataset_stats(policy.config)
         if resolved_dataset_stats is not None:
-            policy.config.dataset_stats = resolved_dataset_stats
+            policy.config.dataset_stats = flatten_stats_for_config(resolved_dataset_stats)
         if train_mode:
             policy = policy.train()
         else:
@@ -223,6 +246,24 @@ def resolve_policy_dataset_stats(policy_cfg: SACConfig) -> dict[str, dict[str, A
         resolved_stats[feature_name] = reshaped_stats
 
     return resolved_stats or None
+
+
+def flatten_stats_for_config(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, list[float]]]:
+    """Flatten per-feature stats to plain float lists before storing them on a policy config.
+
+    `SACConfig.dataset_stats` is typed `dict[str, dict[str, list[float]]]` and gets
+    serialized into the checkpoint's `config.json`, so reshaped `[C, 1, 1]` image stats
+    must be flattened back to `[C]` or draccus cannot re-parse the saved config on
+    `PreTrainedConfig.from_pretrained`.
+    """
+
+    return {
+        feature_name: {
+            stat_key: torch.as_tensor(values, dtype=torch.float32).flatten().tolist()
+            for stat_key, values in feature_stats.items()
+        }
+        for feature_name, feature_stats in stats.items()
+    }
 
 
 def _reshape_feature_stats(stats: dict[str, Any], *, feature: Any) -> dict[str, Any]:

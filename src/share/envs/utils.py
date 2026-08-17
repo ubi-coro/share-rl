@@ -91,6 +91,7 @@ def env_to_dataset_features(env_features: dict[str, PolicyFeature]) -> dict:
 
     ds_features[REWARD] = {"dtype": "float32", "shape": (1,), "names": None}
     ds_features[DONE] = {"dtype": "bool", "shape": (1,), "names": None}
+    ds_features["rl.is_intervention"] = {"dtype": "bool", "shape": (1,), "names": None}
     return ds_features
 
 
@@ -135,6 +136,38 @@ def resolve_entry_start_pose(
     previous_origin = entry_context.task_frame_origin.get(robot_name)
     world_pose = task_pose_to_world_pose(observed_pose, previous_origin)
     return world_pose_to_task_pose(world_pose, frame.origin)
+
+
+def observed_task_frame_origins(
+        observation: dict[str, Any],
+        fallback: dict[str, list[float] | None],
+    ) -> dict[str, list[float] | None]:
+    """Resolve per-robot task-frame origins from observation-borne channels.
+
+    Robots that publish ``{name}.{axis}.task_frame_origin`` report the origin the
+    pose sample is actually expressed in, which is authoritative across origin
+    switches where the configured origin may not have reached the controller yet.
+    Robots without these channels fall back to the config-derived origin.
+
+    Args:
+        observation: Processed or raw observation dictionary.
+        fallback: Config-derived origins keyed by robot name (also defines which
+            robots to resolve).
+
+    Returns:
+        Per-robot origins as plain float lists (or the fallback value).
+    """
+    axis_names = ["x", "y", "z", "rx", "ry", "rz"]
+    origins: dict[str, list[float] | None] = {}
+    for name, fallback_origin in fallback.items():
+        origin: list[float] = []
+        for axis_name in axis_names:
+            value = observation.get(f"{name}.{axis_name}.task_frame_origin")
+            if value is None:
+                break
+            origin.append(float(value.item() if hasattr(value, "item") else value))
+        origins[name] = origin if len(origin) == 6 else fallback_origin
+    return origins
 
 
 def task_frame_origins(primitive: Any) -> dict[str, list[float] | None]:

@@ -3,6 +3,7 @@ import gc
 import os
 import time
 import enum
+import threading
 import multiprocessing as mp
 from dataclasses import dataclass, asdict, replace
 from multiprocessing.managers import SharedMemoryManager
@@ -40,6 +41,22 @@ class Command(enum.IntEnum):
     ZERO_FT = 4
 
 
+class MotionMode(enum.IntEnum):
+    """Which UR motion primitive is currently live on the controller.
+
+    Each mode has to be terminated before the next one starts. A servoL stream and an
+    in-flight moveL both stay live on the robot otherwise, and the stale trajectory
+    resumes as soon as whatever interrupted it ends -- e.g. driving straight to the last
+    moveL goal the moment force mode stops.
+    """
+
+    NONE = 0
+    FORCE = 1  # forceMode wrench streaming
+    SERVO = 2  # servoL streaming
+    MOVE = 3   # blocking moveL
+    JOINT = 4  # joint-space torque
+
+
 @dataclass
 class TaskFrameCommand(TaskFrame):
     """Controller command with user-facing rotational pose inputs in RPY.
@@ -61,6 +78,8 @@ class TaskFrameCommand(TaskFrame):
         "compliance_adaptive_limit_min",
         "rotation_interval_modes",
         "use_force_mode",
+        "force_mode_damping",
+        "simple_pose_use_servo",
     }
 
     @property
@@ -110,6 +129,10 @@ class TaskFrameCommand(TaskFrame):
             d["compliance_desired_wrench"] = np.asarray(raw_overrides.get("compliance_desired_wrench", [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])).astype(np.float64)
             d["compliance_adaptive_limit_min"] = np.asarray(raw_overrides.get("compliance_adaptive_limit_min", [0.1] * 6)).astype(np.float64)
             d["use_force_mode"] = bool(raw_overrides.get("use_force_mode", False))
+            d["force_mode_damping"] = float(raw_overrides.get("force_mode_damping", np.nan))
+            if np.isfinite(d["force_mode_damping"]) and not 0.0 <= d["force_mode_damping"] <= 1.0:
+                raise ValueError("force_mode_damping must be in [0, 1]")
+            d["simple_pose_use_servo"] = bool(raw_overrides.get("simple_pose_use_servo", False))
         except Exception as e:
             raise ValueError(f"TaskFrameCommand seems to be missing fields: {e}")
 
@@ -149,6 +172,12 @@ class RTDETaskFrameController(mp.Process):
           in RPY space but the controller operates internally on rot-vectors.
         - ``config.use_force_mode`` selects force mode (``True``) or simple pose mode (``False``).
         - Per-primitive switching is supported via ``controller_overrides={"use_force_mode": ...}``.
+        - ``controller_overrides={"simple_pose_use_servo": ...}`` picks the simple-pose call
+          per primitive. ``moveL`` blocks per control cycle, so it only suits ABSOLUTE
+          targets; a RELATIVE (velocity) target advances the virtual pose by a fraction of
+          a millimetre per cycle and needs ``servoL`` to be followed at all.
+        - Both flags default to ``False`` when a primitive omits them, so the ``config``
+          values only apply before the first command arrives.
 
     Attributes:
         config (URConfig): Runtime configuration (RTDE IP, gains, limits, etc.).
@@ -171,6 +200,8 @@ class RTDETaskFrameController(mp.Process):
         super().__init__(name="RTDETaskFrameController")
         self.config = config
         self.ready_event = mp.Event()  # “ready” event to signal when the loop has started successfully
+        self.stop_requested_event = mp.Event()
+        self.unexpected_exit_event = mp.Event()
         self.force_on = False  # are we currently in forceMode?
         self._receive_keys = [
             'ActualTCPPose',
@@ -199,6 +230,7 @@ class RTDETaskFrameController(mp.Process):
             example[key] = np.array(getattr(rtde_r, 'get' + key)())
         example["ActualTCPForceFiltered"] = np.array([0.0] * 6)
         example["SetTCPForce"] = np.array([0.0] * 6)
+        example["TaskFrameOrigin"] = np.array([0.0] * 6)
         example['timestamp'] = time.time()
         self.robot_out_rb = SharedMemoryRingBuffer.create_from_examples(
             shm_manager=config.shm_manager,
@@ -207,6 +239,31 @@ class RTDETaskFrameController(mp.Process):
             get_time_budget=0.4,
             put_desired_frequency=config.frequency
         )
+
+        self.wrench_monitor_rb = None
+        if self.config.wrench_monitor_enabled:
+            wrench_monitor_example = {
+                "wrench_monitor_sequence": np.int64(0),
+                "wrench_monitor_timestamp": 0.0,
+                "wrench_monitor_measured": np.zeros(6, dtype=np.float64),
+                "wrench_monitor_filtered": np.zeros(6, dtype=np.float64),
+                "wrench_monitor_nominal": np.zeros(6, dtype=np.float64),
+                "wrench_monitor_commanded": np.zeros(6, dtype=np.float64),
+                "wrench_monitor_adaptive_limit": np.zeros(6, dtype=np.float64),
+                "wrench_monitor_adaptive_scale": np.ones(6, dtype=np.float64),
+                "wrench_monitor_control_mode": np.zeros(6, dtype=np.int8),
+            }
+            wrench_monitor_max_samples = max(
+                2,
+                int(np.ceil(self.config.frequency * self.config.wrench_monitor_history_s)),
+            )
+            self.wrench_monitor_rb = SharedMemoryRingBuffer.create_from_examples(
+                shm_manager=config.shm_manager,
+                examples=wrench_monitor_example,
+                get_max_k=wrench_monitor_max_samples,
+                get_time_budget=0.05,
+                put_desired_frequency=config.frequency,
+            )
 
         # 3) Controller state: last TaskFrameCommand, task‐frame state, gains, etc.
         self._last_cmd = TaskFrameCommand(
@@ -233,6 +290,13 @@ class RTDETaskFrameController(mp.Process):
         self._resolve_compliance_settings(**self._last_cmd.controller_overrides)
         self._active_space: ControlSpace | None = None
         self._use_force_mode: bool = bool(self._last_cmd.controller_overrides.get("use_force_mode", self.config.use_force_mode))
+        self._use_servo: bool = bool(
+            self._last_cmd.controller_overrides.get("simple_pose_use_servo", self.config.simple_pose_use_servo)
+        )
+        self._motion_mode: MotionMode = MotionMode.NONE
+        self._applied_force_mode_damping: float | None = None
+        if getattr(self, "wrench_monitor_rb", None) is not None:
+            self._reset_wrench_monitor_command_metrics()
 
     # =========== launch & shutdown =============
     def connect(self):
@@ -246,8 +310,19 @@ class RTDETaskFrameController(mp.Process):
             wait (bool, optional): If True, block until the loop signals readiness.
         """
         super().start()
+        threading.Thread(
+            target=self._watch_process_exit,
+            name="RTDETaskFrameControllerExitWatcher",
+            daemon=True,
+        ).start()
         if wait:
             self.start_wait()
+
+    def _watch_process_exit(self) -> None:
+        """Report exits that bypass the controller process's cleanup handlers."""
+        self.join()
+        if not self.stop_requested_event.is_set():
+            self.unexpected_exit_event.set()
 
     def stop(self, wait=True):
         """Request a graceful shutdown of the control loop.
@@ -255,6 +330,7 @@ class RTDETaskFrameController(mp.Process):
         Args:
             wait (bool, optional): If True, join the process before returning.
         """
+        self.stop_requested_event.set()
         # Send a STOP command
         stop_cmd = replace(self._last_cmd)
         stop_cmd.cmd = Command.STOP
@@ -346,6 +422,14 @@ class RTDETaskFrameController(mp.Process):
 
     # ========= main loop in process ============
     def run(self):
+        """Run the controller and report any exit not initiated by ``stop()``."""
+        try:
+            self._run_control_loop()
+        finally:
+            if not self.stop_requested_event.is_set():
+                self.unexpected_exit_event.set()
+
+    def _run_control_loop(self):
         """Run the RTDE control loop until a stop command or transport failure.
 
         The loop follows one fixed order on every iteration: apply pending
@@ -376,6 +460,7 @@ class RTDETaskFrameController(mp.Process):
             keep_running = True
             iter_idx = 0
             perf = self._init_perf_tracking(dt)
+            next_debug_time = time.monotonic()
 
             while keep_running:
                 t_loop_start = rtde_c.initPeriod()
@@ -450,6 +535,17 @@ class RTDETaskFrameController(mp.Process):
                 section_start = time.monotonic()
                 self._send_output_command(active_space, rtde_c, wrench_F, torque_cmd, x_cmd)
                 perf["sec_wins"]["forcemode"].add(time.monotonic() - section_start)
+
+                self._publish_wrench_monitor_sample(
+                    sequence=iter_idx,
+                    raw_measured_wrench=current_state["ActualTCPForce"],
+                    filtered_measured_wrench=measured_wrench_F,
+                    commanded_wrench=wrench_F,
+                )
+
+                if self.config.debug and t_iter0 >= next_debug_time:
+                    self._print_controller_state(pose_F=pose_F, x_cmd=x_cmd, v_F=v_F)
+                    next_debug_time = t_iter0 + 1.0 / float(self.config.debug_hz)
 
                 compute_time = time.monotonic() - t_iter0
                 perf["compute_win"].add(compute_time)
@@ -588,7 +684,7 @@ class RTDETaskFrameController(mp.Process):
                 control_mode_i = ControlMode(self.control_mode[i])
                 delta_mode_i = DeltaMode(self.delta_mode[i])
                 if control_mode_i == ControlMode.POS and delta_mode_i == DeltaMode.ABSOLUTE:
-                    if not self._use_force_mode and self.config.simple_pose_use_servo:
+                    if not self._use_force_mode and self._use_servo:
                         max_step = float(self.config.simple_pose_max_speed[i]) * dt
                         x_cmd[i] += float(np.clip(float(self.target[i]) - x_cmd[i], -max_step, max_step))
                     else:
@@ -623,6 +719,8 @@ class RTDETaskFrameController(mp.Process):
         qd_actual: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Compute the wrench or torque command for the active control space."""
+        if getattr(self, "wrench_monitor_rb", None) is not None:
+            self._reset_wrench_monitor_command_metrics()
         wrench_F = np.zeros(6, dtype=np.float64)
         torque_cmd = np.zeros(6, dtype=np.float64)
         if active_space == ControlSpace.TASK and self._use_force_mode:
@@ -639,6 +737,44 @@ class RTDETaskFrameController(mp.Process):
                 qd_actual=qd_actual,
             )
         return wrench_F, torque_cmd
+
+    def _reset_wrench_monitor_command_metrics(self) -> None:
+        """Reset per-cycle wrench diagnostics before computing the next output."""
+        self._wrench_monitor_nominal = np.zeros(6, dtype=np.float64)
+        self._wrench_monitor_adaptive_scale = np.ones(6, dtype=np.float64)
+        self._wrench_monitor_adaptive_limit = np.asarray(
+            self.wrench_limits,
+            dtype=np.float64,
+        ).copy()
+
+    def _publish_wrench_monitor_sample(
+        self,
+        *,
+        sequence: int,
+        raw_measured_wrench: np.ndarray,
+        filtered_measured_wrench: np.ndarray,
+        commanded_wrench: np.ndarray,
+    ) -> None:
+        """Publish one coherent control-cycle sample without delaying control."""
+        if getattr(self, "wrench_monitor_rb", None) is None:
+            return
+
+        sample = {
+            "wrench_monitor_sequence": np.int64(sequence),
+            "wrench_monitor_timestamp": time.monotonic(),
+            "wrench_monitor_measured": np.asarray(raw_measured_wrench, dtype=np.float64),
+            "wrench_monitor_filtered": np.asarray(filtered_measured_wrench, dtype=np.float64),
+            "wrench_monitor_nominal": self._wrench_monitor_nominal,
+            "wrench_monitor_commanded": np.asarray(commanded_wrench, dtype=np.float64),
+            "wrench_monitor_adaptive_limit": self._wrench_monitor_adaptive_limit,
+            "wrench_monitor_adaptive_scale": self._wrench_monitor_adaptive_scale,
+            "wrench_monitor_control_mode": np.asarray(self.control_mode, dtype=np.int8),
+        }
+        try:
+            self.wrench_monitor_rb.put(sample, wait=False)
+        except TimeoutError:
+            # Visualization is diagnostic only and must never delay the control loop.
+            return
 
     def _send_output_command(
         self,
@@ -676,6 +812,27 @@ class RTDETaskFrameController(mp.Process):
         is_compute_spike = compute_time > perf["spike_compute_s"]
         if self.config.verbose and (is_dt_spike or is_compute_spike):
             self._log_perf_spike(perf, iter_idx, dt_loop, compute_time, n_cmd)
+
+    def _print_controller_state(
+        self,
+        *,
+        pose_F: np.ndarray,
+        x_cmd: np.ndarray,
+        v_F: np.ndarray,
+    ) -> None:
+        """Print one compact, rate-limited snapshot of task-space controller state."""
+        def values(value: np.ndarray) -> str:
+            return np.array2string(
+                np.asarray(value), precision=4, suppress_small=True, separator=","
+            )
+
+        print(
+            f"[UR CTRL] mode={self._motion_mode.name} "
+            f"force={int(self._use_force_mode)} servo={int(self._use_servo)} "
+            f"actual={values(pose_F)} cmd={values(x_cmd)} "
+            f"target={values(self.target)} speed={values(v_F)}",
+            flush=True,
+        )
 
     def _log_perf_summary(self, perf: dict[str, Any]) -> None:
         """Print a short rolling summary of loop timing and hottest sections."""
@@ -792,7 +949,16 @@ class RTDETaskFrameController(mp.Process):
 
             wrench_F[i] = self.kp[i] * e + self.kd[i] * edot
 
-        self.apply_wrench_bounds(pose_F, desired_wrench=wrench_F, measured_wrench=measured_wrench_F)
+        if getattr(self, "wrench_monitor_rb", None) is not None:
+            self._wrench_monitor_nominal = wrench_F.copy()
+        adaptive_scale, adaptive_limit = self.apply_wrench_bounds(
+            pose_F,
+            desired_wrench=wrench_F,
+            measured_wrench=measured_wrench_F,
+        )
+        if getattr(self, "wrench_monitor_rb", None) is not None:
+            self._wrench_monitor_adaptive_scale = adaptive_scale
+            self._wrench_monitor_adaptive_limit = adaptive_limit
         return wrench_F
 
     def _send_task_wrench(self, rtde_c, wrench_F: np.ndarray) -> None:
@@ -821,7 +987,7 @@ class RTDETaskFrameController(mp.Process):
     def _send_task_pose(self, rtde_c, pose_task: np.ndarray) -> None:
         """Send a task-frame pose command via moveL or servoL (no force mode)."""
         pose_world = self._task_pose_to_world_pose(pose_task)
-        if self.config.simple_pose_use_servo:
+        if self._use_servo:
             rtde_c.servoL(
                 pose_world.tolist(),
                 0.0,
@@ -915,6 +1081,7 @@ class RTDETaskFrameController(mp.Process):
             self.min_pose = single["min_pose"].copy()
             self._resolve_compliance_settings(**single)
             self._use_force_mode = bool(single["use_force_mode"])
+            self._use_servo = bool(single["simple_pose_use_servo"])
 
             pose_F = self.read_current_state(rtde_r)["ActualTCPPose"]
             q_now = np.array(rtde_r.getActualQ(), dtype=np.float64)
@@ -945,13 +1112,56 @@ class RTDETaskFrameController(mp.Process):
 
             self.control_mode = new_control_mode.copy()
             self.delta_mode = new_delta_mode.copy()
-            if new_space == ControlSpace.TASK and self._use_force_mode and not self.force_on:
-                self._enter_task_force_mode(rtde_c)
-            elif not self._use_force_mode and self.force_on:
-                rtde_c.forceModeStop()
-                self.force_on = False
+            self._apply_motion_mode(rtde_c, new_space)
 
         return keep_running, active_space, x_cmd, q_cmd
+
+    def _resolve_motion_mode(self, space: ControlSpace) -> MotionMode:
+        """Pick the motion mode implied by the active space and the current overrides."""
+        if space != ControlSpace.TASK:
+            return MotionMode.JOINT
+        if self._use_force_mode:
+            return MotionMode.FORCE
+        return MotionMode.SERVO if self._use_servo else MotionMode.MOVE
+
+    def _stop_motion_mode(self, rtde_c, mode: MotionMode) -> None:
+        """Terminate a live motion mode so it cannot resume later."""
+        if mode == MotionMode.FORCE:
+            if self.force_on:
+                rtde_c.forceModeStop()
+                self.force_on = False
+        elif mode == MotionMode.SERVO:
+            if hasattr(rtde_c, "servoStop"):
+                rtde_c.servoStop()
+        elif mode == MotionMode.MOVE:
+            if hasattr(rtde_c, "stopL"):
+                rtde_c.stopL(float(self.config.simple_pose_stop_accel))
+
+    def _apply_motion_mode(self, rtde_c, space: ControlSpace) -> None:
+        """Switch motion mode, stopping the previous one before starting the next.
+
+        Primitives change ``use_force_mode``/``simple_pose_use_servo`` mid-graph, so this
+        runs on every command. Skipping the stop leaves the old primitive live on the
+        robot: an interrupted moveL resumes and drives to its stale goal once force mode
+        ends, and a servoL stream keeps fighting whatever replaced it.
+        """
+        mode = self._resolve_motion_mode(space)
+        mode_changed = mode != self._motion_mode
+        if mode_changed:
+            self._stop_motion_mode(rtde_c, self._motion_mode)
+
+        if mode == MotionMode.FORCE and np.isfinite(self._force_mode_damping) and (
+            self._applied_force_mode_damping is None
+            or not np.isclose(self._applied_force_mode_damping, self._force_mode_damping)
+        ):
+            rtde_c.forceModeSetDamping(self._force_mode_damping)
+            self._applied_force_mode_damping = self._force_mode_damping
+        if not mode_changed:
+            return
+
+        if mode == MotionMode.FORCE:
+            self._enter_task_force_mode(rtde_c)
+        self._motion_mode = mode
 
     def _resolve_compliance_settings(
         self,
@@ -963,6 +1173,7 @@ class RTDETaskFrameController(mp.Process):
         compliance_desired_wrench,
         compliance_adaptive_limit_min,
         rotation_interval_modes,
+        force_mode_damping=np.nan,
         **kwargs
     ):
         """Normalize active compliance settings and compute derived adaptive scales."""
@@ -975,6 +1186,7 @@ class RTDETaskFrameController(mp.Process):
         self.compliance_adaptive_limit_min = np.asarray(compliance_adaptive_limit_min, dtype=np.float64).copy()
         self.compliance_adaptive_limit_theta = np.zeros(6, dtype=np.float64)
         self.rotation_interval_modes = rotation_interval_modes
+        self._force_mode_damping = float(force_mode_damping)
 
         for axis in range(6):
             if not self.compliance_adaptive_limit_enable[axis]:
@@ -1037,7 +1249,7 @@ class RTDETaskFrameController(mp.Process):
 
         if np.any(mask_abs_pos):
             rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
-            if not self._use_force_mode and self.config.simple_pose_use_servo:
+            if not self._use_force_mode and self._use_servo:
                 for j in range(3):
                     if mask_abs_pos[j]:
                         max_step = float(self.config.simple_pose_max_speed[3 + j]) * dt
@@ -1118,18 +1330,10 @@ class RTDETaskFrameController(mp.Process):
     def _cleanup_rtde(self, rtde_c, rtde_r) -> None:
         """Best-effort shutdown of RTDE control mode, script, and connections."""
         try:
-            if self._use_force_mode and self.force_on:
-                rtde_c.forceModeStop()
-        except Exception:
-            pass
-        try:
-            if not self._use_force_mode and self.config.simple_pose_use_servo and hasattr(rtde_c, "servoStop"):
-                rtde_c.servoStop()
-        except Exception:
-            pass
-        try:
-            if not self._use_force_mode and not self.config.simple_pose_use_servo and hasattr(rtde_c, "stopL"):
-                rtde_c.stopL()
+            # Whatever is live has to be stopped, or the arm keeps executing it after we
+            # let go of the connection.
+            self._stop_motion_mode(rtde_c, self._motion_mode)
+            self._motion_mode = MotionMode.NONE
         except Exception:
             pass
         try:
@@ -1152,7 +1356,8 @@ class RTDETaskFrameController(mp.Process):
             rtde_r: `RTDEReceiveInterface` (or mock) used to query current state.
 
         Returns:
-            dict: ``{'ActualTCPPose','ActualTCPSpeed','ActualTCPForce'}`` in task frame.
+            dict: ``{'ActualTCPPose','ActualTCPSpeed','ActualTCPForce'}`` in task frame,
+            plus ``'TaskFrameOrigin'`` (the applied origin, rotational part as rotvec).
         """
         # 1) get the world→frame 4×4
         T = np.linalg.inv(sixvec_to_homogeneous(self.origin))
@@ -1202,7 +1407,10 @@ class RTDETaskFrameController(mp.Process):
         return {
             "ActualTCPPose": pose_F,
             "ActualTCPSpeed": v_F,
-            "ActualTCPForce": wrench_F
+            "ActualTCPForce": wrench_F,
+            # Origin (internal rotvec form) the sample is expressed in, so consumers
+            # can pair pose and frame atomically across origin switches.
+            "TaskFrameOrigin": np.asarray(self.origin, dtype=np.float64).copy(),
         }
 
     def clip_pose(self, pose: np.ndarray) -> np.ndarray:
@@ -1231,7 +1439,12 @@ class RTDETaskFrameController(mp.Process):
         out[3:6] = euler_xyz_to_rotvec(rpy)
         return out
 
-    def apply_wrench_bounds(self, pose: np.ndarray, desired_wrench: np.ndarray, measured_wrench: np.ndarray):
+    def apply_wrench_bounds(
+        self,
+        pose: np.ndarray,
+        desired_wrench: np.ndarray,
+        measured_wrench: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Contact-aware wrench limiting and boundary protection (in-place).
 
         Zeroes or scales components that would push the TCP further outside
@@ -1241,6 +1454,9 @@ class RTDETaskFrameController(mp.Process):
             pose (np.ndarray): Current task-frame pose (6,).
             desired_wrench (np.ndarray): Computed wrench to be bounded (modified).
             measured_wrench (np.ndarray): Measured task-frame wrench from RTDE.
+
+        Returns:
+            Adaptive scale and positive wrench-limit magnitude for each axis.
         """
 
         scale_vec = np.array([1.0] * 6)
@@ -1320,6 +1536,8 @@ class RTDETaskFrameController(mp.Process):
 
             # Contact limits cap the nominal command, but the boundary spring must
             # be allowed to push harder inward after the robot has left its box.
+
+        return scale_vec, scaled_wrench_limits
 
     def clip_reference_errors(self, e: float, edot: float, i: int) -> tuple[float, float]:
         """

@@ -17,7 +17,8 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-from lerobot.teleoperators import TeleoperatorConfig, TeleopEvents
+from lerobot.teleoperators import TeleoperatorConfig
+from share.teleoperators import TeleopEvents
 
 
 @TeleoperatorConfig.register_subclass("spacemouse")

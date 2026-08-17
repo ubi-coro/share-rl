@@ -56,7 +56,7 @@ from share.utils.logging_utils import primary_loss
 
 @parser.wrap()
 def train_cli(cfg: MPNetTrainRLServerPipelineConfig):
-    cfg.validate()
+    cfg.validate(output_role="learner")
     run_learner(cfg)
 
 
@@ -78,10 +78,22 @@ def run_learner(cfg: MPNetTrainRLServerPipelineConfig, shutdown_event: Any | Non
     init_logging(log_file=log_file, display_pid=not is_threaded)
     logging.info("Learner logging initialized, writing to %s", log_file)
 
-    if cfg.wandb.enable and cfg.wandb.project:
-        wandb_logger: WandBLogger | None = WandBLogger(cfg)
+    wandb_logger: WandBLogger | None = None
+    if not cfg.wandb.enable:
+        logging.info("[LEARNER] wandb disabled (cfg.wandb.enable=False); no run will be created.")
+    elif not cfg.wandb.project:
+        logging.warning("[LEARNER] wandb enabled but cfg.wandb.project is empty; skipping wandb run.")
     else:
-        wandb_logger = None
+        try:
+            # WandBLogger calls wandb.init(config=cfg.to_dict()); to_dict() cannot encode the
+            # live robot handles carried on cfg.env, so clear them for the duration exactly as
+            # checkpoint serialization does. Guard the whole thing so a wandb failure degrades
+            # to "train without logging" instead of silently leaving no run.
+            with _checkpoint_safe_runtime_config(cfg):
+                wandb_logger = WandBLogger(cfg)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("[LEARNER] Failed to initialize wandb run, continuing without it: %s", exc)
+            wandb_logger = None
 
     set_seed(cfg.seed)
 
@@ -166,9 +178,15 @@ def add_actor_information_and_train(
             policies = make_policies_for_registry(cfg.env, registry, train_mode=True)
             # Reuse the exact same policy preprocessor stack as the actor so replay
             # training and live inference see identically normalized inputs.
-            preprocessors, _ = make_policy_processors(policies)
+            preprocessors, postprocessors = make_policy_processors(policies)
         finally:
             mp_net.close()
+
+    # The env above connected to the robot/cameras only to read feature shapes, and closing it
+    # frees the RTDE registers. The actor grabs the same robot, so it must not start until this
+    # point -- tools/setup_connector.sh waits for this marker before launching the actor. Keep
+    # the token in sync with that script.
+    logging.info("[LEARNER] ROBOT_RELEASED: features captured, robot free for the actor.")
 
     optimizers = {primitive_id: make_optimizers(policy) for primitive_id, policy in policies.items()}
     resume_optimization_steps, resume_interaction_steps = load_training_state(
@@ -311,6 +329,8 @@ def add_actor_information_and_train(
                     optimizers=optimizers[primitive_id],
                     replay_buffer=replay_buffer,
                     fps=cfg.env.fps,
+                    preprocessor=preprocessors.get(primitive_id),
+                    postprocessor=postprocessors.get(primitive_id),
                 )
 
         if time.time() - last_push_t >= push_period_s:
@@ -862,6 +882,8 @@ def save_training_checkpoint(
     optimizers: dict[str, Optimizer],
     replay_buffer: ReplayBuffer,
     fps: int,
+    preprocessor: Any | None = None,
+    postprocessor: Any | None = None,
 ) -> None:
     primitive_output_dir = Path(cfg.output_dir) / primitive_id
     checkpoint_dir = get_step_checkpoint_dir(primitive_output_dir, online_steps, optimization_step)
@@ -874,6 +896,8 @@ def save_training_checkpoint(
                 policy=policy,
                 optimizer=optimizers,
                 scheduler=None,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
             )
     except Exception as exc:  # noqa: BLE001
         logging.warning(
