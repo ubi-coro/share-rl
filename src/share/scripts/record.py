@@ -24,6 +24,7 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 from share.configs.record import RecordConfig
+from share.debug.ee_pose_rerun import EEPoseRerunVisualizer
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
 from share.teleoperators import TeleopEvents, has_event, is_intervention
@@ -218,7 +219,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         save_env_config_snapshot(cfg.env, cfg.dataset.root)
     force_intervention = not cfg.use_policy
     mp_net.set_step_info({TeleopEvents.IS_INTERVENTION: True} if force_intervention else None)
-    debugger = None
+    debugger = EEPoseRerunVisualizer(session_name="record_ee_pose") if cfg.visualize_ee else None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
 
     try:
@@ -267,7 +268,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 else:
                     log_say("Dataset is empty, continue execution", cfg.play_sounds, blocking=True)
     finally:
-        #debugger.close()
+        if debugger is not None:
+            debugger.close()
         log_say("Stop recording", cfg.play_sounds, blocking=True)
         mp_net.close()
 
