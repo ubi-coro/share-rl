@@ -1,9 +1,10 @@
-"""Test-local shims for share env tests.
+"""Shared test shims, loaded before any test file in this tree.
 
-These tests exercise config and processor logic in headless CI environments, so
-we replace ``pynput`` with a tiny stub before modules under ``share.envs`` are
-imported. The production code only needs ``keyboard.Key.*`` constants for type
-annotations and static event mappings in config objects.
+Tests exercise config/processor logic in headless environments, so pynput is replaced with a
+tiny stub before anything imports it -- production code only needs keyboard.Key.* constants
+for type annotations and static event mappings, plus a Listener it can construct and start().
+Must live at the tests/ root (not per-subdirectory) so it installs before any test module's
+own eager `from pynput import keyboard` can load the real package first.
 """
 
 from __future__ import annotations

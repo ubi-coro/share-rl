@@ -2,28 +2,17 @@
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import sys
-from pathlib import Path
 
 import pytest
 
-
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "experiments" / "envs" / "fiddle_out.py"
-_SPEC = importlib.util.spec_from_file_location("fiddle_out_experiment", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-
-DemoUR3eTeleopFiddleOutEnvConfig = _MODULE.DemoUR3eTeleopFiddleOutEnvConfig
-EEFiddleOutCirclePrimitiveConfig = _MODULE.EEFiddleOutCirclePrimitiveConfig
-OnSuccess = _MODULE.OnSuccess
-OnTargetPoseReached = _MODULE.OnTargetPoseReached
-TaskFrame = _MODULE.TaskFrame
-ControlMode = _MODULE.ControlMode
-ControlSpace = _MODULE.ControlSpace
+from experiments.envs.fiddle_out import (
+    DemoUR3eTeleopFiddleOutEnvConfig,
+    EEFiddleOutCirclePrimitiveConfig,
+)
+from share.envs.manipulation_primitive.config_manipulation_primitive import OpenLoopTrajectorySpec
+from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, TaskFrame
+from share.envs.manipulation_primitive_net.transitions import OnSuccess, OnTargetPoseReached
 
 
 def test_demo_fiddle_out_config_builds_expected_graph():
@@ -50,7 +39,7 @@ def test_fiddle_out_circle_target_pose_applies_xy_circle_and_local_z_lift():
     """The scripted target should draw an EE-frame XY circle while ramping local Z."""
     primitive = EEFiddleOutCirclePrimitiveConfig(
         task_frame={"main": TaskFrame(target=[0.0] * 6, origin=[0.0] * 6)},
-        trajectory=_MODULE.OpenLoopTrajectorySpec(
+        trajectory=OpenLoopTrajectorySpec(
             delta={"main": [0.0, 0.0, -0.02, 0.0, 0.0, 0.0]},
             frame={"main": "ee"},
             duration_s={"main": 1.0},
