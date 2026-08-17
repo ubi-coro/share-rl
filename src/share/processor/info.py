@@ -1,3 +1,5 @@
+import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -166,6 +168,40 @@ class AddFootswitchEventsAsInfoStep(InfoProcessorStep):
             handler.stop()
 
 
+# Every primitive's action pipeline is built eagerly at MP-Net construction, so each
+# AddKeyboardEventsAsInfoStep used to spawn its own pynput.Listener, all fighting over the
+# same keyboard. Share one process-wide listener instead; per-instance mapping/state unchanged.
+_keyboard_listener_lock = threading.Lock()
+_keyboard_listener: Any = None
+_KEYBOARD_LISTENERS: "weakref.WeakValueDictionary[int, AddKeyboardEventsAsInfoStep]" = weakref.WeakValueDictionary()
+
+
+def _dispatch_keyboard_press(key) -> None:
+    # list() snapshot: atomic under the GIL, avoids mutation-during-iteration
+    for step in list(_KEYBOARD_LISTENERS.values()):
+        step._on_key_press(key)
+
+
+def _dispatch_keyboard_release(key) -> None:
+    for step in list(_KEYBOARD_LISTENERS.values()):
+        step._on_key_release(key)
+
+
+def _ensure_keyboard_listener() -> None:
+    global _keyboard_listener
+    if _keyboard_listener is not None:
+        return
+    with _keyboard_listener_lock:
+        if _keyboard_listener is not None:
+            return
+        from pynput import keyboard
+
+        listener = keyboard.Listener(on_press=_dispatch_keyboard_press, on_release=_dispatch_keyboard_release)
+        listener.daemon = True
+        listener.start()
+        _keyboard_listener = listener
+
+
 @ProcessorStepRegistry.register("add_keyboard_events_as_info")
 @dataclass
 class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
@@ -177,42 +213,30 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
         self._pressed = {event: False for event in self.mapping}
         self._is_string_key = {event: isinstance(mapping_key, str) for event, mapping_key in self.mapping.items()}
 
-        from pynput import keyboard
+        _ensure_keyboard_listener()
+        _KEYBOARD_LISTENERS[id(self)] = self
 
-        def on_press(key):
-            for event, mapping_key in self.mapping.items():
-                try:
-                    if self._is_string_key[event]:
-                        if key.char == mapping_key:
-                            if event not in self.pulse_events or not self._pressed[event]:
-                                self._events[event] = True
-                            self._pressed[event] = True
-                    else:
-                        if key == mapping_key:
-                            if event not in self.pulse_events or not self._pressed[event]:
-                                self._events[event] = True
-                            self._pressed[event] = True
-                except Exception:
-                    ...
+    def _on_key_press(self, key) -> None:
+        for event, mapping_key in self.mapping.items():
+            try:
+                matched = key.char == mapping_key if self._is_string_key[event] else key == mapping_key
+                if matched:
+                    if event not in self.pulse_events or not self._pressed[event]:
+                        self._events[event] = True
+                    self._pressed[event] = True
+            except Exception:
+                ...
 
-        def on_release(key):
-            for event, mapping_key in self.mapping.items():
-                try:
-                    if self._is_string_key[event]:
-                        if key.char == mapping_key:
-                            self._pressed[event] = False
-                            if event not in self.pulse_events:
-                                self._events[event] = False
-                    else:
-                        if key == mapping_key:
-                            self._pressed[event] = False
-                            if event not in self.pulse_events:
-                                self._events[event] = False
-                except Exception:
-                    ...
-
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.start()
+    def _on_key_release(self, key) -> None:
+        for event, mapping_key in self.mapping.items():
+            try:
+                matched = key.char == mapping_key if self._is_string_key[event] else key == mapping_key
+                if matched:
+                    self._pressed[event] = False
+                    if event not in self.pulse_events:
+                        self._events[event] = False
+            except Exception:
+                ...
 
     def info(self, info: dict) -> dict:
         new_info = dict(info)
@@ -230,6 +254,3 @@ class AddKeyboardEventsAsInfoStep(InfoProcessorStep):
     def reset(self) -> None:
         self._events = {event: False for event in self.mapping}
         self._pressed = {event: False for event in self.mapping}
-
-    def __del__(self):
-        self._listener.stop()

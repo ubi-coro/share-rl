@@ -18,18 +18,47 @@ def _install_pynput_keyboard_stub() -> None:
 
     keyboard_module = types.ModuleType("pynput.keyboard")
 
+    class _KeySentinel:
+        """Non-str marker so isinstance(Key.x, str) is False, like real pynput."""
+
+        def __init__(self, name: str):
+            self._name = name
+
+        def __repr__(self) -> str:
+            return f"Key.{self._name}"
+
     class Key:
-        left = "left"
-        right = "right"
-        up = "up"
-        down = "down"
-        enter = "enter"
-        shift = "shift"
-        shift_r = "shift_r"
-        ctrl_l = "ctrl_l"
-        ctrl_r = "ctrl_r"
+        left = _KeySentinel("left")
+        right = _KeySentinel("right")
+        up = _KeySentinel("up")
+        down = _KeySentinel("down")
+        enter = _KeySentinel("enter")
+        shift = _KeySentinel("shift")
+        shift_r = _KeySentinel("shift_r")
+        ctrl_l = _KeySentinel("ctrl_l")
+        ctrl_r = _KeySentinel("ctrl_r")
+        space = _KeySentinel("space")
 
     keyboard_module.Key = Key
+
+    class Listener:
+        """Inert stand-in for pynput.keyboard.Listener -- no real OS hook, no thread."""
+
+        def __init__(self, on_press=None, on_release=None):
+            self.on_press = on_press
+            self.on_release = on_release
+            self.daemon = False
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    keyboard_module.Listener = Listener
 
     pynput_module = types.ModuleType("pynput")
     pynput_module.keyboard = keyboard_module
