@@ -422,17 +422,24 @@ class InterventionActionProcessorStep(ProcessorStep):
                 for teleop_name, teleop in self.teleoperators.items():
                     teleop.send_feedback(self._map_to_teleop_action(source_actions, teleop_name))
 
+        # a robot missing from source_actions (e.g. no live teleoperator) falls back to its policy action
+        resolved_source_actions = {
+            name: source_actions.get(name, policy_actions.get(name, {}))
+            for name in self.task_frame
+        }
+
         full_action_dict: dict[str, dict[str, float]] = {}
         for name, frame in self.task_frame.items():
-            full_action = self._project_policy_action(frame, source_actions[name])
-            if self.gripper_enable[name] and f"{GRIPPER_KEY}.pos" in source_actions[name]:
-                full_action[f"{GRIPPER_KEY}.pos"] = source_actions[name][f"{GRIPPER_KEY}.pos"]
+            robot_source_action = resolved_source_actions[name]
+            full_action = self._project_policy_action(frame, robot_source_action)
+            if self.gripper_enable[name] and f"{GRIPPER_KEY}.pos" in robot_source_action:
+                full_action[f"{GRIPPER_KEY}.pos"] = robot_source_action[f"{GRIPPER_KEY}.pos"]
             elif self.gripper_static_pos.get(name, None) is not None:
                 full_action[f"{GRIPPER_KEY}.pos"] = self.gripper_static_pos[name]
             full_action_dict[name] = full_action
 
         complementary_data[TELEOP_ACTION_KEY] = flatten_nested_policy_action(
-            source_actions,
+            resolved_source_actions,
             task_frame=self.task_frame,
             gripper_enable=self.gripper_enable,
             like=policy_actions,

@@ -1,8 +1,10 @@
 import copy
+import importlib
 import time
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal
 
+import draccus
 from draccus import ChoiceRegistry
 from pynput import keyboard
 
@@ -175,6 +177,17 @@ class OpenLoopTrajectorySpec:
     duration_s: float | dict[str, float] = 1.0
 
 
+# draccus has no built-in encoder for `type` (needed by env_class below); round-trip it as a
+# dotted path so config_ur.py-style snapshotting doesn't crash.
+draccus.encode.register(type, lambda cls: f"{cls.__module__}.{cls.__qualname__}")
+draccus.decode.register(
+    type,
+    lambda dotted_path, _t=None: getattr(
+        importlib.import_module(dotted_path.rpartition(".")[0]), dotted_path.rpartition(".")[2]
+    ),
+)
+
+
 @dataclass
 class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     """Shared config and entry hooks for one primitive in an MP-Net."""
@@ -187,8 +200,20 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     task_description: str | None = None
     target_pose_info_key: str | None = PRIMITIVE_TARGET_POSE_INFO_KEY
 
+    # Routes a target robot name to a different source teleoperator, e.g. reusing one
+    # physical device across primitives. Unmapped robots keep their identity lookup.
+    # Resolved by ManipulationPrimitiveNet before make(); direct callers must call
+    # resolve_teleop_dict() themselves.
+    teleop_mapping: dict[str, str] | None = None
+
+    # ManipulationPrimitive subclass to instantiate in make(). Set env_kwargs for extra ctor
+    # args. Ignored by configs that override make() with their own env class.
+    env_class: type[ManipulationPrimitive] = ManipulationPrimitive
+    env_kwargs: dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self):
         self._kinematics_solver = {}
+        self._has_teleop: dict[str, bool] = {}
 
         if isinstance(self.policy, str):
             policy_path = self.policy
@@ -212,6 +237,29 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         else:
             return len([ft for ft in self.features.values() if ft.type == FeatureType.VISUAL])
 
+    def resolve_teleop_dict(self, teleop_dict: dict[str, Teleoperator]) -> dict[str, Teleoperator]:
+        """Apply ``teleop_mapping`` on top of the identity robot->teleoperator lookup.
+
+        Args:
+            teleop_dict: Connected teleoperators keyed by their own name.
+
+        Returns:
+            ``teleop_dict`` unchanged if ``teleop_mapping`` is empty, otherwise a copy with
+            each mapped target robot name pointing at its configured source teleoperator.
+        """
+        if not self.teleop_mapping:
+            return teleop_dict
+
+        resolved = dict(teleop_dict)
+        for target, source in self.teleop_mapping.items():
+            if source not in teleop_dict:
+                raise ValueError(
+                    f"teleop_mapping references unknown teleoperator '{source}' for target "
+                    f"'{target}'. Available: {sorted(teleop_dict)}."
+                )
+            resolved[target] = teleop_dict[source]
+        return resolved
+
     def make(
         self,
         robot_dict: dict[str, Robot],
@@ -223,7 +271,9 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
 
         Args:
             robot_dict: Connected robot handles keyed by primitive robot name.
-            teleop_dict: Connected teleoperators keyed by robot name.
+            teleop_dict: Connected teleoperators keyed by robot name. Callers that don't
+                already route through ``ManipulationPrimitiveNet`` must apply
+                ``resolve_teleop_dict()`` themselves first.
             cameras: Connected camera handles available to the primitive.
             device: Torch device used by observation-side processors.
 
@@ -234,8 +284,19 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         self.validate(robot_dict, teleop_dict)
         self.infer_features(robot_dict, cameras)  # todo: fix initial_features
 
+        reserved_env_kwargs = {"task_frame", "robot_dict", "cameras", "display_cameras"}
+        if overlap := reserved_env_kwargs & set(self.env_kwargs):
+            raise ValueError(f"env_kwargs must not override reserved constructor args: {sorted(overlap)}")
+
         display_cameras = self.processor.image_preprocessing is not None and self.processor.image_preprocessing.display_cameras
-        env = ManipulationPrimitive(task_frame=self.task_frame, robot_dict=robot_dict, cameras=cameras, display_cameras=display_cameras)
+        env_cls = self.env_class or ManipulationPrimitive
+        env = env_cls(
+            task_frame=self.task_frame,
+            robot_dict=robot_dict,
+            cameras=cameras,
+            display_cameras=display_cameras,
+            **self.env_kwargs,
+        )
 
         env_processor = self.make_env_processor(device)
         action_processor = self.make_action_processor(robot_dict, teleop_dict, device)
@@ -478,9 +539,13 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             if name not in robot_dict:
                 raise ValueError(f"Missing robot for task-frame entry '{name}'.")
 
+            # a robot without a teleoperator is supported (e.g. locked robot); guard lookups
+            has_teleop = name in is_delta_teleoperator
+            self._has_teleop[name] = has_teleop
+
             # ENV-101: learnable VEL/FORCE axes require delta teleoperator input.
             for axis in frame.learnable_axis_indices:
-                if frame.control_mode[axis] in {ControlMode.VEL, ControlMode.WRENCH} and not is_delta_teleoperator[name]:
+                if frame.control_mode[axis] in {ControlMode.VEL, ControlMode.WRENCH} and not (has_teleop and is_delta_teleoperator[name]):
                     raise ValueError(
                         "Adaptive task-frame axes with VEL/FORCE control require a delta teleoperator. "
                         f"Got robot='{name}', axis={axis}, control_mode={frame.control_mode[axis].name}, "
@@ -508,9 +573,10 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     )
 
             # ENV-102: TASK-space with absolute-joint teleop or joint-only robot requires kinematics.
+            # no teleoperator alone shouldn't require kinematics; joint-only-robot still does
             requires_kinematics = (
                     frame.space == ControlSpace.TASK and
-                    (not is_delta_teleoperator[name] or not is_task_frame_robot[name])
+                    ((has_teleop and not is_delta_teleoperator[name]) or not is_task_frame_robot[name])
             )
             if requires_kinematics and not self.processor.kinematics.enable[name]:
                 raise ValueError(
@@ -611,13 +677,21 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             entry_context: Optional processed observation and prior task-frame
                 origin from the primitive that just terminated.
         """
-        env.set_target_pose(
-            {
-                name: [float(v) for v in frame.target]
-                for name, frame in self.task_frame.items()
-            },
-            info_key=self.target_pose_info_key,
-        )
+        start_pose, target_pose = self.resolve_targets(entry_context)
+
+        # A locked robot with no teleoperator holds its current pose instead of the static
+        # placeholder target. Scoped to has_teleop=False, not "any policy_mode=None axis":
+        # robots that do have a teleoperator commonly use policy_mode=None with a real
+        # scripted target (e.g. get_target_prim_cfg() in ur5e_foundationpose_pick.py), where
+        # substituting the current pose would break OnTargetPoseReached.
+        for name, frame in self.task_frame.items():
+            if self._has_teleop.get(name, True):
+                continue
+            for axis in range(len(frame.target)):
+                if frame.policy_mode[axis] is None:
+                    target_pose[name][axis] = start_pose[name][axis]
+
+        env.set_target_pose(target_pose, info_key=self.target_pose_info_key)
 
     def resolve_targets(
         self,

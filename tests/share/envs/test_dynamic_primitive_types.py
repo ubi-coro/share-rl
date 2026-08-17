@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from scipy.spatial.transform import Rotation
 
+import draccus
 from lerobot.processor import TransitionKey
 
 from share.debug.mpnet_debug import MPNetDebugConfig, MPNetDebugger
@@ -20,6 +21,7 @@ from share.envs.manipulation_primitive.config_manipulation_primitive import (
     PrimitiveEntryContext,
     ManipulationPrimitiveConfig,
 )
+from share.envs.manipulation_primitive.env_manipulation_primitive import ManipulationPrimitive
 from share.envs.manipulation_primitive_net.config_manipulation_primitive_net import ManipulationPrimitiveNetConfig
 from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode, TaskFrame
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
@@ -27,8 +29,15 @@ from share.envs.manipulation_primitive_net.transitions import (
     DEFAULT_TARGET_POSE_AXES_INFO_KEY,
     OnTargetPoseReached,
 )
+from share.teleoperators import TeleopEvents
 from share.utils.mock_utils import MockRobot, MockTeleoperator
 from share.utils.transformation_utils import compose_delta_pose
+
+
+class _CustomEnvForEnvClassTest(ManipulationPrimitive):
+    """Module-level so the draccus type decoder can resolve it by dotted path."""
+
+    pass
 
 
 class IdentityProcessor:
@@ -722,3 +731,189 @@ def test_open_loop_trajectory_info_matches_debugger_target_visualization(tmp_pat
     step_event = next(event for event in events if event["kind"] == "step")
     assert step_event["trajectory_progress"] == pytest.approx(0.5)
     assert step_event["robots"]["arm"]["target_pose"][0] == pytest.approx(0.4)
+
+
+def test_resolve_teleop_dict_is_identity_without_mapping():
+    config = ManipulationPrimitiveConfig(task_frame={"arm": _task_frame()})
+    teleop_dict = {"arm": MockTeleoperator(name="arm")}
+
+    resolved = config.resolve_teleop_dict(teleop_dict)
+
+    assert resolved is teleop_dict
+
+
+def test_resolve_teleop_dict_overrides_mapped_targets_and_keeps_unmapped_identity():
+    left = MockTeleoperator(name="left")
+    config = ManipulationPrimitiveConfig(
+        task_frame={"left": _task_frame(), "right": _task_frame()},
+        teleop_mapping={"right": "left"},
+    )
+    teleop_dict = {"left": left}
+
+    resolved = config.resolve_teleop_dict(teleop_dict)
+
+    assert resolved["right"] is left
+    assert resolved["left"] is left
+    assert "right" not in teleop_dict  # original not mutated
+
+
+def test_resolve_teleop_dict_raises_clear_error_for_unknown_source():
+    config = ManipulationPrimitiveConfig(
+        task_frame={"right": _task_frame()},
+        teleop_mapping={"right": "nonexistent"},
+    )
+
+    with pytest.raises(ValueError, match="nonexistent"):
+        config.resolve_teleop_dict({"left": MockTeleoperator(name="left")})
+
+
+def test_make_instantiates_default_env_class():
+    config = ManipulationPrimitiveConfig(task_frame={"arm": _task_frame()})
+    env, _, _ = config.make(
+        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+        cameras={},
+    )
+    assert type(env) is ManipulationPrimitive
+
+
+def test_make_instantiates_custom_env_class_via_env_class_field():
+    config = ManipulationPrimitiveConfig(
+        task_frame={"arm": _task_frame()},
+        env_class=_CustomEnvForEnvClassTest,
+    )
+    env, _, _ = config.make(
+        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+        cameras={},
+    )
+    assert isinstance(env, _CustomEnvForEnvClassTest)
+
+
+def test_make_raises_clear_error_on_env_kwargs_reserved_key_collision():
+    config = ManipulationPrimitiveConfig(
+        task_frame={"arm": _task_frame()},
+        env_kwargs={"robot_dict": {}},
+    )
+    with pytest.raises(ValueError, match="reserved"):
+        config.make(
+            robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+            teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+            cameras={},
+        )
+
+
+def test_env_class_round_trips_through_draccus_encode_decode():
+    """Regression test for save_mpnet_config()'s draccus.dump(), used by record.py's
+    dataset snapshot. Scoped to encode/decode directly, not the full net-level round-trip:
+    that currently fails for an unrelated pre-existing reason (EventConfig.key_mapping's
+    pynput.keyboard.Key has no draccus decoder at all, regardless of env_class)."""
+    config = ManipulationPrimitiveConfig(
+        task_frame={"arm": _task_frame()},
+        env_class=_CustomEnvForEnvClassTest,
+    )
+
+    encoded = draccus.encode(config)
+    assert encoded["env_class"] == (
+        f"{_CustomEnvForEnvClassTest.__module__}.{_CustomEnvForEnvClassTest.__qualname__}"
+    )
+
+    decoded_cls = draccus.decode(type, encoded["env_class"])
+    assert decoded_cls is _CustomEnvForEnvClassTest
+
+
+def _locked_task_frame(target=None) -> TaskFrame:
+    return TaskFrame(
+        target=[0.0] * 6 if target is None else list(target),
+        origin=[0.0] * 6,
+        policy_mode=[None] * 6,
+        control_mode=[ControlMode.POS] * 6,
+    )
+
+
+def test_validate_allows_locked_robot_absent_from_teleop_dict():
+    """A robot in task_frame but absent from teleop_dict must validate, not KeyError."""
+    config = ManipulationPrimitiveConfig(
+        task_frame={"driven": _task_frame(), "locked": _locked_task_frame()},
+    )
+
+    config.validate(
+        robot_dict={
+            "driven": MockRobot(name="driven", is_task_frame=True),
+            "locked": MockRobot(name="locked", is_task_frame=True),
+        },
+        teleop_dict={"driven": MockTeleoperator(name="driven", is_delta=True)},
+    )
+    assert config._has_teleop == {"driven": True, "locked": False}
+
+
+def test_validate_still_rejects_vel_axis_missing_teleop_with_clear_error():
+    """A learnable VEL axis still requires a delta teleoperator, ValueError not KeyError."""
+    frame = TaskFrame(
+        # RELATIVE only supports POS; a learnable VEL axis must be ABSOLUTE
+        target=[0.0] * 6,
+        policy_mode=[PolicyMode.ABSOLUTE, None, None, None, None, None],
+        control_mode=[ControlMode.VEL] + [ControlMode.POS] * 5,
+    )
+    config = ManipulationPrimitiveConfig(task_frame={"locked": frame})
+
+    with pytest.raises(ValueError, match="require a delta teleoperator"):
+        config.validate(
+            robot_dict={"locked": MockRobot(name="locked", is_task_frame=True)},
+            teleop_dict={},
+        )
+
+
+def test_on_entry_reports_actual_pose_for_locked_robot_with_no_teleoperator():
+    """A robot with no teleoperator reports its current pose as target, not the placeholder."""
+    config = ManipulationPrimitiveConfig(
+        task_frame={"driven": _task_frame(), "locked": _locked_task_frame(target=[0.0] * 6)},
+    )
+    config.validate(
+        robot_dict={
+            "driven": MockRobot(name="driven", is_task_frame=True),
+            "locked": MockRobot(name="locked", is_task_frame=True),
+        },
+        teleop_dict={"driven": MockTeleoperator(name="driven", is_delta=True)},
+    )
+
+    env = DummyPrimitiveEnv({})
+    entry_context = PrimitiveEntryContext(
+        observation={
+            "driven.x.ee_pos": 0.0, "driven.y.ee_pos": 0.0, "driven.z.ee_pos": 0.0,
+            "driven.rx.ee_pos": 0.0, "driven.ry.ee_pos": 0.0, "driven.rz.ee_pos": 0.0,
+            "locked.x.ee_pos": 1.5, "locked.y.ee_pos": -0.4, "locked.z.ee_pos": 0.3,
+            "locked.rx.ee_pos": 0.0, "locked.ry.ee_pos": 0.0, "locked.rz.ee_pos": 0.0,
+        },
+        task_frame_origin={"driven": [0.0] * 6, "locked": [0.0] * 6},
+    )
+
+    config.on_entry(env, entry_context)
+
+    assert env.target_pose["locked"] == pytest.approx([1.5, -0.4, 0.3, 0.0, 0.0, 0.0])
+
+
+def test_on_entry_keeps_static_target_for_scripted_robot_that_has_a_teleoperator():
+    """A robot with a teleoperator declared keeps its real scripted target (e.g.
+    get_target_prim_cfg()-style move-to-pose primitives), not the current pose."""
+    scripted_target = [0.4, 0.1, 0.2, 0.0, 0.0, 0.0]
+    config = ManipulationPrimitiveConfig(
+        task_frame={"arm": _locked_task_frame(target=scripted_target)},
+    )
+    config.validate(
+        robot_dict={"arm": MockRobot(name="arm", is_task_frame=True)},
+        teleop_dict={"arm": MockTeleoperator(name="arm", is_delta=True)},
+    )
+
+    env = DummyPrimitiveEnv({})
+    entry_context = PrimitiveEntryContext(
+        observation={
+            "arm.x.ee_pos": 0.0, "arm.y.ee_pos": 0.0, "arm.z.ee_pos": 0.0,
+            "arm.rx.ee_pos": 0.0, "arm.ry.ee_pos": 0.0, "arm.rz.ee_pos": 0.0,
+        },
+        task_frame_origin={"arm": [0.0] * 6},
+    )
+
+    config.on_entry(env, entry_context)
+
+    assert env.target_pose["arm"] == pytest.approx(scripted_target)

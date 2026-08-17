@@ -6,8 +6,8 @@ import math
 
 import pytest
 
-from lerobot.processor.core import TransitionKey
-from lerobot.processor.hil_processor import TELEOP_ACTION_KEY
+from lerobot.processor import TransitionKey
+from lerobot.processor.hil_processor import GRIPPER_KEY, TELEOP_ACTION_KEY
 from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode, TaskFrame
 from share.processor.action import InterventionActionProcessorStep
 from share.teleoperators.utils import TeleopEvents
@@ -111,3 +111,63 @@ def test_intervention_action_processor_decodes_so3_6d_representation():
     assert action["rx.ee_pos"] == pytest.approx(expected_euler[0], abs=1e-5)
     assert action["ry.ee_pos"] == pytest.approx(expected_euler[1], abs=1e-5)
     assert action["rz.ee_pos"] == pytest.approx(expected_euler[2], abs=1e-5)
+
+
+def test_intervention_action_processor_falls_back_to_policy_action_for_robot_missing_from_teleop_dict():
+    """A robot missing from the live teleop action dict falls back to its policy action."""
+    driven = TaskFrame(
+        target=[0.0] * 6,
+        policy_mode=[PolicyMode.ABSOLUTE, None, None, None, None, None],
+        control_mode=[ControlMode.POS] * 6,
+    )
+    locked = TaskFrame(
+        target=[9.0, 8.0, 7.0, 0.0, 0.0, 0.0],
+        policy_mode=[None] * 6,
+        control_mode=[ControlMode.POS] * 6,
+    )
+    step = InterventionActionProcessorStep(
+        task_frame={"driven": driven, "locked": locked},
+        gripper_enable={"driven": False, "locked": False},
+    )
+
+    out = step(
+        _base_transition(
+            {"driven": {"x.ee_pos": 0.4}, "locked": {}},
+            info={TeleopEvents.IS_INTERVENTION: True},
+            complementary_data={TELEOP_ACTION_KEY: {"driven": {"x.ee_pos": 0.4}}},  # no "locked"
+        )
+    )
+
+    locked_action = out[TransitionKey.ACTION]["locked"]
+    assert locked_action["x.ee_pos"] == pytest.approx(9.0)
+    assert locked_action["y.ee_pos"] == pytest.approx(8.0)
+
+
+def test_intervention_action_processor_falls_back_to_policy_gripper_for_robot_missing_from_teleop_dict():
+    """A gripper-enabled robot missing from the teleop dict falls back to its policy gripper
+    command instead of crashing the complementary-data flatten step."""
+    driven = TaskFrame(
+        target=[0.0] * 6,
+        policy_mode=[PolicyMode.ABSOLUTE, None, None, None, None, None],
+        control_mode=[ControlMode.POS] * 6,
+    )
+    locked = TaskFrame(
+        target=[0.0] * 6,
+        policy_mode=[None] * 6,
+        control_mode=[ControlMode.POS] * 6,
+    )
+    step = InterventionActionProcessorStep(
+        task_frame={"driven": driven, "locked": locked},
+        gripper_enable={"driven": False, "locked": True},
+    )
+
+    # must not raise (previously: ValueError("Missing policy action key 'locked.gripper.pos'"))
+    out = step(
+        _base_transition(
+            {"driven": {"x.ee_pos": 0.4}, "locked": {f"{GRIPPER_KEY}.pos": 0.75}},
+            info={TeleopEvents.IS_INTERVENTION: True},
+            complementary_data={TELEOP_ACTION_KEY: {"driven": {"x.ee_pos": 0.4}}},
+        )
+    )
+
+    assert out[TransitionKey.ACTION]["locked"][f"{GRIPPER_KEY}.pos"] == pytest.approx(0.75)

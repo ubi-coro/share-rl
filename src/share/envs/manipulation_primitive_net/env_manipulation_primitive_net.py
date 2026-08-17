@@ -41,7 +41,7 @@ class ManipulationPrimitiveNet(gym.Env):
         for name, primitive in self.config.primitives.items():
             env, env_processor, action_processor = primitive.make(
                 self.robot_dict,
-                self.teleop_dict,
+                primitive.resolve_teleop_dict(self.teleop_dict),
                 self.cameras,
                 device=getattr(self.config, "device", "cpu")
             )
