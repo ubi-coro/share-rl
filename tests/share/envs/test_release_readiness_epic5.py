@@ -17,8 +17,8 @@ import torch
 
 from lerobot.processor.core import TransitionKey
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY
-from lerobot.teleoperators import TeleopEvents
 from share.envs.manipulation_primitive.env_manipulation_primitive import ManipulationPrimitive
+from share.teleoperators import TeleopEvents
 from share.processor.action import (
     InterventionActionProcessorStep,
     MatchTeleopToPolicyActionProcessorStep,

@@ -9,8 +9,9 @@ from typing import Any
 
 from lerobot.processor import RobotAction
 from lerobot.processor.hil_processor import HasTeleopEvents
-from lerobot.teleoperators import TeleopEvents, Teleoperator
+from lerobot.teleoperators import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from share.teleoperators import TeleopEvents
 
 from .config_delta_keyboard import (
     KeyboardAxisBinding,

@@ -19,10 +19,11 @@ from typing import Any
 
 from lerobot.motors import Motor, MotorCalibration
 from lerobot.robots.utils import ensure_safe_goal_position
-from lerobot.teleoperators import Teleoperator, TeleopEvents
+from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from share.motors.dynamixel.dynamixel import TrossenDynamixelBus, TrossenNormMode, OperatingMode
+from share.teleoperators import TeleopEvents
 from share.teleoperators.widowx.lerobot_teleoperator_widowx.config_widowx import WidowXConfig
 
 logger = logging.getLogger(__name__)
