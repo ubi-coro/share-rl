@@ -54,6 +54,9 @@ dependencies = [
 ur = [
     "lerobot_robot_ur @ file:src/share/robots/ur",
 ]
+franka = [
+    "lerobot_robot_franka @ file:src/share/robots/franka",
+]
 spacemouse = [
     "lerobot_teleoperator_spacemouse @ file:src/share/teleoperators/spacemouse",
 ]
@@ -72,6 +75,7 @@ test = [
 ]
 all = [
     "share-rl[ur]",
+    "share-rl[franka]",
     "share-rl[spacemouse]",
     "share-rl[aloha]",
     "share-rl[test]",
