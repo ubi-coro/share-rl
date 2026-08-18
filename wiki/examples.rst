@@ -12,6 +12,15 @@ Real example
   - an adaptive inspection primitive
   - a scripted open-loop retract
 
+FR3 commissioning example
+-------------------------
+
+- ``examples/robots/franka_first_motion.py``
+  Streams a small relative Cartesian reference with conservative gains and a
+  three-centimeter translational workspace. Complete ``franka_setup`` before
+  using it on hardware.
+
+
 Mock examples
 -------------
 
