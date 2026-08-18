@@ -211,7 +211,7 @@ class BimanualPickEnvConfig(ManipulationPrimitiveNetConfig):
             "compliance_reference_limit_enable": [True] * 6,
             "kp": [2000.0, 2000.0, 2000.0, 150.0, 150.0, 150.0],
             "kd": [60.0, 60.0, 60.0, 6.0, 6.0, 6.0],
-            "wrench_limits": [25.0, 25.0, 25.0, 3.0, 3.0, 3.0],
+            "wrench_limits": [15.0, 15.0, 15.0, 2.0, 2.0, 2.0],
         }
 
         if self.mock:
