@@ -13,11 +13,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
+from share.robots.adaptive_limits import adaptive_wrench_scales, reference_error_limit
 from share.utils.shared_memory import SharedMemoryRingBuffer, SharedMemoryQueue, Empty
 from share.utils.transformation_utils import (
     clip_angle_to_ccw_arc,
     euler_xyz_to_rotvec,
-    exp_scale,
     homogeneous_to_sixvec,
     RollingPerfWindow,
     RotationIntervalMode,
@@ -1201,18 +1201,11 @@ class RTDETaskFrameController(mp.Process):
 
     def _get_reference_error_limit(self, axis: int) -> float:
         """Return max allowed reference error for a POS axis from soft wrench budget."""
-        if not self.compliance_reference_limit_enable[axis]:
-            return np.inf
-
-        f_soft = float(self.wrench_limits[axis])
-        if f_soft <= 0.0:
-            return 0.0
-
-        kp = float(self.kp[axis])
-        if kp <= 0.0:
-            return np.inf
-
-        return f_soft / kp
+        return reference_error_limit(
+            self.wrench_limits[axis],
+            self.kp[axis],
+            self.compliance_reference_limit_enable[axis],
+        )
 
     def _integrate_virtual_target_rotation(self, rotvec_cmd: np.ndarray, dt: float) -> np.ndarray:
         """Update rotational virtual targets with masked SO(3) deltas plus Euler absolutes.
@@ -1459,22 +1452,13 @@ class RTDETaskFrameController(mp.Process):
             Adaptive scale and positive wrench-limit magnitude for each axis.
         """
 
-        scale_vec = np.array([1.0] * 6)
-        for i in range(6):
-            if not self.compliance_adaptive_limit_enable[i]:
-                continue
-
-            f_measured = measured_wrench[i]
-
-            if np.sign(desired_wrench[i]) == np.sign(f_measured):
-                f_measured = 0.0
-
-            scale_vec[i] = exp_scale(
-                abs(f_measured),
-                self.wrench_limits[i],
-                self.compliance_adaptive_limit_min[i],
-                self.compliance_adaptive_limit_theta[i],
-            )
+        scale_vec = adaptive_wrench_scales(
+            desired_wrench,
+            measured_wrench,
+            self.compliance_adaptive_limit_enable,
+            self.compliance_adaptive_limit_min,
+            self.compliance_adaptive_limit_theta,
+        )
 
         scaled_wrench_limits = scale_vec * np.array(self.wrench_limits)
 
@@ -1539,23 +1523,6 @@ class RTDETaskFrameController(mp.Process):
 
         return scale_vec, scaled_wrench_limits
 
-    def clip_reference_errors(self, e: float, edot: float, i: int) -> tuple[float, float]:
-        """
-        Limit position/orientation error e and velocity error edot so that
-        kp*e and kd*edot cannot exceed +/- fmax (HIL-SERL style reference limiting).
-        """
-        _kp = self.kp[i]
-        _kd = self.kd[i]
-        _fmax = self.compliance_desired_wrench[i]
-
-        if _fmax <= 0:
-            return 0.0, 0.0
-
-        if _kp > 0:
-            e = float(np.clip(e, -_fmax / _kp, _fmax / _kp))
-        if _kd > 0:
-            edot = float(np.clip(edot, -_fmax / _kd, _fmax / _kd))
-        return e, edot
 
 def _validate_config(config: 'URConfig') -> 'URConfig':
     """Normalize and validate controller configuration.

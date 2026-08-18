@@ -19,10 +19,10 @@ from multiprocessing.managers import SharedMemoryManager
 from typing import Literal, Optional, Sequence
 
 import draccus
-import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.robots import RobotConfig
+from share.robots.adaptive_limits import adaptive_scale_and_derivative, compute_adaptive_limit_theta
 
 draccus.encode.register(SharedMemoryManager, lambda _: None)
 
@@ -171,11 +171,7 @@ class URConfig(RobotConfig):
             f_star = F_max * [s_min + (1 - s_min) * exp(-f_star/θ)]
         is satisfied exactly.
         """
-        s_star = f_star / F_max
-        if not (s_min < s_star < 1.0):
-            raise ValueError("Require s_min < f_star/F_max < 1.0")
-        ratio = (s_star - s_min) / (1.0 - s_min)
-        return -f_star / np.log(ratio)
+        return compute_adaptive_limit_theta(F_max, f_star, s_min)
 
     @staticmethod
     def exp_scale_and_derivative(f: float, theta: float, s_min: float) -> tuple:
@@ -184,7 +180,4 @@ class URConfig(RobotConfig):
         s(f) = s_min + (1 - s_min)*exp(-f/theta)
         s'(f) = -(1 - s_min)/theta * exp(-f/theta)
         """
-        exp_term = np.exp(-f / theta)
-        s = s_min + (1 - s_min) * exp_term
-        ds_df = -(1 - s_min) / theta * exp_term
-        return s, ds_df
+        return adaptive_scale_and_derivative(f, theta, s_min)
