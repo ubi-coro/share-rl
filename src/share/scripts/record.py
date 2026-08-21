@@ -24,7 +24,6 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 from share.configs.record import RecordConfig
-from share.debug.ee_pose_rerun import EEPoseRerunVisualizer
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
 from share.teleoperators import TeleopEvents, has_event, is_intervention
@@ -97,6 +96,8 @@ def record_loop(
 
     # record loop
     sum_reward = 0.0
+    _debug_prev_action = None  # TODO(temp-debug): remove with the other debug lines below.
+    _debug_stuck_count = 0
     while True:
         start_loop_t = time.perf_counter()
         obs = transition[TransitionKey.OBSERVATION]
@@ -131,6 +132,20 @@ def record_loop(
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
         info = new_transition.get(TransitionKey.INFO, {})
         sum_reward += float(reward)
+
+        # TODO(temp-debug): remove once the "keeps moving after release" investigation is done.
+        # A live human hand practically never repeats a value bit-for-bit across steps, so a
+        # nonzero action that stops changing for several consecutive steps points at a frozen
+        # upstream reading (e.g. a dropped "device went idle" HID report) rather than real input.
+        _action_list = [round(float(v), 6) for v in (action.squeeze().tolist() if hasattr(action, "squeeze") else list(action))]
+        _is_nonzero = any(abs(v) > 1e-4 for v in _action_list)
+        if _is_nonzero and _action_list == _debug_prev_action:
+            _debug_stuck_count += 1
+            if _debug_stuck_count in (3, 10, 30):
+                print(f"\n[DEBUG action] {mp_net.active_primitive} STUCK for {_debug_stuck_count} steps at {_action_list}", flush=True)
+        else:
+            _debug_stuck_count = 0
+        _debug_prev_action = _action_list if _is_nonzero else None
 
         # (3) Exit on episode end
         intervention_segment_finished = (
@@ -213,13 +228,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         else cfg.display_compressed_images
     )
 
-    # make
-    mp_net = ManipulationPrimitiveNet(cfg.env)
+    # make. cfg.env.make() rather than a hardcoded ManipulationPrimitiveNet(cfg.env) so an env
+    # config can plug in its own ManipulationPrimitiveNet subclass (e.g. bimanual_pick's
+    # origin-visualizing one) -- ManipulationPrimitiveNetConfig.make() already does the latter
+    # by default, so this is a no-op for every other env config.
+    mp_net = cfg.env.make()
     if cfg.dataset is not None and cfg.dataset.root is not None:
         save_env_config_snapshot(cfg.env, cfg.dataset.root)
     force_intervention = not cfg.use_policy
     mp_net.set_step_info({TeleopEvents.IS_INTERVENTION: True} if force_intervention else None)
-    debugger = EEPoseRerunVisualizer(session_name="record_ee_pose") if cfg.visualize_ee else None
+    debugger = None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
 
     try:

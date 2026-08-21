@@ -8,8 +8,6 @@ from share.debug.mpnet_debug import MPNetDebugConfig
 @dataclass(kw_only=True)
 class RecordConfig(MPNetTrainRLServerPipelineConfig):
     debug: MPNetDebugConfig | None = None
-    # Live rerun view of each robot's EE position -- nothing else (no MP-net graph/trace).
-    visualize_ee: bool = False
     # Whether record should load and run the configured policy.
     use_policy: bool = True
     # Whether to save only intervention/correction steps instead of the full rollout.

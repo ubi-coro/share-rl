@@ -261,6 +261,7 @@ class ManipulationPrimitiveNet(gym.Env):
                 ),
                 reason=result.reason,
             )
+            self._close_grippers_on_exit(active)
             self._primitive_step_count = 0
             self._active = target
             self._enter_active_primitive(None, None, self._pending_entry_context)
@@ -275,6 +276,19 @@ class ManipulationPrimitiveNet(gym.Env):
         info.pop(DEFAULT_TARGET_POSE_AXES_INFO_KEY, None)
         processed_transition[TransitionKey.INFO] = info
         return processed_transition
+
+    def _close_grippers_on_exit(self, primitive_name: str) -> None:
+        """Close configured active grippers before switching primitives."""
+        primitive_config = self.config.primitives[primitive_name]
+        if not primitive_config.close_grippers_on_exit:
+            return
+
+        gripper = primitive_config.processor.gripper
+        for name, enabled in gripper.enable.items():
+            if not enabled:
+                continue
+            max_pos = gripper.max_pos[name] if isinstance(gripper.max_pos, dict) else gripper.max_pos
+            self.robot_dict[name].send_action({"gripper.pos": float(max_pos)})
 
     @staticmethod
     def _default_target_pose_axes(primitive: Any) -> dict[str, list[int]]:

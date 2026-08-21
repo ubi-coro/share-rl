@@ -106,7 +106,7 @@ class ObservationConfig:
     add_joint_velocity_to_observation: bool | dict[str, bool] = False
     add_current_to_observation: bool | dict[str, bool] = False
 
-    add_ee_pos_to_observation: bool | dict[str, bool] = False
+    add_ee_pos_to_observation: bool | dict[str, bool] = True
     add_ee_velocity_to_observation: bool | dict[str, bool] = False
     add_ee_wrench_to_observation: bool | dict[str, bool] = False
 
@@ -199,6 +199,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     is_terminal: bool = False
     task_description: str | None = None
     target_pose_info_key: str | None = PRIMITIVE_TARGET_POSE_INFO_KEY
+    close_grippers_on_exit: bool = False
 
     # Routes a target robot name to a different source teleoperator, e.g. reusing one
     # physical device across primitives. Unmapped robots keep their identity lookup.
@@ -889,6 +890,7 @@ class MoveDeltaPrimitiveConfig(ManipulationPrimitiveConfig):
 class OpenLoopTrajectoryPrimitiveConfig(ManipulationPrimitiveConfig):
     """Scripted primitive that samples task-space targets from config-owned logic."""
 
+    env_class: type[ManipulationPrimitive] = OpenLoopTrajectoryPrimitive
     trajectory: OpenLoopTrajectorySpec = field(default_factory=OpenLoopTrajectorySpec)
     publish_target_info: bool | dict[str, bool] = True
 
@@ -960,7 +962,8 @@ class OpenLoopTrajectoryPrimitiveConfig(ManipulationPrimitiveConfig):
         self.infer_features(robot_dict, cameras)
 
         display_cameras = self.processor.image_preprocessing is not None and self.processor.image_preprocessing.display_cameras
-        env = OpenLoopTrajectoryPrimitive(
+        env_cls = self.env_class
+        env = env_cls(
             task_frame=self.task_frame,
             robot_dict=robot_dict,
             cameras=cameras,

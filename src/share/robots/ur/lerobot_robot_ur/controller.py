@@ -1247,6 +1247,28 @@ class RTDETaskFrameController(mp.Process):
             omega[mask_delta_pos] = target_rpy[mask_delta_pos]
             out = (R.from_rotvec(omega * dt) * R.from_rotvec(out)).as_rotvec()
 
+        if np.all(mask_abs_pos):
+            # All three rotational axes are absolute POS targets, so the target is a
+            # single, fully-specified orientation. Step toward it along its SO(3)
+            # geodesic (shortest single-axis rotation) rather than ramping roll,
+            # pitch, and yaw independently: those are coupled, nonlinear coordinates,
+            # and moving them along their own per-axis shortest arcs does not track
+            # the geodesic of the compound rotation. For targets that flip ~180 deg
+            # on more than one axis at once (e.g. a mirrored bimanual grasp
+            # orientation) the two paths diverge by tens of degrees mid-motion.
+            current_rot = R.from_rotvec(out)
+            target_rot = R.from_euler("xyz", target_rpy, degrees=False)
+            if not self._use_force_mode and self._use_servo:
+                error_rotvec = (target_rot * current_rot.inv()).as_rotvec()
+                angle = float(np.linalg.norm(error_rotvec))
+                if angle < 1e-9:
+                    return out
+                max_rate = float(np.min(self.config.simple_pose_max_speed[3:6]))
+                step_angle = min(angle, max_rate * dt)
+                step_rot = R.from_rotvec(error_rotvec * (step_angle / angle))
+                return (step_rot * current_rot).as_rotvec()
+            return target_rot.as_rotvec()
+
         if np.any(mask_abs_pos):
             rpy_cmd = wrap_to_pi(rotvec_to_euler_xyz(out).astype(np.float64))
             if not self._use_force_mode and self._use_servo:
