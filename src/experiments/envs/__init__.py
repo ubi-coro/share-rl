@@ -11,6 +11,7 @@ that is itself imported here, as with ``foundationpose``).
 import logging
 
 from experiments.envs.bimanual_pick import BimanualPickEnvConfig
+from experiments.envs.capture_images import CaptureImagesEnvConfig
 from experiments.envs.fiddle_out import DemoUR3eTeleopFiddleOutEnvConfig
 from experiments.envs.teleop_spacemouse_6dof import TeleopSpaceMouse6DofEnvConfig
 
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BimanualPickEnvConfig",
+    "CaptureImagesEnvConfig",
     "DemoUR3eTeleopFiddleOutEnvConfig",
     "TeleopSpaceMouse6DofEnvConfig",
 ]

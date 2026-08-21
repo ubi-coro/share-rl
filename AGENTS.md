@@ -20,6 +20,8 @@ This repo is small enough that a few architectural rules matter more than clever
 - Runtime state belongs to envs, not configs.
 - Primitive configs may compute entry-time targets in `on_entry(...)`, but they should write the result into the env.
 - Keep the primitive step API stable. If a primitive needs fundamentally different stepping behavior, make a dedicated env subclass in the config's `make(...)`.
+- When writing an env config (`experiments/envs/*.py`), reach for a plain `ManipulationPrimitiveConfig` with `env_class`/`env_kwargs` (or plain field overrides) first. Only introduce a dedicated `ManipulationPrimitiveConfig` subclass -- with its own dataclass fields and a custom `make(...)` -- when the behavior genuinely cannot be expressed as parameters on the existing config surface (see `FoundationPosePrimitiveConfig` for a case that needed it: entry-time frame-origin resolution). A subclass is not the default; it's the fallback once parameterization runs out.
+- Keep problem-specific bits (custom env subclasses, one-off event names/constants, bespoke file formats) local to the env module that needs them. Don't promote something into `share/` -- a shared enum, a shared processor step, a shared primitive base -- until a second real call site needs it too. `TeleopEvents` in particular is a canonical, cross-env vocabulary; a keypress meaningful to only one env config is a local module-level string constant, not a new `TeleopEvents` member.
 - Primitive entry context is intentionally small: processed observation plus the previous task-frame origin.
 - Do not add broad new info keys casually. Prefer the existing narrow surface:
   - `primitive_target_pose`
