@@ -1,28 +1,19 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode
-from share.robots.adaptive_limits import (
-    adaptive_wrench_scales,
-    compute_adaptive_limit_theta,
-    reference_error_limit,
-)
-from share.utils.transformation_utils import (
-    RotationIntervalMode,
-    signed_error_to_nearest_arc_endpoint,
-    wrap_to_pi,
-)
+from share.envs.manipulation_primitive.task_frame import ControlMode, PolicyMode
+from share.robots.adaptive_limits import reference_error_limit
+from share.utils.transformation_utils import RotationIntervalMode, clip_angle_to_ccw_arc, wrap_to_pi
 
 
 @dataclass(slots=True)
 class FrankaState:
-    """Hardware-neutral state consumed by torque strategies."""
+    """Hardware-neutral state consumed by the reference-tracking strategy."""
 
     q: np.ndarray
     dq: np.ndarray
@@ -30,31 +21,33 @@ class FrankaState:
     T_ee_stiffness: np.ndarray
     twist_base_ee: np.ndarray
     wrench_base_at_stiffness: np.ndarray
-    jacobian_base_ee: np.ndarray
     timestamp: float
 
 
 @dataclass(slots=True)
-class ControllerOutput:
-    torque: np.ndarray
+class ReferenceOutput:
+    """One control tick's result: the pose Franky should track, plus diagnostics.
+
+    Franky's native ``CartesianImpedanceTrackingMotion`` turns
+    ``target_pose_task_rpy`` into torque on its own real-time thread; this
+    strategy never computes torque or a wrench itself. Stiffness gains are
+    reported raw (not smoothed here) -- Franky smooths ``set_gains`` updates
+    itself via its own ``gains_time_constant``.
+    """
+
+    target_pose_task_rpy: np.ndarray
     pose_task_rpy: np.ndarray
     twist_task: np.ndarray
     measured_wrench_task: np.ndarray
-    desired_wrench_task: np.ndarray
-    adaptive_scale: np.ndarray
+    translational_stiffness: float
+    rotational_stiffness: float
     holding: bool
 
 
 class FrankaControllerStrategy(Protocol):
     """Stable strategy surface for Python and future pybind controllers."""
 
-    def step(
-        self,
-        state: FrankaState,
-        command: dict[str, Any] | None,
-        model: Any,
-        dt: float,
-    ) -> np.ndarray | ControllerOutput:
+    def step(self, state: FrankaState, command: dict[str, Any] | None, dt: float) -> ReferenceOutput:
         ...
 
     def zero_wrench(self, state: FrankaState) -> None:
@@ -120,20 +113,8 @@ def measured_wrench_in_task(
 ) -> np.ndarray:
     T_base_stiffness = T_base_ee @ T_ee_stiffness
     rotation_task_base = T_base_task[:3, :3].T
-    offset = rotation_task_base @ (
-        T_base_stiffness[:3, 3] - T_base_task[:3, 3]
-    )
+    offset = rotation_task_base @ (T_base_stiffness[:3, 3] - T_base_task[:3, 3])
     return transform_wrench(wrench_base_at_stiffness, rotation_task_base, offset)
-
-
-def task_wrench_at_ee_in_base(
-    wrench_task_at_task: np.ndarray,
-    T_base_task: np.ndarray,
-    T_base_ee: np.ndarray,
-) -> np.ndarray:
-    rotation_base_task = T_base_task[:3, :3]
-    offset = T_base_task[:3, 3] - T_base_ee[:3, 3]
-    return transform_wrench(wrench_task_at_task, rotation_base_task, offset)
 
 
 def so3_error(desired: np.ndarray, actual: np.ndarray) -> np.ndarray:
@@ -141,101 +122,54 @@ def so3_error(desired: np.ndarray, actual: np.ndarray) -> np.ndarray:
     return Rotation.from_matrix(desired @ actual.T).as_rotvec()
 
 
-def nullspace_torque(
-    jacobian: np.ndarray,
-    q: np.ndarray,
-    dq: np.ndarray,
-    q_reference: np.ndarray,
-    stiffness: np.ndarray,
-    damping: np.ndarray,
-    max_torque: float,
-) -> np.ndarray:
-    jacobian = np.asarray(jacobian, dtype=np.float64)
-    projector = np.eye(7) - jacobian.T @ np.linalg.pinv(jacobian.T)
-    posture = stiffness * (q_reference - q) - damping * dq
-    return np.clip(projector @ posture, -max_torque, max_torque)
-
-
-def smooth_values(
-    current: np.ndarray,
-    target: np.ndarray,
-    dt: float,
-    time_constant: float,
-) -> np.ndarray:
-    if time_constant <= 0.0:
-        return np.array(target, dtype=np.float64, copy=True)
-    alpha = 1.0 - math.exp(-max(float(dt), 0.0) / time_constant)
-    return current + alpha * (target - current)
-
-
-def apply_workspace_and_contact_limits(
+def clip_pose_to_workspace(
     pose_rpy: np.ndarray,
-    desired_wrench: np.ndarray,
-    measured_wrench: np.ndarray,
-    stiffness: np.ndarray,
     min_pose: np.ndarray,
     max_pose: np.ndarray,
     rotation_interval_modes: np.ndarray,
-    wrench_limits: np.ndarray,
-    adaptive_enable: np.ndarray,
-    adaptive_minimum: np.ndarray,
-    adaptive_theta: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bound nominal wrench, then add an uncapped inward workspace spring."""
-    bounded = np.array(desired_wrench, dtype=np.float64, copy=True)
-    scales = adaptive_wrench_scales(
-        bounded,
-        measured_wrench,
-        adaptive_enable,
-        adaptive_minimum,
-        adaptive_theta,
-    )
-    scaled_limits = scales * wrench_limits
-    bounded = np.clip(bounded, -scaled_limits, scaled_limits)
+) -> np.ndarray:
+    """Clip a target pose directly into the configured workspace box.
 
-    for axis in range(3):
-        correction = 0.0
-        if pose_rpy[axis] > max_pose[axis]:
-            correction = max_pose[axis] - pose_rpy[axis]
-            if bounded[axis] > 0.0:
-                bounded[axis] = 0.0
-        elif pose_rpy[axis] < min_pose[axis]:
-            correction = min_pose[axis] - pose_rpy[axis]
-            if bounded[axis] < 0.0:
-                bounded[axis] = 0.0
-        bounded[axis] += stiffness[axis] * correction
+    Translation is clipped per axis. Rotation is clipped in wrapped RPY,
+    either to a linear [min, max] range or, for ``ccw_arc`` axes, to the
+    nearest point on the allowed counterclockwise arc.
+    """
+    out = np.array(pose_rpy, dtype=np.float64, copy=True)
+    out[:3] = np.clip(out[:3], np.asarray(min_pose[:3]), np.asarray(max_pose[:3]))
 
-    wrapped_rpy = np.asarray(wrap_to_pi(pose_rpy[3:]), dtype=np.float64)
+    wrapped = np.asarray(wrap_to_pi(out[3:6]), dtype=np.float64)
     for local_axis, axis in enumerate(range(3, 6)):
         if not np.isfinite(min_pose[axis]) and not np.isfinite(max_pose[axis]):
             continue
-        correction = 0.0
         mode = RotationIntervalMode(int(rotation_interval_modes[axis]))
         if mode is RotationIntervalMode.CCW_ARC:
-            correction = signed_error_to_nearest_arc_endpoint(
-                wrapped_rpy[local_axis],
-                min_pose[axis],
-                max_pose[axis],
+            wrapped[local_axis] = clip_angle_to_ccw_arc(
+                float(wrapped[local_axis]), float(min_pose[axis]), float(max_pose[axis])
             )
-        elif wrapped_rpy[local_axis] > max_pose[axis]:
-            correction = max_pose[axis] - wrapped_rpy[local_axis]
-        elif wrapped_rpy[local_axis] < min_pose[axis]:
-            correction = min_pose[axis] - wrapped_rpy[local_axis]
-
-        if correction > 0.0 and bounded[axis] < 0.0:
-            bounded[axis] = 0.0
-        elif correction < 0.0 and bounded[axis] > 0.0:
-            bounded[axis] = 0.0
-        bounded[axis] += stiffness[axis] * correction
-
-    return bounded, scales, scaled_limits
+        else:
+            wrapped[local_axis] = np.clip(wrapped[local_axis], min_pose[axis], max_pose[axis])
+    out[3:6] = wrapped
+    return out
 
 
-class AdaptiveTaskFrameController:
-    """Stateful mixed-axis impedance law used by the 500 Hz bridge."""
+class CartesianReferenceController:
+    """Integrates a POS-only task-frame command into a target pose for Franky.
 
-    HOLD_KP = np.array([200.0, 200.0, 200.0, 20.0, 20.0, 20.0])
-    HOLD_KD = 2.0 * np.sqrt(HOLD_KP)
+    Franky's native ``CartesianImpedanceTrackingMotion`` owns position-error
+    -> torque (and its own gain smoothing); this class owns everything
+    upstream of that: virtual-target integration (translation as a velocity,
+    rotation via proper SO(3) composition for RELATIVE axes), origin
+    re-anchoring when the task frame moves mid-run, workspace clamping, and a
+    reference-error anti-windup clamp against the measured pose. It never
+    computes a wrench or a torque, and it never touches Franky directly --
+    ``force_constraints``/nullspace are fixed for the whole connection on
+    ``FrankaConfig`` because Franky fixes them at motion-construction time
+    (see controller.py); only ``translational_stiffness``/
+    ``rotational_stiffness`` are live-updatable per command.
+    """
+
+    HOLD_TRANSLATIONAL_STIFFNESS = 200.0
+    HOLD_ROTATIONAL_STIFFNESS = 20.0
 
     def __init__(self, config: Any):
         self.config = config
@@ -243,39 +177,17 @@ class AdaptiveTaskFrameController:
         self.virtual_position = np.zeros(3, dtype=np.float64)
         self.virtual_rotation = np.eye(3, dtype=np.float64)
         self.wrench_bias_base = np.zeros(6, dtype=np.float64)
-        self.q_reference: np.ndarray | None = None
-        self._sequence = -1
         self._holding = False
         self._initialized = False
         self._control_mode = np.full(6, int(ControlMode.POS), dtype=np.int8)
         self._policy_mode = np.full(6, int(PolicyMode.RELATIVE), dtype=np.int8)
-        self._kp = np.asarray(config.kp, dtype=np.float64)
-        self._kd = np.asarray(config.kd, dtype=np.float64)
-        self._target_kp = self._kp.copy()
-        self._target_kd = self._kd.copy()
-        self._nullspace_kp = np.asarray(config.nullspace_stiffness, dtype=np.float64)
-        self._nullspace_kd = np.asarray(config.nullspace_damping, dtype=np.float64)
-        self._target_nullspace_kp = self._nullspace_kp.copy()
-        self._target_nullspace_kd = self._nullspace_kd.copy()
+        self._sequence = -1
         self._command: dict[str, Any] | None = None
-        self._adaptive_theta_values = np.ones(6, dtype=np.float64)
 
     def zero_wrench(self, state: FrankaState) -> None:
-        self.wrench_bias_base = np.asarray(
-            state.wrench_base_at_stiffness, dtype=np.float64
-        ).copy()
+        self.wrench_bias_base = np.asarray(state.wrench_base_at_stiffness, dtype=np.float64).copy()
 
-    def step(
-        self,
-        state: FrankaState,
-        command: dict[str, Any] | None,
-        model: Any,
-        dt: float,
-    ) -> ControllerOutput:
-        del model
-        if self.q_reference is None:
-            self.q_reference = np.asarray(state.q, dtype=np.float64).copy()
-
+    def step(self, state: FrankaState, command: dict[str, Any] | None, dt: float) -> ReferenceOutput:
         if command is None:
             self._enter_hold(state)
         elif self._holding or int(command["sequence"]) != self._sequence:
@@ -291,68 +203,23 @@ class AdaptiveTaskFrameController:
             self.T_base_task,
         )
 
-        self._kp = smooth_values(
-            self._kp, self._target_kp, dt, self.config.gains_time_constant_s
-        )
-        self._kd = smooth_values(
-            self._kd, self._target_kd, dt, self.config.gains_time_constant_s
-        )
-        self._nullspace_kp = smooth_values(
-            self._nullspace_kp,
-            self._target_nullspace_kp,
-            dt,
-            self.config.gains_time_constant_s,
-        )
-        self._nullspace_kd = smooth_values(
-            self._nullspace_kd,
-            self._target_nullspace_kd,
-            dt,
-            self.config.gains_time_constant_s,
-        )
-
-        desired_wrench = self._nominal_wrench(
-            pose,
-            rotation_task_ee,
-            twist,
-            max(float(dt), 0.0),
-        )
         command_data = self._command
         assert command_data is not None
-        theta = self._adaptive_theta_values
-        bounded_wrench, scales, _ = apply_workspace_and_contact_limits(
-            pose,
-            desired_wrench,
-            measured_wrench,
-            self._kp,
+        target_pose = self._integrate_target(pose, rotation_task_ee, dt)
+        target_pose = clip_pose_to_workspace(
+            target_pose,
             command_data["min_pose"],
             command_data["max_pose"],
             command_data["rotation_interval_modes"],
-            command_data["wrench_limits"],
-            command_data["compliance_adaptive_limit_enable"],
-            command_data["compliance_adaptive_limit_min"],
-            theta,
         )
 
-        wrench_base_at_ee = task_wrench_at_ee_in_base(
-            bounded_wrench, self.T_base_task, state.T_base_ee
-        )
-        task_torque = state.jacobian_base_ee.T @ wrench_base_at_ee
-        posture_torque = nullspace_torque(
-            state.jacobian_base_ee,
-            state.q,
-            state.dq,
-            self.q_reference,
-            self._nullspace_kp,
-            self._nullspace_kd,
-            float(command_data["nullspace_max_torque"]),
-        )
-        return ControllerOutput(
-            torque=task_torque + posture_torque,
+        return ReferenceOutput(
+            target_pose_task_rpy=target_pose,
             pose_task_rpy=pose,
             twist_task=twist,
             measured_wrench_task=measured_wrench,
-            desired_wrench_task=bounded_wrench,
-            adaptive_scale=scales,
+            translational_stiffness=float(command_data["translational_stiffness"]),
+            rotational_stiffness=float(command_data["rotational_stiffness"]),
             holding=self._holding,
         )
 
@@ -379,6 +246,7 @@ class AdaptiveTaskFrameController:
             self.virtual_position = pose[:3].copy()
             self.virtual_rotation = rotation_task_ee.copy()
             self._initialized = True
+
         new_control_mode = command["control_mode"][:6]
         new_policy_mode = command["policy_mode"][:6]
 
@@ -413,13 +281,8 @@ class AdaptiveTaskFrameController:
 
         self._control_mode = new_control_mode.copy()
         self._policy_mode = new_policy_mode.copy()
-        self._target_kp = command["kp"].copy()
-        self._target_kd = command["kd"].copy()
-        self._target_nullspace_kp = command["nullspace_stiffness"].copy()
-        self._target_nullspace_kd = command["nullspace_damping"].copy()
         self._command = command
         self._sequence = int(command["sequence"])
-        self._adaptive_theta_values = self._compute_adaptive_theta(command)
         self._holding = False
 
     def _enter_hold(self, state: FrankaState) -> None:
@@ -438,20 +301,19 @@ class AdaptiveTaskFrameController:
         self._command["control_mode"][:6] = self._control_mode
         self._command["policy_mode"][:6] = self._policy_mode
         self._command["compliance_reference_limit_enable"][:] = False
-        self._command["compliance_adaptive_limit_enable"][:] = False
-        self._adaptive_theta_values.fill(1.0)
-        self._target_kp = self.HOLD_KP.copy()
-        self._target_kd = self.HOLD_KD.copy()
+        self._command["translational_stiffness"] = self.HOLD_TRANSLATIONAL_STIFFNESS
+        self._command["rotational_stiffness"] = self.HOLD_ROTATIONAL_STIFFNESS
         self._holding = True
         self._initialized = True
 
-    def _nominal_wrench(
-        self,
-        pose: np.ndarray,
-        rotation_task_ee: np.ndarray,
-        twist: np.ndarray,
-        dt: float,
-    ) -> np.ndarray:
+    def _integrate_target(self, pose: np.ndarray, rotation_task_ee: np.ndarray, dt: float) -> np.ndarray:
+        """Advance the virtual target and return it, clamped against windup.
+
+        Relative POS axes are a velocity integrated at the control
+        frequency -- translation directly, rotation via an SO(3) composition
+        so a mix of relative axes still yields a proper 3D rotation rather
+        than an Euler-angle sum. Absolute POS axes are then imposed directly.
+        """
         command = self._command
         assert command is not None
         target = command["target"]
@@ -475,8 +337,8 @@ class AdaptiveTaskFrameController:
                 virtual_rpy[local_axis] = target[axis]
         if np.any(angular_step):
             self.virtual_rotation = (
-                Rotation.from_rotvec(angular_step).as_matrix() @ self.virtual_rotation
-            )
+                Rotation.from_rotvec(angular_step) * Rotation.from_matrix(self.virtual_rotation)
+            ).as_matrix()
             virtual_rpy = Rotation.from_matrix(self.virtual_rotation).as_euler("xyz")
         for local_axis, axis in enumerate(range(3, 6)):
             if (
@@ -488,9 +350,11 @@ class AdaptiveTaskFrameController:
 
         translation_error = self.virtual_position - pose[:3]
         rotation_error = so3_error(self.virtual_rotation, rotation_task_ee)
-        pose_error = np.concatenate((translation_error, rotation_error))
+        limited_error = np.concatenate((translation_error, rotation_error))
 
-        limited_error = pose_error.copy()
+        translational_stiffness = float(command["translational_stiffness"])
+        rotational_stiffness = float(command["rotational_stiffness"])
+        force_constraints = self.config.force_constraints
         relative_rotation_was_clipped = False
         for axis in range(6):
             if (
@@ -498,9 +362,10 @@ class AdaptiveTaskFrameController:
                 or self._policy_mode[axis] != int(PolicyMode.RELATIVE)
             ):
                 continue
+            stiffness = translational_stiffness if axis < 3 else rotational_stiffness
             limit = reference_error_limit(
-                command["wrench_limits"][axis],
-                self._kp[axis],
+                float(force_constraints[axis]),
+                stiffness,
                 bool(command["compliance_reference_limit_enable"][axis]),
             )
             clipped = float(np.clip(limited_error[axis], -limit, limit))
@@ -512,30 +377,12 @@ class AdaptiveTaskFrameController:
 
         if relative_rotation_was_clipped:
             self.virtual_rotation = (
-                Rotation.from_rotvec(limited_error[3:]).as_matrix() @ rotation_task_ee
-            )
+                Rotation.from_rotvec(limited_error[3:]) * Rotation.from_matrix(rotation_task_ee)
+            ).as_matrix()
 
-        wrench = np.zeros(6, dtype=np.float64)
-        for axis in range(6):
-            mode = ControlMode(int(self._control_mode[axis]))
-            if mode is ControlMode.POS:
-                wrench[axis] = self._kp[axis] * limited_error[axis] - self._kd[axis] * twist[axis]
-            elif mode is ControlMode.VEL:
-                wrench[axis] = self._kd[axis] * (target[axis] - twist[axis])
-            else:
-                wrench[axis] = target[axis]
-        return wrench
-
-    def _compute_adaptive_theta(self, command: dict[str, Any]) -> np.ndarray:
-        theta = np.ones(6, dtype=np.float64)
-        for axis, enabled in enumerate(command["compliance_adaptive_limit_enable"]):
-            if enabled:
-                theta[axis] = compute_adaptive_limit_theta(
-                    command["wrench_limits"][axis],
-                    command["compliance_desired_wrench"][axis],
-                    command["compliance_adaptive_limit_min"][axis],
-                )
-        return theta
+        return np.concatenate(
+            (self.virtual_position, Rotation.from_matrix(self.virtual_rotation).as_euler("xyz"))
+        )
 
     def _virtual_transform(self) -> np.ndarray:
         transform = np.eye(4, dtype=np.float64)
@@ -560,28 +407,10 @@ class AdaptiveTaskFrameController:
             "min_pose": np.asarray(self.config.min_pose_rpy, dtype=np.float64),
             "max_pose": np.asarray(self.config.max_pose_rpy, dtype=np.float64),
             "rotation_interval_modes": np.asarray(
-                [
-                    int(RotationIntervalMode.from_name(mode))
-                    for mode in self.config.rotation_interval_modes
-                ],
+                [int(RotationIntervalMode.from_name(mode)) for mode in self.config.rotation_interval_modes],
                 dtype=np.int8,
             ),
-            "kp": self.HOLD_KP.copy(),
-            "kd": self.HOLD_KD.copy(),
-            "wrench_limits": np.asarray(self.config.wrench_limits, dtype=np.float64),
+            "translational_stiffness": self.HOLD_TRANSLATIONAL_STIFFNESS,
+            "rotational_stiffness": self.HOLD_ROTATIONAL_STIFFNESS,
             "compliance_reference_limit_enable": np.zeros(6, dtype=np.bool_),
-            "compliance_adaptive_limit_enable": np.zeros(6, dtype=np.bool_),
-            "compliance_desired_wrench": np.asarray(
-                self.config.compliance_desired_wrench, dtype=np.float64
-            ),
-            "compliance_adaptive_limit_min": np.asarray(
-                self.config.compliance_adaptive_limit_min, dtype=np.float64
-            ),
-            "nullspace_stiffness": np.asarray(
-                self.config.nullspace_stiffness, dtype=np.float64
-            ),
-            "nullspace_damping": np.asarray(
-                self.config.nullspace_damping, dtype=np.float64
-            ),
-            "nullspace_max_torque": float(self.config.nullspace_max_torque),
         }

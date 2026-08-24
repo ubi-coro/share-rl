@@ -1,6 +1,6 @@
 from .lerobot_robot_franka import (
-    AdaptiveFrankaControllerConfig,
-    ControllerOutput,
+    CartesianReferenceController,
+    CartesianReferenceControllerConfig,
     Franka,
     FrankaConfig,
     FrankaControllerConfig,
@@ -9,11 +9,12 @@ from .lerobot_robot_franka import (
     FrankaState,
     MockFranka,
     MockFrankaConfig,
+    ReferenceOutput,
 )
 
 __all__ = [
-    "AdaptiveFrankaControllerConfig",
-    "ControllerOutput",
+    "CartesianReferenceController",
+    "CartesianReferenceControllerConfig",
     "Franka",
     "FrankaConfig",
     "FrankaControllerConfig",
@@ -22,4 +23,5 @@ __all__ = [
     "FrankaState",
     "MockFranka",
     "MockFrankaConfig",
+    "ReferenceOutput",
 ]

@@ -15,7 +15,6 @@ from share.utils.shared_memory import Empty, SharedMemoryQueue, SharedMemoryRing
 
 from .command import FrankaCommand, FrankaTaskFrameCommand
 from .control_law import (
-    ControllerOutput,
     FrankaState,
     measured_wrench_in_task,
     pose_rpy_to_transform,
@@ -61,28 +60,30 @@ def load_franky() -> Any:
     return franky
 
 
-def normalize_franky_state(raw_state: Any, model: Any, franky: Any) -> FrankaState:
-    """Convert Franky/libfranka objects into NumPy-only controller state."""
-    twist = getattr(raw_state, "O_dP_EE_est", None)
-    if twist is None:
-        twist = getattr(raw_state, "O_dP_EE_c", raw_state.O_dP_EE_d)
-    jacobian = model.zero_jacobian(franky.Frame.EndEffector, raw_state)
+def normalize_franky_state(raw_state: Any) -> FrankaState:
+    """Convert Franky/libfranka objects into NumPy-only controller state.
+
+    ``O_T_EE`` is libfranka's flat 16-element *column-major* transform, so it
+    needs ``order="F"`` (equivalently ``.reshape(4, 4).T``) -- a plain
+    ``.reshape(4, 4)`` silently returns the transpose. ``EE_T_K`` and the
+    ``O_dP_EE_*`` twists are already-typed Franky objects (``Affine``,
+    ``Twist``), not raw arrays, so they're unwrapped via their own
+    ``.matrix``/``.linear``/``.angular`` accessors rather than ``np.asarray``.
+    """
+    twist = raw_state.O_dP_EE_est if raw_state.O_dP_EE_est is not None else raw_state.O_dP_EE_c
     return FrankaState(
         q=np.asarray(raw_state.q, dtype=np.float64).reshape(7),
         dq=np.asarray(raw_state.dq, dtype=np.float64).reshape(7),
-        T_base_ee=np.asarray(raw_state.O_T_EE, dtype=np.float64).reshape(4, 4),
-        T_ee_stiffness=np.asarray(raw_state.EE_T_K, dtype=np.float64).reshape(4, 4),
-        twist_base_ee=np.asarray(twist, dtype=np.float64).reshape(6),
-        wrench_base_at_stiffness=np.asarray(
-            raw_state.O_F_ext_hat_K, dtype=np.float64
-        ).reshape(6),
-        jacobian_base_ee=np.asarray(jacobian, dtype=np.float64).reshape(6, 7),
+        T_base_ee=np.asarray(raw_state.O_T_EE, dtype=np.float64).reshape(4, 4, order="F"),
+        T_ee_stiffness=np.asarray(raw_state.EE_T_K.matrix, dtype=np.float64),
+        twist_base_ee=np.concatenate((np.asarray(twist.linear), np.asarray(twist.angular))),
+        wrench_base_at_stiffness=np.asarray(raw_state.O_F_ext_hat_K, dtype=np.float64).reshape(6),
         timestamp=time.monotonic(),
     )
 
 
 class FrankaControllerProcess(mp.Process):
-    """500 Hz SHARE bridge around Franky's 1 kHz torque motion."""
+    """500 Hz SHARE bridge around Franky's native Cartesian/joint impedance motions."""
 
     def __init__(self, config: Any):
         if config.shm_manager is None:
@@ -105,7 +106,6 @@ class FrankaControllerProcess(mp.Process):
             "ActualTCPPose": np.zeros(6, dtype=np.float64),
             "ActualTCPSpeed": np.zeros(6, dtype=np.float64),
             "ActualTCPForce": np.zeros(6, dtype=np.float64),
-            "SetTCPForce": np.zeros(6, dtype=np.float64),
             "TaskFrameOrigin": np.zeros(6, dtype=np.float64),
             "ActualQ": np.zeros(7, dtype=np.float64),
             "ActualQd": np.zeros(7, dtype=np.float64),
@@ -198,20 +198,10 @@ class FrankaControllerProcess(mp.Process):
                 default_force_threshold=30.0,
             )
             self._configure_robot(robot)
-            model = robot.model
             strategy = self.config.controller.make_strategy(self.config)
             wrench_bias_base = np.zeros(6, dtype=np.float64)
             raw_state = robot.state
-            state = normalize_franky_state(raw_state, model, franky)
-
-            motion = self._make_joint_motion(
-                franky,
-                state.q,
-                np.asarray(self.config.joint_stiffness, dtype=np.float64),
-                np.asarray(self.config.joint_damping, dtype=np.float64),
-            )
-            motion.set_reference(franky.JointReference(q=state.q))
-            robot.move(motion, asynchronous=True)
+            state = normalize_franky_state(raw_state)
 
             active_space: ControlSpace | None = None
             current_command: dict[str, Any] | None = None
@@ -222,6 +212,8 @@ class FrankaControllerProcess(mp.Process):
             last_tick = next_tick
             joint_hold_target: np.ndarray | None = None
             joint_holding = False
+            last_translational_stiffness: float | None = None
+            last_rotational_stiffness: float | None = None
             self.ready_event.set()
 
             while not self.stop_requested_event.is_set():
@@ -234,7 +226,7 @@ class FrankaControllerProcess(mp.Process):
                 dt = max(loop_start - last_tick, np.finfo(np.float64).eps)
                 last_tick = loop_start
                 raw_state = robot.state
-                state = normalize_franky_state(raw_state, model, franky)
+                state = normalize_franky_state(raw_state)
                 stop, zero_requested, latest = self._drain_commands()
                 if stop:
                     normal_stop = True
@@ -247,7 +239,24 @@ class FrankaControllerProcess(mp.Process):
                     if active_space is None:
                         active_space = space
                         if space == ControlSpace.TASK:
-                            motion = self._make_torque_motion(franky)
+                            motion = self._make_task_motion(franky, state)
+                            # Seed the reference to the current pose before
+                            # handing control to the motion -- matches
+                            # franky's own CartesianImpedanceTracker, which
+                            # does the same to avoid a jump if the RT loop
+                            # reads a reference before this process's first
+                            # real strategy.step() call lands.
+                            motion.set_reference(
+                                franky.CartesianReference(target=franky.Affine(state.T_base_ee))
+                            )
+                            robot.move(motion, asynchronous=True)
+                        else:
+                            motion = self._make_joint_motion(
+                                franky,
+                                np.asarray(self.config.joint_stiffness, dtype=np.float64),
+                                np.asarray(self.config.joint_damping, dtype=np.float64),
+                            )
+                            motion.set_reference(franky.JointReference(q=state.q))
                             robot.move(motion, asynchronous=True)
                     elif space != active_space:
                         raise FrankaControllerError(
@@ -267,24 +276,31 @@ class FrankaControllerProcess(mp.Process):
                         joint_holding = False
 
                 stale = loop_start - last_command_time > self.config.command_timeout_s
-                output: ControllerOutput | None = None
+                output = None
                 if active_space == ControlSpace.TASK:
-                    strategy_result = strategy.step(
-                        state,
-                        None if stale else current_command,
-                        model,
-                        dt,
+                    output = strategy.step(state, None if stale else current_command, dt)
+                    T_base_task = pose_rpy_to_transform(current_command["origin"])
+                    target_matrix = T_base_task @ pose_rpy_to_transform(output.target_pose_task_rpy)
+                    motion.set_reference(
+                        franky.CartesianReference(target=franky.Affine(target_matrix))
                     )
-                    if isinstance(strategy_result, ControllerOutput):
-                        output = strategy_result
-                        torque = strategy_result.torque
-                    else:
-                        torque = np.asarray(strategy_result, dtype=np.float64)
-                        if torque.shape != (7,):
-                            raise ValueError(
-                                "Franka controller strategies must return seven torques"
+                    # set_reference is meant to be called every tick (that's
+                    # the whole point of a tracking motion), but gains only
+                    # change on a new command or a stale/hold transition --
+                    # skip the call otherwise rather than pushing an
+                    # unchanged CartesianImpedanceGains through the RT loop
+                    # 500 times a second.
+                    if (
+                        output.translational_stiffness != last_translational_stiffness
+                        or output.rotational_stiffness != last_rotational_stiffness
+                    ):
+                        motion.set_gains(
+                            franky.CartesianImpedanceGains.isotropic(
+                                output.translational_stiffness, output.rotational_stiffness
                             )
-                    motion.set_torque(torque)
+                        )
+                        last_translational_stiffness = output.translational_stiffness
+                        last_rotational_stiffness = output.rotational_stiffness
                 elif active_space == ControlSpace.JOINT:
                     if stale:
                         if not joint_holding:
@@ -308,7 +324,7 @@ class FrankaControllerProcess(mp.Process):
                     motion.set_reference(franky.JointReference(q=target))
 
                 if robot.poll_motion():
-                    raise FrankaControllerError("Franky torque motion ended unexpectedly")
+                    raise FrankaControllerError("Franky motion ended unexpectedly")
 
                 loop_duration = time.perf_counter() - loop_start
                 deadline_missed = loop_duration > period
@@ -354,9 +370,8 @@ class FrankaControllerProcess(mp.Process):
             self.config.upper_force_thresholds_nominal,
         )
         if self.config.end_effector_transform is not None:
-            robot.set_ee(
-                np.asarray(self.config.end_effector_transform, dtype=np.float64).reshape(4, 4)
-            )
+            # set_ee wants a flat length-16 sequence, not a (4, 4) array.
+            robot.set_ee(list(self.config.end_effector_transform))
         load_fields = (
             self.config.payload_mass,
             self.config.payload_center_of_mass,
@@ -369,43 +384,44 @@ class FrankaControllerProcess(mp.Process):
                 )
             robot.set_load(
                 float(self.config.payload_mass),
-                np.asarray(self.config.payload_center_of_mass, dtype=np.float64),
-                np.asarray(self.config.payload_inertia, dtype=np.float64).reshape(3, 3),
+                list(self.config.payload_center_of_mass),
+                # set_load wants a flat length-9 sequence, not a (3, 3) array.
+                list(self.config.payload_inertia),
             )
 
-    def _make_torque_motion(self, franky: Any) -> Any:
-        return franky.SimpleTorqueMotion(
-            initial_torque=np.zeros(7),
-            signal_timeout=float(self.config.torque_signal_timeout_s),
-            compensate_coriolis=True,
-            max_delta_tau=float(self.config.max_delta_tau),
+    def _make_task_motion(self, franky: Any, state: FrankaState) -> Any:
+        return franky.CartesianImpedanceTrackingMotion(
+            translational_stiffness=float(self.config.translational_stiffness),
+            rotational_stiffness=float(self.config.rotational_stiffness),
+            force_constraints=self._force_constraints(),
+            posture_task=franky.PostureTask(
+                target=state.q,
+                stiffness=np.asarray(self.config.nullspace_stiffness, dtype=np.float64),
+                max_torque=float(self.config.nullspace_max_torque),
+            ),
             lower_joint_limits=FR3_LOWER_JOINT_LIMITS,
             upper_joint_limits=FR3_UPPER_JOINT_LIMITS,
-            joint_limit_activation_distance=float(self.config.joint_limit_margin),
-            joint_limit_stiffness=float(self.config.joint_limit_potential),
-            joint_limit_damping=2.0 * np.sqrt(float(self.config.joint_limit_potential)),
-            joint_limit_max_torque=float(self.config.joint_limit_max_torque),
+            gains_time_constant=float(self.config.gains_time_constant_s),
         )
+
+    def _force_constraints(self) -> list[float | None]:
+        return [
+            None if not np.isfinite(value) else float(value)
+            for value in self.config.force_constraints
+        ]
 
     def _make_joint_motion(
         self,
         franky: Any,
-        q: np.ndarray,
         stiffness: np.ndarray,
         damping: np.ndarray,
     ) -> Any:
-        del q
         return franky.JointImpedanceTrackingMotion(
             stiffness=stiffness,
             damping=damping,
             compensate_coriolis=True,
-            max_delta_tau=float(self.config.max_delta_tau),
             lower_joint_limits=FR3_LOWER_JOINT_LIMITS,
             upper_joint_limits=FR3_UPPER_JOINT_LIMITS,
-            joint_limit_activation_distance=float(self.config.joint_limit_margin),
-            joint_limit_stiffness=float(self.config.joint_limit_potential),
-            joint_limit_damping=2.0 * np.sqrt(float(self.config.joint_limit_potential)),
-            joint_limit_max_torque=float(self.config.joint_limit_max_torque),
             gains_time_constant=float(self.config.gains_time_constant_s),
         )
 
@@ -433,7 +449,7 @@ class FrankaControllerProcess(mp.Process):
     def _publish_state(
         self,
         state: FrankaState,
-        output: ControllerOutput | None,
+        output: Any,
         wrench_bias_base: np.ndarray,
         command: dict[str, Any] | None,
         stale: bool,
@@ -458,8 +474,7 @@ class FrankaControllerProcess(mp.Process):
                 state.T_ee_stiffness,
                 T_base_task,
             )
-            desired_wrench = np.zeros(6)
-            holding = stale or command is None
+            holding = True
             origin = (
                 command["origin"].copy()
                 if command is not None
@@ -469,7 +484,6 @@ class FrankaControllerProcess(mp.Process):
             pose = output.pose_task_rpy
             twist = output.twist_task
             wrench = output.measured_wrench_task
-            desired_wrench = output.desired_wrench_task
             holding = output.holding
             origin = np.asarray(command["origin"], dtype=np.float64)
 
@@ -478,7 +492,6 @@ class FrankaControllerProcess(mp.Process):
                 "ActualTCPPose": pose,
                 "ActualTCPSpeed": twist,
                 "ActualTCPForce": wrench,
-                "SetTCPForce": desired_wrench,
                 "TaskFrameOrigin": origin,
                 "ActualQ": state.q,
                 "ActualQd": state.dq,
@@ -495,39 +508,44 @@ class FrankaControllerProcess(mp.Process):
 
     @staticmethod
     def _graceful_stop(robot: Any) -> None:
+        """Ramp the last commanded torque down via TorqueStopMotion.
+
+        Robot.stop() preempts a torque motion's control loop with a
+        ControlException instead of ramping down -- that's the whole reason
+        TorqueStopMotion exists (see franky's own CartesianImpedanceTracker.stop(),
+        which follows the same pattern). So a "Move command preempted!"
+        ControlException here is an expected, tolerable outcome -- e.g.
+        control already ended some other way -- not a failure to fall back
+        from. Only escalate to the abrupt robot.stop() if TorqueStopMotion
+        itself couldn't even be attempted (e.g. franky failed to load) or
+        failed for a genuinely different reason.
+        """
         try:
             franky = load_franky()
-            robot.move(franky.TorqueStopMotion(), asynchronous=False)
         except BaseException:
-            try:
-                robot.stop()
-            except BaseException:
-                pass
+            return
+        try:
+            robot.move(franky.TorqueStopMotion(), asynchronous=False)
+            return
+        except BaseException as error:
+            if "preempt" in str(error).lower():
+                return
+        try:
+            robot.stop()
+        except BaseException:
+            pass
 
     def _default_command(self) -> FrankaTaskFrameCommand:
         command = FrankaTaskFrameCommand()
         command.controller_overrides = {
-            "kp": list(self.config.kp),
-            "kd": list(self.config.kd),
+            "translational_stiffness": float(self.config.translational_stiffness),
+            "rotational_stiffness": float(self.config.rotational_stiffness),
             "min_pose": list(self.config.min_pose_rpy),
             "max_pose": list(self.config.max_pose_rpy),
             "rotation_interval_modes": list(self.config.rotation_interval_modes),
-            "wrench_limits": list(self.config.wrench_limits),
             "compliance_reference_limit_enable": list(
                 self.config.compliance_reference_limit_enable
             ),
-            "compliance_adaptive_limit_enable": list(
-                self.config.compliance_adaptive_limit_enable
-            ),
-            "compliance_desired_wrench": list(
-                self.config.compliance_desired_wrench
-            ),
-            "compliance_adaptive_limit_min": list(
-                self.config.compliance_adaptive_limit_min
-            ),
-            "nullspace_stiffness": list(self.config.nullspace_stiffness),
-            "nullspace_damping": list(self.config.nullspace_damping),
-            "nullspace_max_torque": float(self.config.nullspace_max_torque),
             "joint_stiffness": list(self.config.joint_stiffness),
             "joint_damping": list(self.config.joint_damping),
             "joint_error_clip": list(self.config.joint_error_clip),

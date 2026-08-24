@@ -17,6 +17,7 @@ from share.envs.manipulation_primitive.task_frame import (
     TASK_FRAME_AXIS_NAMES,
     TaskFrame,
 )
+from share.robots.task_frame_command import merge_controller_overrides
 
 from .command import FR3_JOINT_NAMES, FrankaTaskFrameCommand
 from .config_franka import FrankaConfig
@@ -187,19 +188,17 @@ class Franka(Robot):
                     self.task_frame.target[index] = float(action[canonical_key])
         else:
             for axis, axis_name in enumerate(TASK_FRAME_AXIS_NAMES):
-                for suffix, mode in (
-                    ("ee_pos", ControlMode.POS),
-                    ("ee_vel", ControlMode.VEL),
-                    ("ee_wrench", ControlMode.WRENCH),
-                ):
-                    key = f"{axis_name}.{suffix}"
-                    if key not in action:
-                        continue
+                for suffix in ("ee_vel", "ee_wrench"):
+                    if f"{axis_name}.{suffix}" in action:
+                        raise ValueError(
+                            "Franka task-space control is position-only -- Franky's native "
+                            "Cartesian impedance controller owns the wrench law, so there is no "
+                            f"VEL/WRENCH axis to send it (got {axis_name}.{suffix})"
+                        )
+                key = f"{axis_name}.ee_pos"
+                if key in action:
                     self.task_frame.target[axis] = float(action[key])
-                    self.task_frame.control_mode[axis] = mode
-                    if mode is not ControlMode.POS:
-                        self.task_frame.policy_mode[axis] = PolicyMode.ABSOLUTE
-                    break
+                    self.task_frame.control_mode[axis] = ControlMode.POS
 
         if self.hand is not None and "gripper.pos" in action:
             self.hand.move(float(action["gripper.pos"]))
@@ -230,27 +229,14 @@ class Franka(Robot):
 
     def _default_controller_overrides(self) -> dict[str, Any]:
         return {
-            "kp": list(self.config.kp),
-            "kd": list(self.config.kd),
+            "translational_stiffness": float(self.config.translational_stiffness),
+            "rotational_stiffness": float(self.config.rotational_stiffness),
             "min_pose": list(self.config.min_pose_rpy),
             "max_pose": list(self.config.max_pose_rpy),
             "rotation_interval_modes": list(self.config.rotation_interval_modes),
-            "wrench_limits": list(self.config.wrench_limits),
             "compliance_reference_limit_enable": list(
                 self.config.compliance_reference_limit_enable
             ),
-            "compliance_adaptive_limit_enable": list(
-                self.config.compliance_adaptive_limit_enable
-            ),
-            "compliance_desired_wrench": list(
-                self.config.compliance_desired_wrench
-            ),
-            "compliance_adaptive_limit_min": list(
-                self.config.compliance_adaptive_limit_min
-            ),
-            "nullspace_stiffness": list(self.config.nullspace_stiffness),
-            "nullspace_damping": list(self.config.nullspace_damping),
-            "nullspace_max_torque": float(self.config.nullspace_max_torque),
             "joint_stiffness": list(self.config.joint_stiffness),
             "joint_damping": list(self.config.joint_damping),
             "joint_error_clip": list(self.config.joint_error_clip),
@@ -259,19 +245,13 @@ class Franka(Robot):
     def _merged_controller_overrides(
         self, overrides: dict[str, Any] | None
     ) -> dict[str, Any]:
-        unknown = set(overrides or {}) - FrankaTaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
-        if unknown:
-            raise ValueError(
-                "Unsupported Franka controller overrides: "
-                + ", ".join(sorted(unknown))
-            )
-        merged = dict(
-            self.task_frame.controller_overrides
-            or self._default_controller_overrides()
+        return merge_controller_overrides(
+            self.task_frame.controller_overrides,
+            overrides,
+            FrankaTaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS,
+            "Franka",
+            self._default_controller_overrides,
         )
-        if overrides:
-            merged.update(overrides)
-        return merged
 
     def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
         resolved = ControlSpace(int(space))

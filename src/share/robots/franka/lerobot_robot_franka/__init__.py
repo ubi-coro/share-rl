@@ -1,7 +1,7 @@
 from .command import FR3_JOINT_NAMES, FrankaTaskFrameCommand
-from .control_law import ControllerOutput, FrankaControllerStrategy, FrankaState
+from .control_law import CartesianReferenceController, FrankaControllerStrategy, FrankaState, ReferenceOutput
 from .config_franka import (
-    AdaptiveFrankaControllerConfig,
+    CartesianReferenceControllerConfig,
     FrankaConfig,
     FrankaControllerConfig,
     MockFrankaConfig,
@@ -10,8 +10,8 @@ from .franka import Franka
 from .mock_franka import MockFranka
 
 __all__ = [
-    "ControllerOutput",
-    "AdaptiveFrankaControllerConfig",
+    "CartesianReferenceController",
+    "CartesianReferenceControllerConfig",
     "FR3_JOINT_NAMES",
     "Franka",
     "FrankaConfig",
@@ -21,4 +21,5 @@ __all__ = [
     "FrankaTaskFrameCommand",
     "MockFranka",
     "MockFrankaConfig",
+    "ReferenceOutput",
 ]
