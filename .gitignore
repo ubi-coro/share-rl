@@ -178,5 +178,13 @@ outputs/
 *.xml
 *.part
 
-# Experiments
-/src/experiments/
+# Experiments -- private/site-specific by default (robot IPs, camera serials,
+# in-progress task tuning). A directory-exclude pattern here blocks git from
+# ever traversing into it, which also blocks re-including anything nested
+# inside via a plain "!" rule -- hence the wildcard-plus-carve-out below
+# instead of a bare "!src/experiments/envs/demo_franka_movedelta.py".
+/src/experiments/*
+!/src/experiments/__init__.py
+!/src/experiments/envs/
+/src/experiments/envs/*
+!/src/experiments/envs/demo_franka_movedelta.py
