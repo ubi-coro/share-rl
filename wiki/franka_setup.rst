@@ -6,15 +6,27 @@ Overview
 
 The SHARE Franka backend is ROS-free. The application-facing Franka object
 exchanges complete commands and state through shared memory with a dedicated
-500 Hz Python process. That process evaluates the mixed-axis SHARE controller
-and sends seven torques to Franky 2's SimpleTorqueMotion. Franky and libfranka
-own the 1 kHz FCI connection, Coriolis compensation, torque-rate limiting, the
-torque watchdog, and soft joint-limit repulsion.
+500 Hz Python process. That process integrates task-frame commands into a
+target pose (or joint reference) -- relative axes as a velocity, including
+proper SO(3) composition for rotation, absolute axes imposed directly,
+workspace bounds clamped -- and streams the result into one of Franky 2's
+native motions, which owns the actual impedance control law:
 
-Joint-space commands use Franky's native JointImpedanceTrackingMotion. The
-optional Franka Hand runs in a different process because homing, moves, and
-grasps may block. No ROS node, topic, service, or ROS environment leaks into
-the LeRobot process.
+- Task-space (position-only) streams into ``CartesianImpedanceTrackingMotion``
+  via ``set_reference(CartesianReference(...))``/``set_gains(...)`` every
+  tick. Nullspace posture is Franky's own ``PostureTask``, not a hand-rolled
+  Jacobian projection.
+- Joint-space streams into ``JointImpedanceTrackingMotion`` via
+  ``set_reference(JointReference(q=...))``, unchanged from before.
+
+Franky and libfranka run that impedance law, Coriolis compensation,
+torque-rate limiting, the torque watchdog, and soft joint-limit repulsion on
+their own real-time thread -- the Python bridge never computes torque or a
+wrench itself.
+
+The optional Franka Hand runs in a different process because homing, moves,
+and grasps may block. No ROS node, topic, service, or ROS environment leaks
+into the LeRobot process.
 
 What Desk and FCI are
 ---------------------
@@ -111,31 +123,54 @@ Controller behavior
 -------------------
 
 The public pose convention is xyz plus extrinsic XYZ roll, pitch, yaw. The
-controller converts rotations to matrices and uses an SO(3) logarithm for
-impedance error. Wrenches are shifted between the stiffness point, task-frame
-origin, and EE Jacobian point with the corresponding force/moment lever arm.
+controller converts rotations to matrices and uses an SO(3) logarithm where it
+needs an orientation error (the reference-error clamp below); target poses
+handed to Franky are always absolute, in the base frame.
 
-A task command may mix position, velocity, and wrench axes. Relative position
-targets are velocities integrated at 500 Hz. Reference limiting clamps stored
-position error to wrench_limits / kp. Adaptive limiting exponentially shrinks
-the final wrench budget only when measured contact opposes the command.
-Workspace violations suppress outward wrench and add an inward spring.
-Rotational bounds support linear and ccw_arc intervals.
+Task-space control is position-only: Franky's native Cartesian impedance
+motion owns the wrench law, so there is no SHARE-owned VEL or WRENCH axis to
+send it, and ``FrankaTaskFrameCommand`` rejects anything else at construction.
+Relative POS axes are a velocity integrated at 500 Hz -- translation directly,
+rotation via SO(3) composition so a mix of relative axes still yields a proper
+3D rotation. Absolute POS axes are then imposed directly. A reference-error
+clamp limits how far the stored (virtual) target may run ahead of the measured
+pose, to ``force_constraints / stiffness`` per axis, when
+``compliance_reference_limit_enable`` is set for that axis -- pure anti-windup,
+computed entirely on the Python side. Workspace violations clip the target
+pose directly into the configured box; rotational bounds support linear and
+ccw_arc intervals. There is no adaptive, contact-reactive wrench scaling
+anymore -- that required owning the wrench law, which Franky does now.
 
-Custom Python controllers subclass and register FrankaControllerConfig, then
+``translational_stiffness``/``rotational_stiffness`` are scalar (Franky's
+Cartesian impedance is isotropic per axis group, not six independent gains)
+and live-updatable per command -- ``CartesianImpedanceTrackingMotion`` smooths
+``set_gains`` changes itself via ``gains_time_constant``. ``force_constraints``
+and the nullspace ``PostureTask`` (``nullspace_stiffness``/
+``nullspace_max_torque``) are fixed for the whole connection on
+``FrankaConfig``, not per command: Franky fixes both at motion-construction
+time with no live setter, and the posture target is the joint configuration
+captured the moment task-space control starts.
+
+Custom Python strategies subclass and register FrankaControllerConfig, then
 implement make_strategy(). The returned strategy receives a NumPy-only
-FrankaState, the latest complete command snapshot (or None while stale), the
-Franky model handle, and dt on every 500 Hz tick. Its step method may return a
-finite seven-element torque array directly. The built-in adaptive strategy
-returns the same torques together with state-publication diagnostics. This is
-also the boundary intended for a future pybind-backed C++ strategy.
-
+FrankaState, the latest complete command snapshot (or None while stale), and
+dt on every 500 Hz tick, and returns a ReferenceOutput -- the target pose
+Franky should track next, plus state-publication diagnostics. It never
+returns torque or a wrench; Franky's motion computes that from the pose it's
+handed.
 
 Every command is a complete atomic snapshot. If its monotonic timestamp is
 older than 250 ms, the controller captures the measured pose and holds it with
 conservative gains. A fresh complete command resumes control. Parent death,
 Franky watchdog expiry, FCI errors, and strategy exceptions trigger a
-TorqueStopMotion and are raised by the Franka wrapper.
+TorqueStopMotion and are raised by the Franka wrapper -- ``CartesianImpedanceTrackingMotion``
+and ``JointImpedanceTrackingMotion`` are both client-side torque motions
+underneath, so the same graceful-stop path covers either.
+
+Joint-space control is otherwise unchanged and untouched by the above: it
+still streams a clamped joint reference into ``JointImpedanceTrackingMotion``
+and is configured by the separate ``joint_stiffness``/``joint_damping``/
+``joint_error_clip`` fields.
 
 First motion and acceptance
 ---------------------------
@@ -150,13 +185,18 @@ Use this progression for each new robot and host combination:
 1. Pass official communication_test and stream idle SHARE state.
 2. Capture wrench bias and physically verify all force and torque signs.
 3. Test low-gain free-space translation, then rotation, one axis at a time.
-4. Test nullspace posture and soft joint-limit behavior away from hard limits.
-5. Introduce controlled contact and validate reference/adaptive limiting.
+4. Test nullspace posture (PostureTask) and soft joint-limit behavior away
+   from hard limits.
+5. Introduce controlled contact and validate the reference-error clamp
+   (compliance_reference_limit_enable) and force_constraints.
 6. Stop command publication, kill the parent process, and inject a controller
    failure to verify hold, error propagation, and torque stop.
 7. Record 500 Hz loop durations and FCI communication success during a
    sustained run under representative camera and GPU load.
 
-Promote the controller to a native Franky C++ Motion only if these measurements
-show meaningful 500 Hz deadline misses or unacceptable contact-loop stiffness
-or damping.
+The impedance control law itself already runs on Franky's real-time thread,
+not in this Python bridge, so there is no further promotion step for it. If
+step 7 shows meaningful deadline misses, the suspect is the bridge's own
+per-tick work (state read, pose integration, the ``set_reference``/
+``set_gains`` calls) or host latency (see Realtime host setup), not the
+control law.

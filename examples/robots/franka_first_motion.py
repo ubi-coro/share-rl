@@ -1,4 +1,8 @@
-"""Conservative first task-frame motion for an already commissioned FR3."""
+"""Conservative first task-frame motion for an already commissioned FR3.
+
+Task-space control wraps Franky's native CartesianImpedanceTrackingMotion
+(position-only) -- see wiki/franka_setup.rst.
+"""
 
 import time
 
@@ -17,10 +21,18 @@ robot = Franka(
     FrankaConfig(
         robot_ip="172.16.0.2",
         enforce_realtime=True,
+        # Franky's own Cartesian impedance defaults are 2000/200; start an
+        # order of magnitude softer for first contact with a new robot/cell.
+        translational_stiffness=200.0,
+        rotational_stiffness=20.0,
+        # force_constraints/nullspace are fixed for the whole connection --
+        # Franky has no live setter for them -- so they live on the config,
+        # not in a per-command controller_overrides dict (see command below).
+        force_constraints=[15.0, 15.0, 15.0, 2.0, 2.0, 2.0],
         # Set all three payload fields together before contact experiments.
         # payload_mass=...,
         # payload_center_of_mass=[...],
-        # payload_inertia=[...],  # row-major 3x3 matrix
+        # payload_inertia=[...],  # flat row-major 3x3 matrix
     )
 )
 
@@ -57,9 +69,8 @@ try:
                 3.14159,
             ],
             controller_overrides={
-                "kp": [200.0, 200.0, 200.0, 20.0, 20.0, 20.0],
-                "kd": [28.3, 28.3, 28.3, 8.9, 8.9, 8.9],
-                "wrench_limits": [15.0, 15.0, 15.0, 2.0, 2.0, 2.0],
+                "translational_stiffness": 200.0,
+                "rotational_stiffness": 20.0,
                 "compliance_reference_limit_enable": [True] * 6,
             },
         )

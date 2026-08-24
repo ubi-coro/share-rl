@@ -8,7 +8,8 @@ live SpaceMouse and widens the workspace slightly.
 
 Controls:
     - Move/tilt the SpaceMouse cap: relative Cartesian velocity in the world
-      frame, integrated by the 500 Hz controller (see AdaptiveTaskFrameController).
+      frame, integrated by the 500 Hz bridge (see CartesianReferenceController)
+      and tracked by Franky's native CartesianImpedanceTrackingMotion.
     - Button 0: ends the session (a few zero-velocity commands, then a clean
       disconnect). Ctrl-C works too.
 
@@ -17,8 +18,8 @@ Safety:
       controller box for the entire session. Software cannot override either.
     - The commanded workspace is a small box around the pose the arm was in
       when this script connected -- see TRANSLATION_HALF_RANGE_M below.
-    - Gains and wrench_limits below are deliberately soft. Raise them only
-      after this profile feels controllable.
+    - Stiffness and force_constraints below are deliberately soft. Raise them
+      only after this profile feels controllable.
     - use_gripper is off. Enable it in FrankaConfig once arm teleop is
       comfortable, not on the first run.
 """
@@ -52,19 +53,27 @@ TRANSLATION_HALF_RANGE_M = 0.10
 # in m/s / rad/s. Conservative on purpose -- raise once this feels tame.
 ACTION_SCALE = [0.05, 0.05, 0.05, 0.25, 0.25, 0.25]
 
-# Same conservative profile as franka_first_motion.py.
+# Same conservative profile as franka_first_motion.py. force_constraints is
+# not here -- Franky fixes it for the whole connection (no live setter), so
+# it's a FrankaConfig field below, not a per-command controller override.
 CONTROLLER_OVERRIDES = {
-    "kp": [200.0, 200.0, 200.0, 20.0, 20.0, 20.0],
-    "kd": [28.3, 28.3, 28.3, 8.9, 8.9, 8.9],
-    "wrench_limits": [15.0, 15.0, 15.0, 2.0, 2.0, 2.0],
+    "translational_stiffness": 200.0,
+    "rotational_stiffness": 20.0,
     "compliance_reference_limit_enable": [True] * 6,
 }
+FORCE_CONSTRAINTS = [15.0, 15.0, 15.0, 2.0, 2.0, 2.0]
 
 LOOP_HZ = 100.0
 
 
 def main() -> None:
-    robot = Franka(FrankaConfig(robot_ip=ROBOT_IP, enforce_realtime=True))
+    robot = Franka(
+        FrankaConfig(
+            robot_ip=ROBOT_IP,
+            enforce_realtime=True,
+            force_constraints=FORCE_CONSTRAINTS,
+        )
+    )
     teleop = None
 
     try:
