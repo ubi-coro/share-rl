@@ -14,6 +14,12 @@ from scipy.spatial.transform import Rotation as R
 
 from share.envs.manipulation_primitive.task_frame import ControlMode, ControlSpace, PolicyMode, TaskFrame
 from share.robots.adaptive_limits import adaptive_wrench_scales, reference_error_limit
+from share.robots.task_frame_command import (
+    OverrideField,
+    reject_unknown_overrides,
+    resolve_override_fields,
+    resolve_rotation_interval_modes,
+)
 from share.utils.shared_memory import SharedMemoryRingBuffer, SharedMemoryQueue, Empty
 from share.utils.transformation_utils import (
     clip_angle_to_ccw_arc,
@@ -57,6 +63,32 @@ class MotionMode(enum.IntEnum):
     JOINT = 4  # joint-space torque
 
 
+def _validate_force_mode_damping(name: str, value: float) -> None:
+    if math.isfinite(value) and not 0.0 <= value <= 1.0:
+        raise ValueError("force_mode_damping must be in [0, 1]")
+
+
+# The per-axis impedance/compliance knobs a UR task-frame command may
+# override. min_pose/max_pose are handled separately (see
+# TaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS) since their default is
+# dynamic rather than a fixed constant.
+_OVERRIDE_SCHEMA: dict[str, OverrideField] = {
+    "rotation_interval_modes": OverrideField(default=["linear"] * 6, shape=None, dtype=list),
+    "kp": OverrideField(default=[2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0], shape=(6,)),
+    "kd": OverrideField(default=[80.0, 80.0, 80.0, 8.0, 8.0, 8.0], shape=(6,)),
+    "wrench_limits": OverrideField(default=[30.0, 30.0, 30.0, 3.0, 3.0, 3.0], shape=(6,)),
+    "compliance_adaptive_limit_enable": OverrideField(default=[False] * 6, shape=(6,), dtype=np.bool_),
+    "compliance_reference_limit_enable": OverrideField(default=[False] * 6, shape=(6,), dtype=np.bool_),
+    "compliance_desired_wrench": OverrideField(default=[5.0, 5.0, 5.0, 0.5, 0.5, 0.5], shape=(6,)),
+    "compliance_adaptive_limit_min": OverrideField(default=[0.1] * 6, shape=(6,)),
+    "use_force_mode": OverrideField(default=False, shape=None, dtype=bool),
+    "force_mode_damping": OverrideField(
+        default=math.nan, shape=None, dtype=float, validate=_validate_force_mode_damping
+    ),
+    "simple_pose_use_servo": OverrideField(default=False, shape=None, dtype=bool),
+}
+
+
 @dataclass
 class TaskFrameCommand(TaskFrame):
     """Controller command with user-facing rotational pose inputs in RPY.
@@ -66,20 +98,14 @@ class TaskFrameCommand(TaskFrame):
     the controller converts them to rotation vectors before use.
     """
     cmd: Command = Command.SET
-    SUPPORTED_CONTROLLER_OVERRIDE_KEYS: ClassVar[set[str]] = {
-        "kp",
-        "kd",
+
+    # min_pose/max_pose are deliberately not schema entries below: their
+    # default is dynamic -- self.min_pose/self.max_pose (the TaskFrame field
+    # set directly on the command) -- not a fixed constant, so they're
+    # resolved by hand in to_queue_dict.
+    SUPPORTED_CONTROLLER_OVERRIDE_KEYS: ClassVar[frozenset[str]] = frozenset(_OVERRIDE_SCHEMA) | {
         "min_pose",
         "max_pose",
-        "wrench_limits",
-        "compliance_reference_limit_enable",
-        "compliance_adaptive_limit_enable",
-        "compliance_desired_wrench",
-        "compliance_adaptive_limit_min",
-        "rotation_interval_modes",
-        "use_force_mode",
-        "force_mode_damping",
-        "simple_pose_use_servo",
     }
 
     @property
@@ -96,9 +122,7 @@ class TaskFrameCommand(TaskFrame):
         d = asdict(self)
         d.pop("joint_names")
         raw_overrides = d.pop("controller_overrides", None) or {}
-        unknown = set(raw_overrides) - self.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
-        if unknown:
-            raise ValueError(f"Unsupported UR task-frame controller overrides: {', '.join(sorted(unknown))}")
+        reject_unknown_overrides(raw_overrides, self.SUPPORTED_CONTROLLER_OVERRIDE_KEYS, "UR task-frame")
         try:
             d["cmd"] = self.cmd.value
             d.pop("policy_mode", None)
@@ -114,25 +138,9 @@ class TaskFrameCommand(TaskFrame):
                 d["origin"][3:6] = R.from_euler("xyz", d["origin"][3:6], degrees=False).as_rotvec()
             d["max_pose"] = np.asarray(raw_overrides.get("max_pose", self.max_pose)).astype(np.float64)
             d["min_pose"] = np.asarray(raw_overrides.get("min_pose", self.min_pose)).astype(np.float64)
-            d["rotation_interval_modes"] = np.array(
-                [
-                    int(RotationIntervalMode.from_name(str(mode)))
-                    for mode in raw_overrides.get("rotation_interval_modes", ["linear"] * 6)
-                ],
-                dtype=np.int8,
-            )
-            d["kp"] = np.asarray(raw_overrides.get("kp", [2500.0, 2500.0, 2500.0, 150.0, 150.0, 150.0])).astype(np.float64)
-            d["kd"] = np.asarray(raw_overrides.get("kd", [80.0, 80.0, 80.0, 8.0, 8.0, 8.0])).astype(np.float64)
-            d["wrench_limits"] = np.asarray(raw_overrides.get("wrench_limits", [30.0, 30.0, 30.0, 3.0, 3.0, 3.0])).astype(np.float64)
-            d["compliance_adaptive_limit_enable"] = np.asarray(raw_overrides.get("compliance_adaptive_limit_enable", [False] * 6)).astype(np.bool_)
-            d["compliance_reference_limit_enable"] = np.asarray(raw_overrides.get("compliance_reference_limit_enable", [False] * 6)).astype(np.bool_)
-            d["compliance_desired_wrench"] = np.asarray(raw_overrides.get("compliance_desired_wrench", [5.0, 5.0, 5.0, 0.5, 0.5, 0.5])).astype(np.float64)
-            d["compliance_adaptive_limit_min"] = np.asarray(raw_overrides.get("compliance_adaptive_limit_min", [0.1] * 6)).astype(np.float64)
-            d["use_force_mode"] = bool(raw_overrides.get("use_force_mode", False))
-            d["force_mode_damping"] = float(raw_overrides.get("force_mode_damping", np.nan))
-            if np.isfinite(d["force_mode_damping"]) and not 0.0 <= d["force_mode_damping"] <= 1.0:
-                raise ValueError("force_mode_damping must be in [0, 1]")
-            d["simple_pose_use_servo"] = bool(raw_overrides.get("simple_pose_use_servo", False))
+            fields = resolve_override_fields(raw_overrides, _OVERRIDE_SCHEMA)
+            d["rotation_interval_modes"] = resolve_rotation_interval_modes(fields.pop("rotation_interval_modes"))
+            d.update(fields)
         except Exception as e:
             raise ValueError(f"TaskFrameCommand seems to be missing fields: {e}")
 

@@ -34,6 +34,7 @@ from share.robots.ur.lerobot_robot_ur.controller import (
     RTDETaskFrameController,
 )
 from share.robots.ur.lerobot_robot_ur.wrench_monitor import WrenchMonitorProcess
+from share.robots.task_frame_command import merge_controller_overrides
 
 from share.grippers.robotiq_controller import RTDERobotiqController
 from share.utils.transformation_utils import euler_xyz_from_rotvec
@@ -353,14 +354,13 @@ class UR(Robot):
 
 
     def _merged_controller_overrides(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
-        unknown = set(overrides or {}) - TaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS
-        if unknown:
-            raise ValueError(f"Unsupported UR task-frame controller overrides: {', '.join(sorted(unknown))}")
-        merged = dict(self.task_frame.controller_overrides or self._default_controller_overrides())
-        if not overrides:
-            return merged
-        merged.update(overrides)
-        return merged
+        return merge_controller_overrides(
+            self.task_frame.controller_overrides,
+            overrides,
+            TaskFrameCommand.SUPPORTED_CONTROLLER_OVERRIDE_KEYS,
+            "UR task-frame",
+            self._default_controller_overrides,
+        )
 
     def _ensure_control_space(self, space: ControlSpace | int) -> ControlSpace:
         """Lock the robot wrapper to its first commanded control space."""

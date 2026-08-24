@@ -102,6 +102,9 @@ def _load_ur_module(controller_module):
     gripper_module = types.ModuleType("share.grippers.robotiq_controller")
     gripper_module.RTDERobotiqController = object
 
+    wrench_monitor_module = types.ModuleType("share.robots.ur.lerobot_robot_ur.wrench_monitor")
+    wrench_monitor_module.WrenchMonitorProcess = object
+
     ur_parent = types.ModuleType("share.robots.ur")
     ur_parent.__path__ = []
     ur_pkg = types.ModuleType("share.robots.ur.lerobot_robot_ur")
@@ -116,6 +119,7 @@ def _load_ur_module(controller_module):
     sys.modules["share.robots.ur.lerobot_robot_ur"] = ur_pkg
     sys.modules["share.robots.ur.lerobot_robot_ur.config_ur"] = config_module
     sys.modules["share.robots.ur.lerobot_robot_ur.controller"] = controller_module
+    sys.modules["share.robots.ur.lerobot_robot_ur.wrench_monitor"] = wrench_monitor_module
     sys.modules["share.grippers.robotiq_controller"] = gripper_module
 
     module_path = ROOT / "src/share/robots/ur/lerobot_robot_ur/ur.py"
