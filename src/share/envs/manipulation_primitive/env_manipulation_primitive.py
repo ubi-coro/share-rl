@@ -210,6 +210,18 @@ class ManipulationPrimitive(gymnasium.Env):
             for axis in range(min(len(self.task_frame[name].target), len(pose))):
                 self.task_frame[name].target[axis] = float(pose[axis])
 
+    def get_display_points(self) -> dict[str, list[float]]:
+        """Optional hook: named [x, y, z] points, in one common frame, for live 3D
+        visualization -- e.g. each robot's end-effector plus any shared reference
+        point a primitive tracks. Empty by default. ManipulationPrimitiveNet queries
+        whichever primitive is active each step (see its own get_display_points) and
+        callers that show live 3D state (record.py, actor_server.py) simply skip
+        logging when this is empty, so there is nothing to opt into here unless a
+        primitive actually maintains a meaningful shared frame across its robots --
+        see e.g. rail_bimanual_grasp.CooperativeFramePrimitive.
+        """
+        return {}
+
     def _get_observation(self):
         """Collect raw camera pixels and robot observations into one dict."""
         obs_dict = {}

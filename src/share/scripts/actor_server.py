@@ -27,6 +27,7 @@ from lerobot.utils.random_utils import set_seed
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import Transition, move_transition_to_device
 from lerobot.utils.utils import init_logging
+from lerobot.utils.visualization_utils import init_rerun
 
 from share.configs.rl import MPNetTrainRLServerPipelineConfig
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import (
@@ -42,6 +43,7 @@ from share.rl.runtime import (
 from share.teleoperators import TeleopEvents, has_event, is_intervention
 from share.utils.control_utils import predict_action
 from share.utils.device import get_safe_torch_device
+from share.utils.live_points import log_mpnet_live_points
 from share.utils.logging_utils import log_runtime_frequency
 
 
@@ -72,6 +74,9 @@ def run_actor(cfg: MPNetTrainRLServerPipelineConfig, shutdown_event: Any | None 
     print("[ACTOR] Initializing environment...")
     mp_net = ManipulationPrimitiveNet(cfg.env)
     print("[ACTOR] Environment initialized successfully.")
+
+    if cfg.display_data:
+        init_rerun(session_name="actor", ip=cfg.display_ip, port=cfg.display_port)
 
     external_shutdown_event = shutdown_event
     if external_shutdown_event is None:
@@ -209,11 +214,19 @@ def act_with_policy(
             "total_steps": 0,
             "policy_inference_dts": [],
             "pending_transitions": [],
-            # Sticky success flag so we can report whether the segment solved the task.
-            "success": False,
         }
 
-    def publish_segment(active_primitive: str, variant: str) -> None:
+    def publish_segment(active_primitive: str, variant: str, info: dict[str, Any]) -> bool:
+        """Push the segment's transitions and interaction stats, and report whether it ended in
+        success. Episode success specifically means an operator asserted TeleopEvents.SUCCESS --
+        distinct from reward, since a RewardClassifierTransition can also grant reward with no
+        operator present. False during unattended classifier-driven rollout is correct then, not
+        a bug: it honestly reports "no operator validated this one", not "the task wasn't solved"
+        (see "Episodic reward" alongside it for that). done/truncated only ever go True on the
+        exact step a graph Transition fires, so this step's info already carries whatever flag
+        matters -- no need to track a sticky flag across every step of the segment.
+        """
+        success = bool(has_event(info, TeleopEvents.SUCCESS))
         push_transitions_to_transport_queue(
             transitions=segment_state["pending_transitions"],
             transitions_queue=transitions_queue,
@@ -236,7 +249,7 @@ def act_with_policy(
                         "Variant": variant,
                         "Interaction step": collection_counts[active_primitive],
                         "Episodic reward": segment_state["reward_sum"],
-                        "Episode success": int(segment_state["success"]),
+                        "Episode success": int(success),
                         "Episode intervention": int(segment_state["intervention_steps"] > 0),
                         "Intervention rate": intervention_rate,
                         "Cycle time [s]": cycle_time_s,
@@ -244,6 +257,7 @@ def act_with_policy(
                     }
                 )
             )
+        return success
 
     def reset_active_policy() -> None:
         policy = policies.get(env.active_primitive)
@@ -355,6 +369,8 @@ def act_with_policy(
                 action = torch.zeros((env.action_dim,), dtype=torch.float32)
 
             new_transition = env.step(action)
+            if cfg.display_data:
+                log_mpnet_live_points(env)
             reward = float(new_transition[TransitionKey.REWARD])
             done = bool(new_transition.get(TransitionKey.DONE, False))
             truncated = bool(new_transition.get(TransitionKey.TRUNCATED, False))
@@ -367,7 +383,6 @@ def act_with_policy(
                 segment_state["reward_sum"] += reward
                 segment_state["total_steps"] += 1
                 collection_counts[active_primitive] += 1
-                segment_state["success"] = segment_state["success"] or has_event(info, TeleopEvents.SUCCESS)
 
                 intervention_active = is_intervention(info)
                 if intervention_active:
@@ -399,15 +414,13 @@ def act_with_policy(
                 if policy is not None and rerecord_requested:
                     collection_counts[active_primitive] -= segment_state["total_steps"]
                 elif policy is not None:
-                    # Success may only be asserted on the terminal step; fold it in before publishing.
-                    segment_state["success"] = segment_state["success"] or has_event(info, TeleopEvents.SUCCESS)
                     variant = env.config.primitives[active_primitive].task_description or active_primitive
-                    publish_segment(active_primitive, variant)
+                    success = publish_segment(active_primitive, variant, info)
                     logging.info(
                         "[ACTOR] adaptive_episode primitive=%s variant=%s success=%s reward=%.3f length=%d",
                         active_primitive,
                         variant,
-                        segment_state["success"],
+                        success,
                         segment_state["reward_sum"],
                         segment_state["total_steps"],
                     )

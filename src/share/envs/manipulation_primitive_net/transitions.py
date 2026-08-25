@@ -234,6 +234,14 @@ class RewardClassifierTransition(Transition):
         probability = self._success_probability(obs)
         info[self.prob_info_key] = probability
         fired = compare(probability, self.threshold, self.operator)
+        if fired:
+            # The classifier is just another success detector alongside a human pressing the
+            # SUCCESS button/key -- write into the same canonical flag rather than a
+            # classifier-specific one, so every existing consumer (actor/record telemetry,
+            # any other OnSuccess edge reading this same key) picks it up for free. Only ever
+            # set True here, never reset to False: a human asserting it on the same step must
+            # not be clobbered by this transition not firing.
+            info[TeleopEvents.SUCCESS] = True
         return Outcome(
             terminated=fired,
             truncated=False,

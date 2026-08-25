@@ -12,12 +12,8 @@ class RecordConfig(MPNetTrainRLServerPipelineConfig):
     use_policy: bool = True
     # Whether to save only intervention/correction steps instead of the full rollout.
     save_only_interventions: bool = False
-    # Display all cameras on screen
-    display_data: bool = False
-    # Display data on a remote Rerun server
-    display_ip: str | None = None
-    # Port of the remote Rerun server
-    display_port: int | None = None
+    # display_data/display_ip/display_port live on MPNetTrainRLServerPipelineConfig now,
+    # shared with actor_server.py -- see there.
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
     # Use vocal synthesis to read events.

@@ -30,6 +30,7 @@ from share.teleoperators import TeleopEvents, has_event, is_intervention
 from share.utils.control_utils import make_policies_and_datasets, predict_action
 from share.utils.device import get_safe_torch_device
 from share.utils.env_config_snapshot import save_env_config_snapshot
+from share.utils.live_points import log_mpnet_live_points
 from share.utils.video_utils import MultiVideoEncodingManager
 
 init_logging()
@@ -125,6 +126,8 @@ def record_loop(
         new_transition = mp_net.step(action)
         if debugger is not None:
             debugger.log_step(mp_net, new_transition)
+        if display_data:
+            log_mpnet_live_points(mp_net)
 
         action = new_transition[TransitionKey.ACTION]
         reward = new_transition[TransitionKey.REWARD]
@@ -137,7 +140,7 @@ def record_loop(
         # A live human hand practically never repeats a value bit-for-bit across steps, so a
         # nonzero action that stops changing for several consecutive steps points at a frozen
         # upstream reading (e.g. a dropped "device went idle" HID report) rather than real input.
-        _action_list = [round(float(v), 6) for v in (action.squeeze().tolist() if hasattr(action, "squeeze") else list(action))]
+        _action_list = [round(float(v), 6) for v in (action.flatten().tolist() if hasattr(action, "flatten") else list(action))]
         _is_nonzero = any(abs(v) > 1e-4 for v in _action_list)
         if _is_nonzero and _action_list == _debug_prev_action:
             _debug_stuck_count += 1
@@ -179,9 +182,15 @@ def record_loop(
             dataset.add_frame(frame)
 
             if display_data:
+                # log_rerun_data expects dicts (it does `if action:` / `.items()`), not a raw
+                # tensor -- passing the tensor directly makes `if action:` ambiguous for any
+                # multi-element action. flatten (not squeeze) so a 1-element action stays 1-D
+                # instead of collapsing to a 0-d array, which log_rerun_data would misread as
+                # an image.
                 rerun_obs = {k: v.numpy() for k, v in dataset_observation.items()}
+                rerun_action = {ACTION: action.flatten().cpu().numpy()}
                 log_rerun_data(
-                    observation=rerun_obs, action=action.squeeze().cpu(), compress_images=display_compressed_images
+                    observation=rerun_obs, action=rerun_action, compress_images=display_compressed_images
                 )
 
         # (5) Update current observation
@@ -233,8 +242,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     # origin-visualizing one) -- ManipulationPrimitiveNetConfig.make() already does the latter
     # by default, so this is a no-op for every other env config.
     mp_net = cfg.env.make()
-    if cfg.dataset is not None and cfg.dataset.root is not None:
-        save_env_config_snapshot(cfg.env, cfg.dataset.root)
+    #if cfg.dataset is not None and cfg.dataset.root is not None:
+    #    save_env_config_snapshot(cfg.env, cfg.dataset.root)
     force_intervention = not cfg.use_policy
     mp_net.set_step_info({TeleopEvents.IS_INTERVENTION: True} if force_intervention else None)
     debugger = None

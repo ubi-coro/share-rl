@@ -17,6 +17,7 @@ from share.envs.manipulation_primitive_net.transitions import (
     OnTimeLimit,
     RewardClassifierTransition,
 )
+from share.teleoperators import TeleopEvents
 
 
 def test_always_transition_terminates_immediately():
@@ -106,6 +107,35 @@ def test_reward_classifier_transition_is_noop_below_threshold():
     assert outcome.truncated is False
     assert outcome.reward == 0.0
     assert outcome.reason is None
+
+
+def test_reward_classifier_transition_asserts_the_canonical_success_event_when_it_fires():
+    """A classifier-detected success and a human pressing SUCCESS are two detectors for the
+    same underlying event -- both should feed TeleopEvents.SUCCESS, the one flag every existing
+    consumer (actor/record telemetry, any other OnSuccess edge) already reads, instead of the
+    classifier growing its own separate signal that those consumers would have to special-case."""
+    transition = RewardClassifierTransition(source="pick", target="done", threshold=0.5)
+    transition._success_probability = lambda obs: 0.9  # bypass loading a real pretrained model
+
+    info: dict = {}
+    outcome = transition.evaluate(obs={}, info=info)
+
+    assert outcome.terminated is True
+    assert info[TeleopEvents.SUCCESS] is True
+
+
+def test_reward_classifier_transition_never_clears_an_already_asserted_success_event():
+    """Below threshold, this transition simply didn't detect success -- it must not stomp a
+    True already asserted this same step by something else (e.g. a human pressing the button
+    on the very step the classifier happens to disagree)."""
+    transition = RewardClassifierTransition(source="pick", target="done", threshold=0.5)
+    transition._success_probability = lambda obs: 0.1
+
+    info = {TeleopEvents.SUCCESS: True}
+    outcome = transition.evaluate(obs={}, info=info)
+
+    assert outcome.terminated is False
+    assert info[TeleopEvents.SUCCESS] is True
 
 
 def test_target_pose_transition_defaults_to_fixed_pos_axes():

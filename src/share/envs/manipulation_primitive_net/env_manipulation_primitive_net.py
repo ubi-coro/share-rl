@@ -433,6 +433,18 @@ class ManipulationPrimitiveNet(gym.Env):
         self._pending_entry_context = None
         return processed_transition
 
+    def get_display_points(self) -> dict[str, list[float]]:
+        """Live 3D points {name: [x, y, z]} for visualization, delegated to whichever
+        primitive is currently active -- see ManipulationPrimitive.get_display_points.
+        The active primitive alone decides what it has to show (e.g. rail_bimanual_
+        grasp's cooperative primitives add a shared "vtcp" point on top of both
+        robots' end-effectors, others just report {}); MP-Net itself stays agnostic
+        of what any of that means."""
+        env = self._envs.get(self._active)
+        if env is None:
+            return {}
+        return env.get_display_points()
+
     def sample_action(self, primitive: str | None = None) -> Any:
         if primitive is None:
             primitive = self._active

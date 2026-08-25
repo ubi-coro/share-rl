@@ -6,21 +6,27 @@ registers itself with ``EnvConfig.register_subclass`` when its module is
 actually imported, every new env config module added under
 ``experiments/envs`` must be imported here (or from a subpackage ``__init__``
 that is itself imported here, as with ``foundationpose``).
+
+``experiments/envs/archive/`` holds env configs that are no longer actively worked on --
+deliberately not imported here, so they don't show up as an ``--env.type`` choice. Import them
+directly by path if you need to run one again (e.g. ``experiments.envs.archive.bimanual_pick``,
+archived once ``rail_bimanual_grasp.py`` grew its own self-contained copy of
+``CooperativeFramePrimitive`` and no longer needed anything from it).
 """
 
 import logging
 
-from experiments.envs.bimanual_pick import BimanualPickEnvConfig
 from experiments.envs.capture_images import CaptureImagesEnvConfig
 from experiments.envs.fiddle_out import DemoUR3eTeleopFiddleOutEnvConfig
+from experiments.envs.rail_bimanual_grasp import RailBimanualGraspEnvConfig
 from experiments.envs.teleop_spacemouse_6dof import TeleopSpaceMouse6DofEnvConfig
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "BimanualPickEnvConfig",
     "CaptureImagesEnvConfig",
     "DemoUR3eTeleopFiddleOutEnvConfig",
+    "RailBimanualGraspEnvConfig",
     "TeleopSpaceMouse6DofEnvConfig",
 ]
 

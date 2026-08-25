@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rail Insertion Runbook</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f0f1f4;
+    --surface: #ffffff;
+    --surface-2: #e8eaef;
+    --text: #1d2129;
+    --muted: #5a6270;
+    --faint: #8a92a0;
+    --border: #d7dbe2;
+    --accent: #c96a1f;
+    --accent-ink: #7a3f0f;
+    --accent-soft: #fbeade;
+    --warn: #a5382a;
+    --warn-soft: #fbe8e4;
+    --code-bg: #191c22;
+    --code-text: #dfe3ea;
+    --code-var: #f0b26b;
+    --code-comment: #7d8590;
+    --shadow: 0 1px 2px rgba(20, 24, 32, 0.06), 0 8px 24px -12px rgba(20, 24, 32, 0.18);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161b;
+      --surface: #1b1e25;
+      --surface-2: #23272f;
+      --text: #e7e9ee;
+      --muted: #a3aab8;
+      --faint: #6b7280;
+      --border: #2d323c;
+      --accent: #e5924a;
+      --accent-ink: #ffd9b0;
+      --accent-soft: #2e2318;
+      --warn: #e2685a;
+      --warn-soft: #2e1c1a;
+      --code-bg: #101216;
+      --code-text: #dfe3ea;
+      --code-var: #f0b26b;
+      --code-comment: #6b7280;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #14161b;
+    --surface: #1b1e25;
+    --surface-2: #23272f;
+    --text: #e7e9ee;
+    --muted: #a3aab8;
+    --faint: #6b7280;
+    --border: #2d323c;
+    --accent: #e5924a;
+    --accent-ink: #ffd9b0;
+    --accent-soft: #2e2318;
+    --warn: #e2685a;
+    --warn-soft: #2e1c1a;
+    --code-bg: #101216;
+    --code-text: #dfe3ea;
+    --code-var: #f0b26b;
+    --code-comment: #6b7280;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    margin: 0;
+    padding: 3.5rem 1.5rem 6rem;
+  }
+
+  .page {
+    max-width: 840px;
+    margin: 0 auto;
+  }
+
+  code, pre, .mono, .env-block { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  /* ---------- header ---------- */
+
+  header.hero {
+    margin-bottom: 3rem;
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    display: inline-block;
+    padding: 0.3rem 0.65rem;
+    border-radius: 3px;
+    margin-bottom: 1rem;
+  }
+
+  h1 {
+    font-size: clamp(2rem, 4vw, 2.6rem);
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    margin: 0 0 0.6rem;
+    text-wrap: balance;
+  }
+
+  .dek {
+    color: var(--muted);
+    font-size: 1.05rem;
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  nav.quicknav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1.75rem;
+  }
+
+  nav.quicknav a {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem;
+    color: var(--text);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 0.4rem 0.75rem;
+    border-radius: 5px;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+
+  nav.quicknav a:hover,
+  nav.quicknav a:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    outline: none;
+  }
+
+  /* ---------- sections ---------- */
+
+  section {
+    margin-bottom: 3rem;
+    scroll-margin-top: 1.5rem;
+  }
+
+  .step-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.85rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .step-letter {
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    width: 1.9rem;
+    height: 1.9rem;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+  }
+
+  h2 {
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+
+  h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin: 1.6rem 0 0.6rem;
+  }
+
+  section > p {
+    color: var(--muted);
+    max-width: 68ch;
+    margin: 0.35rem 0 1.1rem 2.75rem;
+  }
+
+  section > p.no-indent { margin-left: 0; }
+
+  .step-body { margin-left: 2.75rem; }
+
+  /* ---------- code blocks ---------- */
+
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    border-radius: 8px;
+    padding: 1.1rem 1.25rem;
+    overflow-x: auto;
+    font-size: 0.84rem;
+    line-height: 1.65;
+    box-shadow: var(--shadow);
+    margin: 0 0 1rem;
+  }
+
+  pre .flag { color: var(--code-text); }
+  pre .var { color: var(--code-var); }
+  pre .comment { color: var(--code-comment); font-style: italic; }
+  pre .str { color: #9fd18a; }
+
+  .env-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.1rem 1.25rem;
+    font-size: 0.84rem;
+    line-height: 1.75;
+    box-shadow: var(--shadow);
+  }
+  .env-block .var { color: var(--accent-ink); font-weight: 500; }
+  .env-block .comment { color: var(--faint); }
+
+  code.inline {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    font-size: 0.85em;
+  }
+
+  /* ---------- callouts ---------- */
+
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    border-radius: 0 6px 6px 0;
+    padding: 0.85rem 1.1rem;
+    margin: 0.9rem 0 1.1rem;
+    font-size: 0.92rem;
+    color: var(--text);
+  }
+  .note strong { color: var(--accent-ink); }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 3rem 0;
+  }
+
+  /* ---------- findings ---------- */
+
+  .finding {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    background: var(--surface);
+    border-radius: 0 8px 8px 0;
+    padding: 1.1rem 1.3rem;
+    margin-bottom: 1.1rem;
+    box-shadow: var(--shadow);
+  }
+
+  .finding.good { border-left-color: var(--accent); }
+
+  .finding-tag {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--warn);
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  .finding.good .finding-tag { color: var(--accent-ink); }
+
+  .finding h4 {
+    margin: 0 0 0.5rem;
+    font-size: 1.02rem;
+    font-weight: 600;
+  }
+
+  .finding p {
+    margin: 0.5rem 0;
+    color: var(--muted);
+  }
+
+  .finding p:first-of-type { margin-top: 0; }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--faint);
+    font-size: 0.8rem;
+  }
+
+  @media (max-width: 560px) {
+    section > p, .step-body { margin-left: 0; }
+    .step-head { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+
+
+<div class="page">
+
+<header class="hero">
+  <span class="eyebrow">🦾 UR bimanual rail insertion · rail_bimanual_grasp</span>
+  <h1>Rail Insertion Runbook</h1>
+  <p class="dek">Record demonstrations, train the success classifier, bootstrap a larger dataset with it, and launch actor/learner RL — in that order — for <code class="inline">rail_bimanual_grasp</code>.</p>
+  <nav class="quicknav">
+    <a href="#step-0">0 · Crop</a>
+    <a href="#setup">Setup</a>
+    <a href="#step-a">A · Record</a>
+    <a href="#step-b">B · Classifier</a>
+    <a href="#step-c">C · Bootstrap</a>
+    <a href="#visualize">Visualize</a>
+    <a href="#step-d">D · Train</a>
+    <a href="#recovery">Stuck?</a>
+    <a href="#notes">Notes</a>
+  </nav>
+</header>
+
+<section id="step-0">
+  <div class="step-head"><span class="step-letter">0</span><h2>Calibrate the camera crop</h2></div>
+  <p>Do this first, before recording anything — every downstream step (dataset images, the classifier, the policy) depends on <code class="inline">_processor()</code>'s hardcoded <code class="inline">crop_params_dict={"left": [...]}</code> actually framing the workpiece. Re-run it any time the camera moves.</p>
+  <div class="step-body">
+<pre>MPLBACKEND=qtagg python src/share/scripts/utils/find_crop_params.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp</pre>
+    <p class="no-indent">Env-agnostic — it connects whatever cameras <code class="inline">rail_bimanual_grasp</code> configures (just <code class="inline">"left"</code> here), not a hoermann-specific tool. Drag a box around the workpiece in the window that opens, press <code class="inline">w</code> to print <code class="inline">[top, left, height, width]</code>, <code class="inline">q</code> to quit. No <code class="inline">--object_dir</code> given, so nothing gets written automatically — copy the printed box into <code class="inline">crop_params_dict</code> in <code class="inline">rail_bimanual_grasp.py</code>'s <code class="inline">_processor()</code> by hand.</p>
+  </div>
+</section>
+
+<section id="setup">
+  <h2>Setup</h2>
+  <p class="no-indent" style="margin-top:0.6rem;">Run every command below from the repo root. Only <code class="inline">cooperative_insert</code> — the one primitive with a policy attached — ever gets recorded; every other primitive (align, grasp, calibrate, reset) is scripted or manual setup and produces no dataset frames.</p>
+  <div class="env-block"><pre style="all:unset; white-space:pre-wrap;"><span class="comment"># repo root: /home/jstranghoener/PyCharmProjects/share-rl</span>
+<span class="var">export DATASET_ROOT</span>=/media/internal/nvme/shared_data/weidmueller/insertion/data
+<span class="var">export DATASET_REPO_ID</span>=insertion
+<span class="var">export JOB_NAME</span>=rail_bimanual_grasp_sac</pre></div>
+</section>
+
+<section id="step-a">
+  <div class="step-head"><span class="step-letter">A</span><h2>Record demonstrations</h2></div>
+  <p><code class="inline">skip_grasp=false</code> walks the full setup chain once — align to the rail, grasp left, grasp right, zero the F/T sensors, teleop <code class="inline">ry</code> to the right angle — then loops <code class="inline">cooperative_reset ⇄ cooperative_insert</code>. Only the <code class="inline">cooperative_insert</code> half of that loop is recorded; the setup chain never repeats after the first pass.</p>
+  <div class="step-body">
+<pre>python src/share/scripts/record.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp \
+  <span class="flag">--env.skip_grasp</span>=false \
+  <span class="flag">--env.mock</span>=false \
+  <span class="flag">--use_policy</span>=false \
+  <span class="flag">--dataset.root</span>=$DATASET_ROOT \
+  <span class="flag">--dataset.repo_id</span>=$DATASET_REPO_ID \
+  <span class="flag">--dataset.num_episodes</span>=30 \
+  <span class="flag">--dataset.single_task</span>=<span class="str">"Insert the workpiece"</span> \
+  <span class="flag">--dataset.push_to_hub</span>=false</pre>
+    <div class="note">SUCCESS fires on either SpaceMouse button or space; STOP_RECORDING is the other SpaceMouse button or the down arrow. Demonstrate genuine variety in <code class="inline">cooperative_insert</code> — successes <em>and</em> realistic near-misses — the classifier in step B learns entirely from this data.</div>
+    <p class="no-indent">Writes to <code class="inline">$DATASET_ROOT/cooperative_insert</code> as repo id <code class="inline">$DATASET_REPO_ID-cooperative_insert</code>. Each episode auto-truncates after 5s if nothing else has fired yet (<code class="inline">cooperative_insert_episode_duration_s</code>, overridable with <code class="inline">--env.cooperative_insert_episode_duration_s=&lt;seconds&gt;</code>).</p>
+  </div>
+</section>
+
+<section id="step-b">
+  <div class="step-head"><span class="step-letter">B</span><h2>Train the reward classifier</h2></div>
+  <p>Plain <code class="inline">argparse</code> script, not draccus — flags use single dashes, not <code class="inline">--env.</code> prefixes.</p>
+  <div class="step-body">
+<pre>python src/share/scripts/train_reward_classifier.py \
+  <span class="flag">--dataset-root</span> $DATASET_ROOT/cooperative_insert \
+  <span class="flag">--output-dir</span> $DATASET_ROOT/reward_classifier \
+  <span class="flag">--image-size</span> 128</pre>
+    <h3>Find the checkpoint</h3>
+    <p class="no-indent">Step C needs an actual checkpoint path — the step-numbered folder varies per run:</p>
+<pre>find $DATASET_ROOT/reward_classifier/checkpoints -maxdepth 1 -type d | sort
+<span class="comment"># pick the highest step, then point at its pretrained_model subfolder:</span>
+<span class="var">export CLASSIFIER</span>=$DATASET_ROOT/reward_classifier/checkpoints/002000/pretrained_model</pre>
+  </div>
+</section>
+
+<section id="step-c">
+  <div class="step-head"><span class="step-letter">C</span><h2>Bootstrap more demonstrations</h2></div>
+  <p>Same recording run, now with the classifier live and <code class="inline">skip_grasp=true</code> — jump straight into <code class="inline">zero_ft_before_cooperative → cooperative_reset</code> instead of re-grasping and re-calibrating <code class="inline">ry</code> every session. This assumes the rig is still physically holding the rail from step A — <code class="inline">ry</code> gets re-measured from the arm's actual pose, not a stored value, so as long as it hasn't moved, it comes out right on its own.</p>
+  <div class="step-body">
+<pre>python src/share/scripts/record.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp \
+  <span class="flag">--env.skip_grasp</span>=true \
+  <span class="flag">--env.mock</span>=false \
+  <span class="flag">--env.reward_classifier_path</span>=$CLASSIFIER \
+  <span class="flag">--env.reward_classifier_threshold</span>=0.7 \
+  <span class="flag">--env.reward_classifier_device</span>=cuda \
+  <span class="flag">--use_policy</span>=false \
+  <span class="flag">--resume</span>=true \
+  <span class="flag">--dataset.root</span>=$DATASET_ROOT \
+  <span class="flag">--dataset.repo_id</span>=$DATASET_REPO_ID \
+  <span class="flag">--dataset.num_episodes</span>=60 \
+  <span class="flag">--dataset.single_task</span>=<span class="str">"Insert the workpiece"</span> \
+  <span class="flag">--dataset.push_to_hub</span>=false</pre>
+    <p class="no-indent">The classifier is an <em>additional</em> automatic SUCCESS trigger, not a replacement — manual (space/button) and the 5s time limit still work exactly as before, whichever fires first wins. <code class="inline">--dataset.num_episodes</code> is the running total the dataset should reach, not an added count — 60 here assumes step A already left it at 30.</p>
+  </div>
+</section>
+
+<section id="visualize">
+  <h2>Visualize a recorded episode</h2>
+  <p class="no-indent" style="margin-top:0.6rem;">Sanity-check what actually got recorded — same <code class="inline">$DATASET_ROOT</code>/<code class="inline">$DATASET_REPO_ID</code> from Setup, with <code class="inline">cooperative_insert</code>'s own root/repo-id suffix (record.py's per-primitive dataset convention — see the Setup note above).</p>
+  <div class="step-body">
+<pre>lerobot-dataset-viz \
+  <span class="flag">--repo-id</span> ${DATASET_REPO_ID}-cooperative_insert \
+  <span class="flag">--root</span> $DATASET_ROOT/cooperative_insert \
+  <span class="flag">--episode-index</span> 23</pre>
+    <p class="no-indent">Spawns a local rerun.io viewer. Swap <code class="inline">--episode-index</code> for whichever episode you want to inspect (0-indexed).</p>
+  </div>
+</section>
+
+<section id="step-d">
+  <div class="step-head"><span class="step-letter">D</span><h2>Actor / learner RL</h2></div>
+  <p>The learner claims the robots' RTDE registers first, reads feature shapes, then releases them — start it first and wait for it to log <code class="inline">ROBOT_RELEASED</code> before starting the actor, or the actor's connection collides with the learner's. Neither command passes <code class="inline">--policy.path</code>: leaving it unset keeps <code class="inline">cooperative_insert</code>'s own baked-in fresh <code class="inline">SACConfig(device="cpu", storage_device="cpu")</code>.</p>
+  <div class="step-body">
+    <h3>Learner — start first, wait for ROBOT_RELEASED</h3>
+<pre>python src/share/scripts/learner_server.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp \
+  <span class="flag">--env.mock</span>=false \
+  <span class="flag">--env.skip_grasp</span>=true \
+  <span class="flag">--env.reward_classifier_path</span>=$CLASSIFIER \
+  <span class="flag">--env.reward_classifier_threshold</span>=0.7 \
+  <span class="flag">--dataset.root</span>=$DATASET_ROOT \
+  <span class="flag">--dataset.repo_id</span>=$DATASET_REPO_ID \
+  <span class="flag">--job_name</span>=$JOB_NAME \
+  <span class="flag">--wandb.enable</span>=true \
+  <span class="flag">--wandb.project</span>=rail_bimanual_grasp</pre>
+    <h3>Actor — foreground, after ROBOT_RELEASED</h3>
+<pre>python src/share/scripts/actor_server.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp \
+  <span class="flag">--env.mock</span>=false \
+  <span class="flag">--env.skip_grasp</span>=true \
+  <span class="flag">--env.reward_classifier_path</span>=$CLASSIFIER \
+  <span class="flag">--env.reward_classifier_threshold</span>=0.7 \
+  <span class="flag">--dataset.root</span>=$DATASET_ROOT \
+  <span class="flag">--dataset.repo_id</span>=$DATASET_REPO_ID \
+  <span class="flag">--job_name</span>=$JOB_NAME</pre>
+    <div class="note">Reconnecting a dropped actor: rerun its command unchanged — same <code class="inline">--job_name</code>, same dataset flags. The learner keeps running with its checkpoints in place; stop it deliberately (Ctrl-C in its own pane) only when you mean to.</div>
+  </div>
+</section>
+
+<hr class="divider">
+
+<section id="recovery">
+  <h2 style="margin-bottom:1.25rem;">If you get stuck in a singularity</h2>
+  <div class="finding">
+    <span class="finding-tag">Recovery</span>
+    <h4>Force mode itself is what's stuck — turn it off to drive clear</h4>
+    <p>A force-mode singularity can leave the arms stuck under <code class="inline">cooperative_reset</code>'s normal compliant teleop, with no way to move away from it — the compliant controller is what's caught, so no amount of pushing through it with the SpaceMouse helps. The only way out is rigid, non-compliant teleop: <code class="inline">--env.cooperative_reset_servo_recovery=true</code> makes <code class="inline">cooperative_reset</code> itself servo-position-controlled instead of force-controlled (the same <code class="inline">use_force_mode=false</code> + <code class="inline">simple_pose_use_servo=true</code> combination <code class="inline">align_to_rail</code>/<code class="inline">zero_ft</code> already use), so the SpaceMouse streams rigid position commands you can drive out of the singularity with. It requires <code class="inline">skip_grasp=true</code> — enforced, raises a <code class="inline">ValueError</code> otherwise — since it only makes sense entering straight into the stuck loop.</p>
+  </div>
+  <div class="step-body">
+<pre>python src/share/scripts/record.py \
+  <span class="flag">--env.type</span>=rail_bimanual_grasp \
+  <span class="flag">--env.mock</span>=false \
+  <span class="flag">--env.skip_grasp</span>=true \
+  <span class="flag">--env.cooperative_reset_servo_recovery</span>=true \
+  <span class="flag">--use_policy</span>=false \
+  <span class="flag">--dataset</span>=null</pre>
+    <p class="no-indent">Drive the arms clear with the SpaceMouse, stop the process, then start your normal command again with <code class="inline">cooperative_reset_servo_recovery</code> left out (or explicitly <code class="inline">false</code>) — it's a recovery switch, not a normal operating mode, and <code class="inline">cooperative_insert</code>'s own compliance is untouched by it either way.</p>
+  </div>
+</section>
+
+<section id="notes">
+  <h2 style="margin-bottom:1.25rem;">Notes from reading the config</h2>
+
+  <div class="finding good">
+    <span class="finding-tag">Added this session</span>
+    <h4>Up arrow in cooperative_reset re-teleops ry, no full reset needed</h4>
+    <p>Jumps straight to <code class="inline">calibrate_ry_angle</code> (unlocks <code class="inline">ry</code> for live teleop again) without walking back through <code class="inline">align_to_rail</code>/<code class="inline">teleop_left</code>/<code class="inline">teleop_right</code>. <code class="inline">calibrate_ry_angle</code>'s own success edge already routes back through <code class="inline">zero_ft_before_cooperative</code> → <code class="inline">cooperative_reset</code> afterward, so it's a self-contained detour, not a new loop shape. Bound nowhere else.</p>
+  </div>
+
+  <div class="finding good">
+    <span class="finding-tag">Added this session</span>
+    <h4>cooperative_insert's observation grew delta-position and previous-action</h4>
+    <p>On top of the driver-only xyz velocity every other cooperative primitive gets, <code class="inline">cooperative_insert</code> now also observes delta position from wherever the driver was when the episode started, and the previous step's action — closer to Markovian without needing pose history. Both reuse existing observation-state slots with custom axis names (<code class="inline">dx/dy/dz.ee_pos</code>, <code class="inline">prev_x/prev_y/prev_z.ee_vel</code>) rather than a new shared processor step. <code class="inline">dataset_stats["observation.state"]</code> is set explicitly to match — position bound is half of <code class="inline">cooperative_insert_position_range_m</code> (default 0.05, i.e. an assumed 5×5×5 cm cube), previous-action shares <code class="inline">translation_action_scale</code> since it's that same m/s quantity, one step delayed.</p>
+  </div>
+
+  <div class="finding good">
+    <span class="finding-tag">Added this session</span>
+    <h4>5-second auto-truncation on <code class="inline">cooperative_insert</code></h4>
+    <p>The graph had no timeout at all before — an episode ran until SUCCESS or the classifier fired, full stop. Added <code class="inline">cooperative_insert_episode_duration_s: float = 5.0</code> plus an <code class="inline">OnTimeLimit(source="cooperative_insert", target="cooperative_reset", …)</code> edge, mirroring the pattern used elsewhere for insertion tasks. It's listed first among <code class="inline">cooperative_insert</code>'s outgoing edges as a safety fallback, but in practice never races the manual/classifier triggers — it only fires when neither has. Tests updated and passing (35/35).</p>
+  </div>
+
+  <div class="finding good">
+    <span class="finding-tag">Added this session</span>
+    <h4>Reproducible <code class="inline">ry</code> via <code class="inline">--env.ry_angle</code></h4>
+    <p><code class="inline">calibrate_ry_angle</code>'s live teleop-and-measure now has a reproducible alternative: <code class="inline">ry_angle</code> supplies an exact value instead of freezing whatever the arm's actual pose happens to measure on entry — no run-to-run variance from a fresh grasp or re-home. Requires <code class="inline">skip_grasp=true</code> (enforced, raises a <code class="inline">ValueError</code> otherwise) — <code class="inline">calibrate_ry_angle</code> is unreachable there anyway, and <code class="inline">ry_angle</code> is what fills in for it. Fixed a real bug along the way: naively wiring the override in made <code class="inline">CooperativeFramePrimitive</code> capture the driver's grasp-geometry offset from its <em>raw</em> measured pose, which silently reconstructed the original (un-overridden) value the moment a target got sent — the override looked like it took effect internally but never reached the robot.</p>
+  </div>
+
+  <div class="finding good">
+    <span class="finding-tag">Added this session</span>
+    <h4>Driver-only, xyz-only velocity observation — dropped the redundant/rotated signal</h4>
+    <p>Traced through <code class="inline">share/processor/observation.py</code>: each robot's <code class="inline">.ee_vel</code> was read straight from its own raw observation, uncomposited through <code class="inline">robot_base_pose_in_world</code> or the vtcp rotation — left and right reported velocity in two different native/base frames, six axes each, most of it either redundant (both arms move together, up to inertia) or meaningless (rotation is locked entirely in every cooperative primitive). Every primitive sharing <code class="inline">cooperative_processor</code> — <code class="inline">zero_ft</code> through <code class="inline">cooperative_insert</code> — now observes just the driver's xyz velocity (3 values, down from up to 12): a clean, near-Markovian signal instead of two robots' worth of largely-redundant, differently-rotated noise. <code class="inline">align_to_rail</code>/<code class="inline">teleop_left</code>/<code class="inline">teleop_right</code> keep the old broad default — they don't feed a policy.</p>
+  </div>
+
+  <div class="finding">
+    <span class="finding-tag">Resume support</span>
+    <h4><code class="inline">pivot_offset_x</code> isn't carried across process restarts</h4>
+    <p>Unlike <code class="inline">ry</code> (re-measured from the arm's actual pose every activation, so it survives a restart on its own), <code class="inline">pivot_offset_x</code> lives only in shared runtime state, cleared on every full reset. If step A's live <code class="inline">,</code>/<code class="inline">.</code> tuning found a good value, pass it explicitly in steps C and D — <code class="inline">--env.pivot_offset_x=&lt;value&gt;</code> — or it silently restarts from 0.0 and re-tunes live in <code class="inline">cooperative_reset</code>.</p>
+  </div>
+
+  <div class="finding">
+    <span class="finding-tag">Concurrent edit</span>
+    <h4><code class="inline">alignment_linear_speed_mps</code> is now 0.05, not 0.01</h4>
+    <p>Changed on disk from 1&nbsp;cm/s to 5&nbsp;cm/s while this doc was being written — confirmed intentional. Updated the one test that still asserted 0.01 rather than touching the new default.</p>
+  </div>
+
+  <div class="finding">
+    <span class="finding-tag">Entry point</span>
+    <h4>Use <code class="inline">python src/share/scripts/record.py</code>, not the installed <code class="inline">share-record</code></h4>
+    <p>The <code class="inline">share-record</code> console script doesn't list <code class="inline">rail_bimanual_grasp</code> among <code class="inline">--env.type</code>'s valid choices — it isn't picking up <code class="inline">experiments</code>'s env registrations, likely a stale or narrower install than the checked-out source. Every command in this doc now runs the script by path instead, which is confirmed working and is already how steps B–D invoke everything.</p>
+  </div>
+</section>
+
+<footer>
+  Commands match the pattern established earlier this session for <code class="inline">record.py</code>, cross-checked against <code class="inline">make_policies_and_datasets()</code> in <code class="inline">share/utils/control_utils.py</code> for the dataset-per-primitive convention.
+</footer>
+
+</div>
+
+</body>
+</html>

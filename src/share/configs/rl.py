@@ -26,6 +26,14 @@ class MPNetTrainRLServerPipelineConfig(TrainRLServerPipelineConfig):
     log_freq: int = 10
     num_workers: int = 6
     batch_size: int = 256
+    # Live Rerun visualization (see share.utils.live_points.log_mpnet_live_points) --
+    # shared by record.py and actor_server.py, both of which drive a
+    # ManipulationPrimitiveNet built from this same env config. learner_server.py
+    # never touches the env, so these are simply unused there.
+    display_data: bool = False
+    # Optional remote Rerun server to stream to instead of spawning a local viewer.
+    display_ip: str | None = None
+    display_port: int | None = None
 
     def resolve_policy_overrides(self) -> None:
         """Apply one umbrella policy selection to every adaptive primitive."""

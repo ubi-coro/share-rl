@@ -163,16 +163,14 @@ class StateObservationProcessor(ProcessorStep):
                 state_dim += len(self._joint_keys(obs_features, name, "current"))
 
             if self._is_enabled(self.add_ee_pos_to_observation, name):
-                state_dim += len(self._ee_keys(obs_features, name, self._axes(self.ee_pos_axes, name, ".ee_pos")))
+                state_dim += self._feature_axis_count(obs_features, self.ee_pos_axes, name, ".ee_pos")
 
             if self._is_enabled(self.add_ee_velocity_to_observation, name):
-                filter_vel = self._axes(self.ee_velocity_axes, name, ".ee_vel")
-                filter_pos = self._axes(self.ee_pos_axes, name, ".ee_pos")
-                vel_keys = self._ee_keys(obs_features, name, filter_vel)
-                state_dim += len(vel_keys) if vel_keys else len(self._ee_keys(obs_features, name, filter_pos))
+                vel_dim = self._feature_axis_count(obs_features, self.ee_velocity_axes, name, ".ee_vel")
+                state_dim += vel_dim if vel_dim else self._feature_axis_count(obs_features, self.ee_pos_axes, name, ".ee_pos")
 
             if self._is_enabled(self.add_ee_wrench_to_observation, name):
-                state_dim += len(self._ee_keys(obs_features, name, self._axes(self.ee_wrench_axes, name, ".ee_wrench")))
+                state_dim += self._feature_axis_count(obs_features, self.ee_wrench_axes, name, ".ee_wrench")
 
             if self._is_enabled(self.gripper_enable, name) and f"{name}.gripper.pos" in obs_features:
                 state_dim += 1
@@ -200,6 +198,30 @@ class StateObservationProcessor(ProcessorStep):
     @staticmethod
     def _axes(axis_dict: dict[str, list[str]], name: str, suffix: str = ".pos") -> list[str]:
         return list(axis_dict.get(name, [f"{ax}{suffix}" for ax in TASK_FRAME_AXIS_NAMES]))
+
+    def _feature_axis_count(
+        self,
+        obs_features: dict[str, Any],
+        axis_dict: dict[str, list[str]],
+        name: str,
+        suffix: str,
+    ) -> int:
+        """Count one robot/modality's contribution to the inferred observation.state shape.
+
+        obs_features is a one-time snapshot of the robot's own raw get_observation() keys
+        (see ManipulationPrimitiveConfig.infer_features()), taken before any primitive has
+        ever run -- it has no way to know about keys a primitive injects into the observation
+        itself at runtime (e.g. CooperativeInsertPrimitive's dx/dy/dz.ee_pos and
+        prev_x/prev_y/prev_z.ee_vel). Filtering an explicit per-robot axis override against
+        that snapshot would silently drop exactly those keys and undercount state_dim, so an
+        explicit override is trusted directly instead. Only the unconfigured default axis list
+        (TASK_FRAME_AXIS_NAMES) still gets filtered against obs_features -- a robot may
+        legitimately not expose every one of those.
+        """
+        axis_names = self._axes(axis_dict, name, suffix)
+        if name in axis_dict:
+            return len(axis_names)
+        return len(self._ee_keys(obs_features, name, axis_names))
 
     @staticmethod
     def _to_float(value: Any) -> float:
