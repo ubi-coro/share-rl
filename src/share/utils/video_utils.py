@@ -42,19 +42,15 @@ class MultiVideoEncodingManager:
         # Handle any remaining episodes that haven't been batch encoded
         for dataset in self.datasets.values():
 
-            writer = dataset.writer
-            if writer is not None:
-                if exc_type is not None and writer._streaming_encoder is not None:
-                    writer.cancel_pending_videos()
+            if exc_type is not None and dataset.episode_buffer is not None:
+                # Recording was interrupted mid-episode -- drop whatever partial
+                # episode was in flight (streaming video state + partial image
+                # files) rather than finalizing with a half-written one.
+                dataset.clear_episode_buffer(delete_images=True)
 
-                # finalize() handles flush_pending_videos + parquet + metadata
-                dataset.finalize()
-
-                # Clean up episode images if recording was interrupted (only for non-streaming mode)
-                if exc_type is not None and writer._streaming_encoder is None:
-                    writer.cleanup_interrupted_episode(dataset.num_episodes)
-            else:
-                dataset.finalize()
+            # finalize() closes the parquet writers and, if streaming video encoding
+            # is active, the streaming encoder (dataset._streaming_encoder) too.
+            dataset.finalize()
 
             # Clean up any remaining images directory if it's empty
             img_dir = dataset.root / "images"

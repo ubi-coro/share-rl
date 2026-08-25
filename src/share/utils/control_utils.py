@@ -62,99 +62,100 @@ def make_policies_and_datasets(cfg: RecordConfig):
     preprocessors = {}
     postprocessors = {}
     for name, p in cfg.env.primitives.items():
-        if p.is_adaptive:
+        # 1) dataset -- independent of policy/reset-vs-not. Whether this primitive's
+        # frames get recorded is ManipulationPrimitiveConfig.should_record_data: defaults
+        # to is_adaptive (a fully scripted, all-axes-None primitive isn't recorded by
+        # default; one with at least a teleop/policy-controlled axis is), but an explicit
+        # `record_data` on the primitive always overrides that default either direction.
+        rename_map = {}
+        stats = None
+        if cfg.dataset is not None and p.should_record_data:
+            root = Path(cfg.dataset.root) / name
+            repo_id = f"{cfg.dataset.repo_id}-{name}"
 
-            if name == cfg.env.reset_primitive:
-                continue
-
-            # 1) dataset
-            rename_map = {}
-            stats = None
-            if cfg.dataset is not None and p.policy is not None:
-                root = Path(cfg.dataset.root) / name
-                repo_id = f"{cfg.dataset.repo_id}-{name}"
-
-                if cfg.resume:
-                    datasets[name] = LeRobotDataset.resume(
-                        repo_id,
-                        root=root,
-                        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                        vcodec=cfg.dataset.vcodec,
-                        image_writer_processes=cfg.dataset.num_image_writer_processes,
-                        image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
-                    )
-                    if "rl.is_intervention" not in datasets[name].features:
-                        logging.warning(
-                            f"Resumed dataset '{repo_id}' was recorded before the 'rl.is_intervention' "
-                            f"feature was added; adding frames with this feature will fail. "
-                            f"Record into a fresh dataset instead."
-                        )
-
-                else:
-                    datasets[name] = LeRobotDataset.create(
-                        repo_id,
-                        cfg.env.fps,
-                        root=root,
-                        features=env_to_dataset_features(p.features),
-                        robot_type=cfg.env.type,
-                        use_videos=cfg.dataset.video,
-                        image_writer_processes=cfg.dataset.num_image_writer_processes,
-                        image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
-                        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                        vcodec=cfg.dataset.vcodec,
+            if cfg.resume:
+                datasets[name] = LeRobotDataset.resume(
+                    repo_id,
+                    root=root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
+                )
+                if "rl.is_intervention" not in datasets[name].features:
+                    logging.warning(
+                        f"Resumed dataset '{repo_id}' was recorded before the 'rl.is_intervention' "
+                        f"feature was added; adding frames with this feature will fail. "
+                        f"Record into a fresh dataset instead."
                     )
 
-                rename_map = cfg.dataset.rename_map
-                stats = rename_stats(datasets[name].meta.stats, rename_map)
-
-            # 2) policy
-            if not cfg.use_policy or p.policy is None:
-                policies[name] = None
-                preprocessors[name] = None
-                postprocessors[name] = None
-                continue
-
-            policy_path = p.policy.pretrained_path
-            if policy_path is None:
-                assert cfg.dataset is not None, "Policies that are not loaded from checkpoints need a dataset"
             else:
-                p.policy = PreTrainedConfig.from_pretrained(p.policy.pretrained_path)
-                p.policy = replace(p.policy, **p.policy_overwrites)
-                p.policy.pretrained_path = policy_path
-                _remove_redundant_offline_cache_features(p.policy, p.features or {})
+                datasets[name] = LeRobotDataset.create(
+                    repo_id,
+                    cfg.env.fps,
+                    root=root,
+                    features=env_to_dataset_features(p.features),
+                    robot_type=cfg.env.type,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
+                )
 
-            policies[name] = make_policy(cfg=p.policy, env_cfg=p)
-            policies[name] = policies[name].eval()
+            rename_map = cfg.dataset.rename_map
+            stats = rename_stats(datasets[name].meta.stats, rename_map)
 
-            # Checkpoints saved by our learner do not include processor pipelines, so
-            # rebuild them from the policy config the same way training did instead of
-            # loading them from the checkpoint.
-            processor_path = p.policy.pretrained_path
-            if processor_path is not None and not (
-                Path(processor_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-            ).exists():
-                processor_path = None
-                config_stats = resolve_policy_dataset_stats(p.policy)
-                if config_stats is not None:
-                    stats = config_stats
+        # 2) policy -- only primitives with learnable axes have a policy action to
+        # predict at all, so this stays gated on is_adaptive (unlike dataset creation
+        # above, which no longer is).
+        if not p.is_adaptive or not cfg.use_policy or p.policy is None:
+            policies[name] = None
+            preprocessors[name] = None
+            postprocessors[name] = None
+            continue
 
-            pre, post = make_pre_post_processors(
-                policy_cfg=p.policy,
-                pretrained_path=processor_path,
-                dataset_stats=stats,
-                preprocessor_overrides={
-                    "device_processor": {"device": p.policy.device},
-                    "rename_observations_processor": {"rename_map": rename_map},
-                },
-            )
-            if processor_path is None:
-                # Freshly built pipelines ignore `preprocessor_overrides`, so apply the
-                # record-time rename map to the fresh preprocessor directly.
-                for step in pre.steps:
-                    if isinstance(step, RenameObservationsProcessorStep):
-                        step.rename_map = rename_map
-            preprocessors[name] = pre
-            postprocessors[name] = post
+        policy_path = p.policy.pretrained_path
+        if policy_path is None:
+            assert cfg.dataset is not None, "Policies that are not loaded from checkpoints need a dataset"
+        else:
+            p.policy = PreTrainedConfig.from_pretrained(p.policy.pretrained_path)
+            p.policy = replace(p.policy, **p.policy_overwrites)
+            p.policy.pretrained_path = policy_path
+            _remove_redundant_offline_cache_features(p.policy, p.features or {})
+
+        policies[name] = make_policy(cfg=p.policy, env_cfg=p)
+        policies[name] = policies[name].eval()
+
+        # Checkpoints saved by our learner do not include processor pipelines, so
+        # rebuild them from the policy config the same way training did instead of
+        # loading them from the checkpoint.
+        processor_path = p.policy.pretrained_path
+        if processor_path is not None and not (
+            Path(processor_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+        ).exists():
+            processor_path = None
+            config_stats = resolve_policy_dataset_stats(p.policy)
+            if config_stats is not None:
+                stats = config_stats
+
+        pre, post = make_pre_post_processors(
+            policy_cfg=p.policy,
+            pretrained_path=processor_path,
+            dataset_stats=stats,
+            preprocessor_overrides={
+                "device_processor": {"device": p.policy.device},
+                "rename_observations_processor": {"rename_map": rename_map},
+            },
+        )
+        if processor_path is None:
+            # Freshly built pipelines ignore `preprocessor_overrides`, so apply the
+            # record-time rename map to the fresh preprocessor directly.
+            for step in pre.steps:
+                if isinstance(step, RenameObservationsProcessorStep):
+                    step.rename_map = rename_map
+        preprocessors[name] = pre
+        postprocessors[name] = post
 
     return datasets, policies, preprocessors, postprocessors
 

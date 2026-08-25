@@ -355,6 +355,18 @@ class CartesianReferenceController:
         translational_stiffness = float(command["translational_stiffness"])
         rotational_stiffness = float(command["rotational_stiffness"])
         force_constraints = self.config.force_constraints
+        # The clamp bounds the force we command *this tick* (stiffness * error <=
+        # force_constraint); it must not overwrite the persistent virtual target
+        # itself. self.virtual_position/self.virtual_rotation carry the true,
+        # unclamped intended target across ticks -- mutating them here would
+        # permanently re-anchor the reference to wherever the arm currently is
+        # the first time tracking error saturates, discarding the real target
+        # and turning a one-off saturation into commanding max force in a fixed
+        # direction forever (even once the arm stops moving and error would
+        # otherwise settle back to zero). Only the value returned/sent for this
+        # tick is clamped.
+        output_position = self.virtual_position.copy()
+        output_rotation = self.virtual_rotation
         relative_rotation_was_clipped = False
         for axis in range(6):
             if (
@@ -370,18 +382,18 @@ class CartesianReferenceController:
             )
             clipped = float(np.clip(limited_error[axis], -limit, limit))
             if axis < 3:
-                self.virtual_position[axis] = pose[axis] + clipped
+                output_position[axis] = pose[axis] + clipped
             elif clipped != limited_error[axis]:
                 relative_rotation_was_clipped = True
             limited_error[axis] = clipped
 
         if relative_rotation_was_clipped:
-            self.virtual_rotation = (
+            output_rotation = (
                 Rotation.from_rotvec(limited_error[3:]) * Rotation.from_matrix(rotation_task_ee)
             ).as_matrix()
 
         return np.concatenate(
-            (self.virtual_position, Rotation.from_matrix(self.virtual_rotation).as_euler("xyz"))
+            (output_position, Rotation.from_matrix(output_rotation).as_euler("xyz"))
         )
 
     def _virtual_transform(self) -> np.ndarray:

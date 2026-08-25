@@ -30,7 +30,6 @@ from share.teleoperators import TeleopEvents, has_event, is_intervention
 from share.utils.control_utils import make_policies_and_datasets, predict_action
 from share.utils.device import get_safe_torch_device
 from share.utils.env_config_snapshot import save_env_config_snapshot
-from share.utils.exploration import OUActionNoise, resolve_action_scale
 from share.utils.video_utils import MultiVideoEncodingManager
 
 init_logging()
@@ -76,15 +75,12 @@ def record_loop(
     save_only_interventions: bool = False,
     force_intervention: bool = False,
     debugger: MPNetDebugger | None = None,
-    ou_noises: dict[str, OUActionNoise] | None = None,
 ):
     # reset
     transition = mp_net.reset()
     policy = policies.get(mp_net.active_primitive, None)
     if policy is not None:
         policies[mp_net.active_primitive].reset()
-    if ou_noises is not None and mp_net.active_primitive in ou_noises:
-        ou_noises[mp_net.active_primitive].reset()
     if debugger is not None:
         debugger.log_reset(mp_net, transition)
 
@@ -119,9 +115,6 @@ def record_loop(
                 task=task,
                 robot_type=mp_net.config.type
             ).squeeze()
-            noise_gen = ou_noises.get(mp_net.active_primitive) if ou_noises is not None else None
-            if noise_gen is not None and noise_gen.enabled:
-                action = action + noise_gen.sample_torch(dt=1.0 / mp_net.config.fps, like=action)
         else:
             # Dummy action, expected to be overwritten by teleop action
             action = torch.tensor([0.0] * mp_net.action_dim, dtype=torch.float32)
@@ -221,34 +214,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     # make
     mp_net = ManipulationPrimitiveNet(cfg.env)
-    if cfg.dataset is not None and cfg.dataset.root is not None:
-        save_env_config_snapshot(cfg.env, cfg.dataset.root)
+    #if cfg.dataset is not None and cfg.dataset.root is not None:
+    #    save_env_config_snapshot(cfg.env, cfg.dataset.root)
     force_intervention = not cfg.use_policy
     mp_net.set_step_info({TeleopEvents.IS_INTERVENTION: True} if force_intervention else None)
     debugger = None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
-
-    ou_noises = {}
-    if cfg.exploration_noise_scale > 0:
-        for name, policy in policies.items():
-            if policy is None:
-                continue
-            scale = resolve_action_scale(postprocessors[name], ACTION)
-            if scale is None:
-                logging.warning(
-                    f"[{name}] exploration_noise_scale is set but the policy's postprocessor has no "
-                    f"'{ACTION}' statistics; falling back to unit noise scale (likely wrong units)."
-                )
-            ou_noises[name] = OUActionNoise(
-                action_scale=scale,
-                noise_scale=cfg.exploration_noise_scale,
-                correlation_time_s=cfg.exploration_noise_correlation_s,
-            )
-            logging.info(
-                f"[{name}] exploration noise enabled: scale={cfg.exploration_noise_scale} "
-                f"correlation={cfg.exploration_noise_correlation_s}s "
-                f"action_scale={'auto' if scale is not None else 'unit-fallback'}"
-            )
 
     try:
         with MultiVideoEncodingManager(datasets):
@@ -268,8 +239,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                     save_only_interventions=cfg.save_only_interventions,
                     force_intervention=force_intervention,
-                    debugger=debugger,
-                    ou_noises=ou_noises,
+                    debugger=debugger
                 )
 
                 if has_event(info, TeleopEvents.STOP_RECORDING):
@@ -288,7 +258,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if has_event(info, TeleopEvents.RERECORD_EPISODE):
                     log_say("Re-record episode", cfg.play_sounds, blocking=True)
                     dataset.clear_episode_buffer()
-                elif dataset.writer.episode_buffer["size"] > 0:
+                elif dataset.episode_buffer is not None and dataset.episode_buffer["size"] > 0:
                     log_say("Save episode", cfg.play_sounds, blocking=True)
                     dataset.save_episode()
                     logging.info(f"[{mp_net.active_primitive}] Episodes saved: {dataset.num_episodes}")

@@ -1,14 +1,2 @@
-from .envs.demo_movedelta import DemoUR3eMoveDeltaEnvConfig
 from .envs.demo_franka_movedelta import DemoFrankaMoveDeltaEnvConfig
-from .envs.fiddle_out import DemoUR3eTeleopFiddleOutEnvConfig
-from .envs.gripper_sequence import GripperSeqEnvConfig
 
-from .dataset.test import TestDatasetConfig
-from .dataset.hormann import UR3eHormannInsertionDatasetConfig
-
-# Hoermann
-from experiments.envs.hoermann.base import UR3eHormannInsertionEnvConfig
-from experiments.envs.hoermann.e2e.ttl_090726 import UR3eHormann_E2E_TTL_090726_EnvConfig
-from experiments.envs.hoermann.isolation.ttl_150626 import UR3eHormannInsertionEnvConfig_150626_1642
-from experiments.envs.hoermann.isolation.ttl_170626 import UR3eHormannInsertionEnvConfig_170626
-from experiments.envs.hoermann.isolation.Black4Pin_010726 import UR3eHormannInsertionEnvConfig_Black4Pin_010726

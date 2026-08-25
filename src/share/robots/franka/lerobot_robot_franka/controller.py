@@ -63,18 +63,16 @@ def load_franky() -> Any:
 def normalize_franky_state(raw_state: Any) -> FrankaState:
     """Convert Franky/libfranka objects into NumPy-only controller state.
 
-    ``O_T_EE`` is libfranka's flat 16-element *column-major* transform, so it
-    needs ``order="F"`` (equivalently ``.reshape(4, 4).T``) -- a plain
-    ``.reshape(4, 4)`` silently returns the transpose. ``EE_T_K`` and the
-    ``O_dP_EE_*`` twists are already-typed Franky objects (``Affine``,
-    ``Twist``), not raw arrays, so they're unwrapped via their own
-    ``.matrix``/``.linear``/``.angular`` accessors rather than ``np.asarray``.
+    ``O_T_EE`` and ``EE_T_K`` are already-typed Franky ``Affine`` objects, not
+    raw column-major arrays, so both are unwrapped via their own ``.matrix``
+    accessor rather than ``np.asarray``. Likewise the ``O_dP_EE_*`` twists are
+    typed ``Twist`` objects, unwrapped via ``.linear``/``.angular``.
     """
     twist = raw_state.O_dP_EE_est if raw_state.O_dP_EE_est is not None else raw_state.O_dP_EE_c
     return FrankaState(
         q=np.asarray(raw_state.q, dtype=np.float64).reshape(7),
         dq=np.asarray(raw_state.dq, dtype=np.float64).reshape(7),
-        T_base_ee=np.asarray(raw_state.O_T_EE, dtype=np.float64).reshape(4, 4, order="F"),
+        T_base_ee=np.asarray(raw_state.O_T_EE.matrix, dtype=np.float64),
         T_ee_stiffness=np.asarray(raw_state.EE_T_K.matrix, dtype=np.float64),
         twist_base_ee=np.concatenate((np.asarray(twist.linear), np.asarray(twist.angular))),
         wrench_base_at_stiffness=np.asarray(raw_state.O_F_ext_hat_K, dtype=np.float64).reshape(6),
@@ -160,6 +158,14 @@ class FrankaControllerProcess(mp.Process):
             message = self.error_queue.get_nowait()
         except queue.Empty:
             message = None
+        if message is None and self.unexpected_exit_event.is_set():
+            # The worker sets unexpected_exit_event before its traceback string has
+            # necessarily made it through the Queue's feeder thread/pipe -- give it a
+            # brief window rather than immediately falling back to a message-less error.
+            try:
+                message = self.error_queue.get(timeout=1.0)
+            except queue.Empty:
+                message = None
         if message is not None:
             raise FrankaControllerError(message)
         if self.unexpected_exit_event.is_set():
@@ -323,8 +329,34 @@ class FrankaControllerProcess(mp.Process):
                         )
                     motion.set_reference(franky.JointReference(q=target))
 
-                if robot.poll_motion():
-                    raise FrankaControllerError("Franky motion ended unexpectedly")
+                # Nothing to check before the first command: active_space stays None (and
+                # motion is never created/started) until a task/joint-space command actually
+                # arrives, e.g. get_observation() is commonly called before any send_action()
+                # ever ran, and is_in_control is correctly False the whole time -- not a fault.
+                if active_space is not None:
+                    # poll_motion() is non-blocking and raises any exception the RT thread hit
+                    # (e.g. ControlException on a real fault); its own boolean return isn't a
+                    # useful liveness signal here, though -- for a long-lived *TrackingMotion
+                    # holding a static target, libfranka never considers it "in motion" in the
+                    # trajectory sense, so poll_motion() reports False the entire time it's
+                    # healthily running. is_in_control is what franky's own CartesianImpedanceTracker/
+                    # JointImpedanceTracker poll instead, and is what actually reflects whether the
+                    # motion is still active.
+                    robot.poll_motion()
+                    if not robot.is_in_control:
+                        # poll_motion() above didn't raise, so libfranka considers this a clean
+                        # end rather than a ControlException -- most likely cause is a genuine
+                        # safety trip (current_errors/last_motion_errors non-empty, e.g. a
+                        # force_constraints or joint-limit violation) rather than a bug here.
+                        # Surface the actual state instead of a bare message so it's diagnosable
+                        # without re-running with an attached debugger.
+                        raise FrankaControllerError(
+                            "Franky motion ended unexpectedly: "
+                            f"robot_mode={raw_state.robot_mode} "
+                            f"current_errors={raw_state.current_errors} "
+                            f"last_motion_errors={raw_state.last_motion_errors} "
+                            f"control_command_success_rate={getattr(raw_state, 'control_command_success_rate', None)}"
+                        )
 
                 loop_duration = time.perf_counter() - loop_start
                 deadline_missed = loop_duration > period
@@ -393,7 +425,28 @@ class FrankaControllerProcess(mp.Process):
         return franky.CartesianImpedanceTrackingMotion(
             translational_stiffness=float(self.config.translational_stiffness),
             rotational_stiffness=float(self.config.rotational_stiffness),
-            force_constraints=self._force_constraints(),
+            # NOTE: this used to pass force_constraints=self._force_constraints()
+            # here. In the installed franky build (2.0.1.dev52+g209e3a93),
+            # CartesianImpedanceTrackingMotion's force_constraints is unstable --
+            # verified in isolation (bare franky.Robot + this motion type, no
+            # share code at all, holding a perfectly static reference) to run
+            # away by tens of centimeters within ~1s purely from force_constraints
+            # being set, regardless of any commanded target. franky's own
+            # CartesianImpedanceTracker convenience wrapper doesn't even expose
+            # force_constraints for this reason -- it uses translational_error_clip/
+            # rotational_error_clip instead, which bound the same thing (tracking
+            # error against the live reference, hence commanded force) natively in
+            # the RT thread and were confirmed stable in the same isolation test.
+            # These are fixed for the life of the motion, same as force_constraints
+            # was, so they're still derived once here from the connection-time
+            # translational_stiffness/rotational_stiffness -- not the live,
+            # per-command gains.
+            translational_error_clip=self._error_clip(
+                self.config.force_constraints[:3], self.config.translational_stiffness
+            ),
+            rotational_error_clip=self._error_clip(
+                self.config.force_constraints[3:], self.config.rotational_stiffness
+            ),
             posture_task=franky.PostureTask(
                 target=state.q,
                 stiffness=np.asarray(self.config.nullspace_stiffness, dtype=np.float64),
@@ -404,11 +457,20 @@ class FrankaControllerProcess(mp.Process):
             gains_time_constant=float(self.config.gains_time_constant_s),
         )
 
-    def _force_constraints(self) -> list[float | None]:
-        return [
-            None if not np.isfinite(value) else float(value)
-            for value in self.config.force_constraints
-        ]
+    # Large-but-finite stand-in for an unconstrained axis: error_clip must be
+    # finite and non-negative (unlike force_constraints, which allows None/inf
+    # for "unconstrained"), and this comfortably exceeds any real tracking error.
+    _UNCONSTRAINED_ERROR_CLIP = 1.0e6
+
+    @classmethod
+    def _error_clip(cls, force_constraints: Any, stiffness: float) -> np.ndarray:
+        return np.array(
+            [
+                cls._UNCONSTRAINED_ERROR_CLIP if not np.isfinite(value) else float(value) / stiffness
+                for value in force_constraints
+            ],
+            dtype=np.float64,
+        )
 
     def _make_joint_motion(
         self,

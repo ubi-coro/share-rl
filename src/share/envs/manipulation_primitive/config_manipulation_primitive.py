@@ -186,6 +186,11 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     is_terminal: bool = False
     task_description: str | None = None
     target_pose_info_key: str | None = PRIMITIVE_TARGET_POSE_INFO_KEY
+    # Explicit override for whether record.py should create a dataset and write frames
+    # for this primitive. None (the default) means "infer from is_adaptive" -- see
+    # should_record_data. Set explicitly (True/False) to force the decision regardless
+    # of is_adaptive; an explicit value here always wins over the inferred default.
+    record_data: bool | None = None
 
     def __post_init__(self):
         self._kinematics_solver = {}
@@ -199,6 +204,18 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
     def gym_kwargs(self) -> dict:
         """Extra kwargs forwarded to gym environment creation."""
         return {}
+
+    @property
+    def should_record_data(self) -> bool:
+        """Whether record.py should create a dataset and write frames for this primitive.
+
+        Defaults to `is_adaptive` (a primitive with at least one teleop/policy-controlled
+        axis is data-collection-worthy by default; a fully scripted primitive with every
+        axis's policy_mode set to None is not) -- but an explicit `record_data` always
+        wins over that inference, e.g. to record a scripted reset leg on purpose or to
+        skip a policy-driven primitive you don't want in the dataset.
+        """
+        return self.is_adaptive if self.record_data is None else self.record_data
 
     @property
     def is_adaptive(self) -> bool:
