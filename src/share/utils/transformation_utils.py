@@ -412,3 +412,42 @@ def get_robot_pose_from_observation(observation: dict[str, Any], robot_name: str
             f"Observation is missing EE pose axes for robot '{robot_name}': {', '.join(missing)}."
         )
     return [*position, *euler_xyz_from_rotvec(raw_rotvec)]
+
+
+def get_robot_poses_in_world(
+    observations: dict[str, dict[str, Any]],
+    task_frame_origins: dict[str, list[float]],
+    robot_base_pose_in_world: dict[str, list[float]] | None = None,
+) -> dict[str, list[float]]:
+    """Compose each robot's current EE pose into one shared world frame.
+
+    Args:
+        observations: Raw per-robot observation dicts (unprefixed keys, as returned by
+            ``Robot.get_observation()``), keyed by robot name.
+        task_frame_origins: Each robot's configured task-frame origin, used whenever the
+            observation itself doesn't report a live ``task_frame_origin`` (e.g. mocks that
+            don't model origin transitions).
+        robot_base_pose_in_world: Each robot's base pose in one shared world frame, for
+            composing robots with different bases. Missing entries default to [0]*6.
+
+    Returns:
+        Each robot's current pose as ``[x, y, z, rx, ry, rz]`` in one shared world frame.
+    """
+    robot_base_pose_in_world = robot_base_pose_in_world or {}
+    poses: dict[str, list[float]] = {}
+    for name, obs in observations.items():
+        prefixed_obs = {f"{name}.{key}": value for key, value in obs.items()}
+        raw_pose = get_robot_pose_from_observation(prefixed_obs, robot_name=name)
+
+        fallback_origin = task_frame_origins.get(name, [0.0] * 6)
+        # The controller's own reported task_frame_origin is authoritative over the configured
+        # one -- a just-changed origin may not have reached it yet. Mocks that don't model
+        # origin transitions simply don't report it, hence the per-axis fallback.
+        active_origin = [
+            obs.get(f"{axis}.task_frame_origin", fallback_origin[i])
+            for i, axis in enumerate(TASK_FRAME_AXIS_NAMES)
+        ]
+
+        native_pose = task_pose_to_world_pose(raw_pose, active_origin)
+        poses[name] = task_pose_to_world_pose(native_pose, robot_base_pose_in_world.get(name, [0.0] * 6))
+    return poses

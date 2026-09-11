@@ -51,6 +51,7 @@ from share.processor.info import (
 )
 from share.processor.observation import (
     JointsToEEObservation,
+    PreviousActionObservationProcessor,
     RelativeFrameObservationProcessor,
     StateObservationProcessor, ImageObservationProcessor,
 )
@@ -116,6 +117,7 @@ class ObservationConfig:
 
     stack_frames: int | dict[str, int] = 0
     relative_ee_pos: bool | dict[str, bool] = False
+    add_previous_action_to_observation: bool = False
 
 
 @dataclass
@@ -299,7 +301,7 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             **self.env_kwargs,
         )
 
-        env_processor = self.make_env_processor(device)
+        env_processor = self.make_env_processor(device, action_dim=self._get_action_dim(robot_dict))
         action_processor = self.make_action_processor(robot_dict, teleop_dict, device)
         return env, env_processor, action_processor
 
@@ -418,19 +420,23 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             before_step_hooks=action_before_hooks, after_step_hooks=action_after_hooks
         )
 
-    def make_env_processor(self, device: str = "cpu") -> DataProcessorPipeline:
+    def make_env_processor(
+        self, device: str = "cpu", action_dim: int | None = None
+    ) -> DataProcessorPipeline:
         """Create the observation-side processing pipeline.
 
         Args:
             device: Torch device used for tensor conversion and stacked state
                 outputs in downstream processor steps.
+            action_dim: Optional flattened action width for previous-action observations.
 
         Returns:
             A ``DataProcessorPipeline`` that augments raw env observations with
-            FK-derived EE poses, relative-frame channels, state tensors, and any
-            configured image preprocessing.
+            FK-derived EE poses, state tensors, and any configured preprocessing.
         """
         env_pipeline_steps = []
+        if action_dim is None and self.processor.observation.add_previous_action_to_observation:
+            action_dim = self._get_action_dim()
 
         # obs is dict with keys {robot_name}.{axis/joint}.{pos/vel/ee_pos/ee_vel/ee_wrench} | {OBS_IMAGES}{camera_name}
         # {axis} is in {x,y,z,wx,wy,wz}
@@ -449,6 +455,13 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
         #        penalty=self.processor.gripper.penalty,
         #    )
         #)
+
+        if any_enabled(self.processor.observation.relative_ee_pos):
+            env_pipeline_steps.append(
+                RelativeFrameObservationProcessor(
+                    enable=self.processor.observation.relative_ee_pos
+                )
+            )
 
         env_pipeline_steps.extend([
             # builds OBS_STATE based on what we want to have in there
@@ -470,6 +483,14 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             ),
         ])
 
+        if any_enabled(self.processor.observation.add_previous_action_to_observation):
+            env_pipeline_steps.append(
+                PreviousActionObservationProcessor(
+                    enable=self.processor.observation.add_previous_action_to_observation,
+                    action_dim=0 if action_dim is None else action_dim,
+                )
+            )
+
         if self.processor.image_preprocessing:
             env_pipeline_steps.append(
                 ImageObservationProcessor(
@@ -482,14 +503,6 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
             )
 
         env_pipeline_steps.append(DeviceProcessorStep(device=device))
-
-        # action relative to starting pose
-        if any_enabled(self.processor.observation.relative_ee_pos):
-            env_pipeline_steps.append(
-                RelativeFrameObservationProcessor(
-                    enable=self.processor.observation.relative_ee_pos
-                )
-            )
 
         # timing hooks
         if self.processor.hooks.time_env_processor:
@@ -616,6 +629,19 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     joint_names=self.task_frame[name].joint_names,
                 )
 
+    def _get_action_dim(self, robot_dict=None) -> int:
+        if robot_dict is None:
+            is_task_frame_robot = {
+                name: frame.space == ControlSpace.TASK
+                for name, frame in self.task_frame.items()
+            }
+        else:
+            is_task_frame_robot = check_task_frame_robot(robot_dict)
+        return sum(frame.policy_action_dim for frame in self.task_frame.values()) + sum(
+            bool(self.processor.gripper.enable.get(name, False)) and is_task_frame_robot.get(name, False)
+            for name in self.task_frame
+        )
+
     def infer_features(self, robot_dict, cameras):
         """Infer policy-visible feature specs from the configured pipelines.
 
@@ -646,15 +672,14 @@ class ManipulationPrimitiveConfig(EnvConfig, ChoiceRegistry):
                     raise ValueError(f"Unknown type for observation {name}.{k}: {type(v)}")
                 initial_features[f"{name}.{k}"] = PolicyFeature(type=FeatureType.STATE, shape=shape)
 
-        initial_features = create_initial_features(observation=initial_features)
-        env_processor = self.make_env_processor()
+        action_dim = self._get_action_dim(robot_dict)
+        initial_features = create_initial_features(
+            action={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,))},
+            observation=initial_features,
+        )
+        env_processor = self.make_env_processor(action_dim=action_dim)
         pipeline_features = env_processor.transform_features(initial_features)
         obs_features = pipeline_features[PipelineFeatureType.OBSERVATION]
-
-        action_dim = sum(frame.policy_action_dim for frame in self.task_frame.values())
-
-        count_gripper = [is_tf and bool(enable) for (is_tf, enable) in zip(check_task_frame_robot(robot_dict).values(), self.processor.gripper.enable.values())]
-        action_dim += sum(count_gripper)  # add gripper action dim if enabled
 
         # expose state, action and visual features
         self.features = {

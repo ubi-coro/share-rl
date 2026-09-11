@@ -12,6 +12,7 @@ happening.
 
    quickstart
    architecture
+   experiment_config_conventions
    connector_setup
    examples
    open_problems

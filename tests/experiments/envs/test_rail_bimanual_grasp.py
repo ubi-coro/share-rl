@@ -4,22 +4,24 @@ import os
 os.environ.setdefault("PYNPUT_BACKEND", "dummy")
 
 import pytest
+import torch
+from lerobot.processor import TransitionKey, create_transition
+from lerobot.utils.constants import OBS_STATE
 
 from experiments.envs.rail_bimanual_grasp import (
-    COOPERATIVE_INSERT_LEFT_POLICY,
-    COOPERATIVE_LEFT_POLICY,
-    DEFAULT_GRASP_ORIENTATION_RPY,
-    DEFAULT_RAIL_Y_M,
+    CALIBRATION_POLICY,
+    YZ_POLICY,
     RECALIBRATE_RY_KEY,
     RECALIBRATE_RY_REQUEST_FLAG,
     CooperativeFramePrimitive,
-    CooperativeInsertPrimitive,
-    FROZEN_AXES_RUNTIME_KEY,
+    RUNTIME_KEY_FROZEN_AXES,
+    RailCalibration,
     RailBimanualGraspEnvConfig,
     CalibratePrimitive,
-    XZ_RELATIVE_POLICY,
+    XZ_POLICY,
 )
 from share.envs.manipulation_primitive.config_manipulation_primitive import (
+    ManipulationPrimitiveConfig,
     MoveDeltaPrimitiveConfig,
     PrimitiveEntryContext,
     ZeroFTPrimitiveConfig,
@@ -71,14 +73,16 @@ def test_rail_env_graph_and_task_frame_contract():
     assert isinstance(cfg.primitives["align_to_rail"], MoveDeltaPrimitiveConfig)
     assert cfg.alignment_linear_speed_mps == pytest.approx(0.05)
     for name, frame in cfg.primitives["align_to_rail"].task_frame.items():
-        assert frame.target[1] == pytest.approx(DEFAULT_RAIL_Y_M[name])
-        assert frame.target[3:6] == pytest.approx(DEFAULT_GRASP_ORIENTATION_RPY[name])
+        assert frame.target == pytest.approx(cfg.rail_target_poses[name])
         assert frame.policy_mode == [None] * 6
 
-    assert cfg.primitives["teleop_left"].task_frame["left"].policy_mode == XZ_RELATIVE_POLICY
-    assert cfg.primitives["teleop_right"].task_frame["right"].policy_mode == XZ_RELATIVE_POLICY
+    assert cfg.primitives["teleop_left"].task_frame["left"].policy_mode == XZ_POLICY
+    assert cfg.primitives["teleop_right"].task_frame["right"].policy_mode == XZ_POLICY
     assert cfg.primitives["teleop_right"].teleop_mapping == {"right": "main"}
     assert cfg.primitives["calibrate"].env_class is CalibratePrimitive
+    for name in ("calibrate", "cooperative_reset", "cooperative_insert", "pushdown"):
+        assert type(cfg.primitives[name]) is ManipulationPrimitiveConfig
+    assert cfg.primitives["cooperative_insert"].env_class is CooperativeFramePrimitive
     # Regression: without this mapping, the driver ("left") never resolves a teleoperator at
     # all -- self.teleop is a single SpaceMouseConfig, wrapped under DEFAULT_ROBOT_NAME
     # ("main") by ManipulationPrimitiveNetConfig, not under "left" -- so the SpaceMouse would
@@ -87,12 +91,12 @@ def test_rail_env_graph_and_task_frame_contract():
     assert cfg.primitives["calibrate"].teleop_mapping == {"left": "main"}
     # calibrate is the only primitive that still exposes ry live -- that's the entire
     # calibration: teleop it to the right value, then space moves on.
-    assert cfg.primitives["calibrate"].task_frame["left"].policy_mode == COOPERATIVE_LEFT_POLICY
+    assert cfg.primitives["calibrate"].task_frame["left"].policy_mode == CALIBRATION_POLICY
     # cooperative_reset and cooperative_insert are both translation-only: x and ry (indices 0
     # and 4) are locked in both, frozen to whatever they measure on entry rather than a
     # hardcoded target -- they differ only in whether a policy is attached.
     for name in ("cooperative_reset", "cooperative_insert"):
-        assert cfg.primitives[name].task_frame["left"].policy_mode == COOPERATIVE_INSERT_LEFT_POLICY
+        assert cfg.primitives[name].task_frame["left"].policy_mode == YZ_POLICY
         assert cfg.primitives[name].task_frame["right"].policy_mode == [None] * 6
         assert cfg.primitives[name].env_kwargs["freeze_driver_axes_at_entry"] == (0, 4)
     assert cfg.primitives["cooperative_reset"].policy is None
@@ -100,8 +104,7 @@ def test_rail_env_graph_and_task_frame_contract():
 
     for name in ("teleop_left", "teleop_right", "zero_ft", "calibrate", "zero_ft_before_cooperative", "cooperative_reset", "cooperative_insert"):
         for robot_name, frame in cfg.primitives[name].task_frame.items():
-            assert frame.target[1] == pytest.approx(DEFAULT_RAIL_Y_M[robot_name])
-            assert frame.target[3:6] == pytest.approx(DEFAULT_GRASP_ORIENTATION_RPY[robot_name])
+            assert frame.target == pytest.approx(cfg.rail_target_poses[robot_name])
 
     assert isinstance(cfg.transitions[0], OnTargetPoseReached)
     assert [(edge.source, edge.target) for edge in cfg.transitions] == [
@@ -114,9 +117,9 @@ def test_rail_env_graph_and_task_frame_contract():
         ("cooperative_reset", "calibrate"),  # OnEvent -- up arrow, re-teleop ry
         ("cooperative_reset", "cooperative_insert"),
         ("cooperative_insert", "cooperative_reset"),  # OnTimeLimit -- no pull_out on timeout
-        ("cooperative_insert", "pull_out"),  # OnSuccess -- demo=False (default)
+        ("cooperative_insert", "pull_out"),  # OnSuccess -- pushdown=False (default)
         ("pull_out", "cooperative_reset"),
-        ("pushdown", "cooperative_reset"),  # OnSuccess -- only reachable via demo=True
+        ("pushdown", "cooperative_reset"),  # OnSuccess -- only reachable via pushdown=True
     ]
     for name in ("zero_ft", "zero_ft_before_cooperative"):
         edge = next(e for e in cfg.transitions if e.source == name)
@@ -162,7 +165,7 @@ def test_rail_env_reward_classifier_path_adds_an_additional_auto_trigger():
 def test_skip_grasp_enters_through_calibrate():
     """skip_grasp jumps straight into calibrate -- deliberately skipping
     zero_ft_before_cooperative's F/T re-zero for faster interactive iteration on ry/
-    pivot_offset_x (a temporary trade-off, not yet the final semantics)."""
+    the vTCP x offset."""
     cfg = RailBimanualGraspEnvConfig(mock=True, skip_grasp=True)
 
     assert cfg.start_primitive == "calibrate"
@@ -215,7 +218,9 @@ def test_ry_angle_supplies_a_driver_axis_override_to_both_cooperative_primitives
     to measure. Wired to both cooperative_reset and cooperative_insert, since either one may
     be the first to activate and capture it (see CooperativeFramePrimitive.driver_axis_overrides
     for why the exact value -- not just the measured pose -- is what actually gets used)."""
-    cfg = RailBimanualGraspEnvConfig(mock=True, skip_grasp=True, ry_angle=0.1234)
+    cfg = RailBimanualGraspEnvConfig(
+        mock=True, skip_grasp=True, calibration=RailCalibration(driver_ry_rad=0.1234)
+    )
 
     for name in ("cooperative_reset", "cooperative_insert"):
         assert cfg.primitives[name].env_kwargs["driver_axis_overrides"] == {4: pytest.approx(0.1234)}
@@ -230,20 +235,28 @@ def test_ry_angle_defaults_to_no_override():
 
 def test_ry_angle_requires_skip_grasp():
     with pytest.raises(ValueError, match="skip_grasp"):
-        RailBimanualGraspEnvConfig(mock=True, skip_grasp=False, ry_angle=0.1)
+        RailBimanualGraspEnvConfig(
+            mock=True, skip_grasp=False, calibration=RailCalibration(driver_ry_rad=0.1)
+        )
 
 
 def test_x_offset_supplies_a_driver_axis_override_to_both_cooperative_primitives():
     """Same idea as ry_angle, for the locked x axis -- no skip_grasp requirement, since unlike
     ry there's no dedicated calibration primitive this would make redundant."""
-    cfg = RailBimanualGraspEnvConfig(mock=True, x_offset=0.02)
+    cfg = RailBimanualGraspEnvConfig(
+        mock=True, calibration=RailCalibration(driver_x_m=0.02)
+    )
 
     for name in ("cooperative_reset", "cooperative_insert"):
         assert cfg.primitives[name].env_kwargs["driver_axis_overrides"] == {0: pytest.approx(0.02)}
 
 
 def test_x_offset_and_ry_angle_combine():
-    cfg = RailBimanualGraspEnvConfig(mock=True, skip_grasp=True, x_offset=0.02, ry_angle=0.1234)
+    cfg = RailBimanualGraspEnvConfig(
+        mock=True,
+        skip_grasp=True,
+        calibration=RailCalibration(driver_x_m=0.02, driver_ry_rad=0.1234),
+    )
 
     for name in ("cooperative_reset", "cooperative_insert"):
         assert cfg.primitives[name].env_kwargs["driver_axis_overrides"] == {
@@ -255,24 +268,40 @@ def test_x_offset_and_ry_angle_combine():
 def test_load_calibration_requires_the_file_to_exist():
     with pytest.raises(ValueError, match="doesn't exist"):
         RailBimanualGraspEnvConfig(
-            mock=True, load_calibration=True, calibration_path="/tmp/definitely-not-there.json"
+            mock=True,
+            skip_grasp=True,
+            calibration=RailCalibration(
+                path="/tmp/definitely-not-there.json", load_from_path=True
+            ),
         )
 
 
-def test_load_calibration_populates_pivot_x_offset_ry_angle_from_file(tmp_path):
-    """load_calibration doesn't require skip_grasp -- the loaded values fill in exactly like
-    x_offset/ry_angle set directly, and the relaxed validation (skip_grasp OR
-    load_calibration) is what makes that legal."""
+def test_load_calibration_requires_skip_grasp(tmp_path):
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(json.dumps({"pivot_offset_x": 0.0, "x_offset": 0.0, "ry_angle": 0.0}))
+
+    with pytest.raises(ValueError, match="skip_grasp"):
+        RailBimanualGraspEnvConfig(
+            mock=True,
+            calibration=RailCalibration(path=str(calibration_path), load_from_path=True),
+        )
+
+
+def test_load_calibration_populates_vtcp_x_offset_ry_angle_from_file(tmp_path):
+    """load_calibration fills in exactly like x_offset/ry_angle set directly, while
+    skip_grasp permits the mid-air startup path that bypasses manual grasping."""
     calibration_path = tmp_path / "calibration.json"
     calibration_path.write_text(json.dumps({"pivot_offset_x": 0.11, "x_offset": 0.02, "ry_angle": 0.33}))
 
     cfg = RailBimanualGraspEnvConfig(
-        mock=True, load_calibration=True, calibration_path=str(calibration_path)
+        mock=True,
+        skip_grasp=True,
+        calibration=RailCalibration(path=str(calibration_path), load_from_path=True),
     )
 
-    assert cfg.pivot_offset_x == pytest.approx(0.11)
-    assert cfg.x_offset == pytest.approx(0.02)
-    assert cfg.ry_angle == pytest.approx(0.33)
+    assert cfg.calibration.vtcp_offset_x_m == pytest.approx(0.11)
+    assert cfg.calibration.driver_x_m == pytest.approx(0.02)
+    assert cfg.calibration.driver_ry_rad == pytest.approx(0.33)
     for name in ("cooperative_reset", "cooperative_insert"):
         assert cfg.primitives[name].env_kwargs["driver_axis_overrides"] == {
             0: pytest.approx(0.02),
@@ -285,7 +314,9 @@ def test_load_calibration_skips_calibrate_in_the_graph(tmp_path):
     calibration_path.write_text(json.dumps({"pivot_offset_x": 0.0, "x_offset": 0.0, "ry_angle": 0.0}))
 
     cfg = RailBimanualGraspEnvConfig(
-        mock=True, load_calibration=True, calibration_path=str(calibration_path)
+        mock=True,
+        skip_grasp=True,
+        calibration=RailCalibration(path=str(calibration_path), load_from_path=True),
     )
 
     assert any(e.source == "zero_ft" and e.target == "zero_ft_before_cooperative" for e in cfg.transitions)
@@ -301,7 +332,9 @@ def test_load_calibration_with_skip_grasp_enters_through_zero_ft_before_cooperat
     calibration_path.write_text(json.dumps({"pivot_offset_x": 0.0, "x_offset": 0.0, "ry_angle": 0.0}))
 
     cfg = RailBimanualGraspEnvConfig(
-        mock=True, skip_grasp=True, load_calibration=True, calibration_path=str(calibration_path)
+        mock=True,
+        skip_grasp=True,
+        calibration=RailCalibration(path=str(calibration_path), load_from_path=True),
     )
 
     assert cfg.start_primitive == "zero_ft_before_cooperative"
@@ -309,7 +342,9 @@ def test_load_calibration_with_skip_grasp_enters_through_zero_ft_before_cooperat
 
 
 def test_calibration_path_flows_to_calibrate_env_kwargs():
-    cfg = RailBimanualGraspEnvConfig(mock=True, calibration_path="/tmp/my_calibration.json")
+    cfg = RailBimanualGraspEnvConfig(
+        mock=True, calibration=RailCalibration(path="/tmp/my_calibration.json")
+    )
 
     assert cfg.primitives["calibrate"].env_kwargs["calibration_path"] == "/tmp/my_calibration.json"
 
@@ -330,15 +365,15 @@ def test_calibrate_primitive_saves_calibration_every_step(tmp_path):
         env.step({"left": {}})
 
         saved = json.loads(calibration_path.read_text())
-        assert saved["pivot_offset_x"] == pytest.approx(0.0)
-        assert saved["x_offset"] == pytest.approx(0.0)
-        assert saved["ry_angle"] == pytest.approx(0.3)
+        assert saved["vtcp_offset_x_m"] == pytest.approx(0.0)
+        assert saved["driver_x_m"] == pytest.approx(0.0)
+        assert saved["driver_ry_rad"] == pytest.approx(0.3)
 
         env._slider_x.set_val(0.07)
         env.step({"left": {}})
 
         saved = json.loads(calibration_path.read_text())
-        assert saved["pivot_offset_x"] == pytest.approx(0.07)
+        assert saved["vtcp_offset_x_m"] == pytest.approx(0.07)
     finally:
         import matplotlib.pyplot as plt
 
@@ -363,29 +398,29 @@ def test_driver_axis_overrides_pins_a_translation_axis_for_every_robot():
     assert right.last_action["x.ee_pos"] == pytest.approx(0.02)
 
 
-def test_pivot_offset_x_survives_freeze_driver_axes_at_entry_without_compounding():
+def test_vtcp_offset_x_survives_freeze_driver_axes_at_entry_without_compounding():
     """Regression test for a real bug: cooperative_reset/cooperative_insert/pushdown all
     freeze x via freeze_driver_axes_at_entry, which runs *after* midpoint (where
-    pivot_offset_x used to be added) is built -- so the freeze branch silently overwrote and
-    discarded a calibrated pivot_offset_x the moment x was also a frozen axis. Fixing that by
-    re-publishing FROZEN_AXES_RUNTIME_KEY with the pivot already baked in would have swapped
+    vTCP x offset used to be added) is built -- so the freeze branch silently overwrote and
+    discarded a calibrated vTCP x offset the moment x was also a frozen axis. Fixing that by
+    re-publishing RUNTIME_KEY_FROZEN_AXES with the vTCP already baked in would have swapped
     "discarded" for "compounds a little further on every hop" instead -- this checks a chain
     of three primitives (calibrate -> cooperative_reset -> pushdown) ends up with the exact
-    same pivot every time, not zero times and not growing."""
+    same vTCP every time, not zero times and not growing."""
     shared_runtime_values = {}
 
-    # calibrate: x is live, not frozen -- pivot_offset_x set directly, as if just calibrated.
+    # calibrate: x is live, not frozen -- vTCP x offset set directly, as if just calibrated.
     left1 = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     right1 = _FakeRobot([0.2, 0.0, 1.0, 0.0, 0.0, 0.0])
     calibrate_env = CooperativeFramePrimitive(
         _ry_calibration_task_frame(), {"left": left1, "right": right1}, {},
-        driver="left", fps=30.0, pivot_offset_x=0.05,
+        driver="left", fps=30.0, vtcp_offset_x=0.05,
     )
     calibrate_env.attach_shared_runtime_values(shared_runtime_values)
     calibrate_env.step({"left": {}})
     assert calibrate_env._vtcp_world[0] == pytest.approx(0.15)  # raw midpoint 0.1 + 0.05
 
-    # cooperative_reset: x IS frozen -- pivot_offset_x adopted from shared runtime state, not
+    # cooperative_reset: x IS frozen -- vTCP x offset adopted from shared runtime state, not
     # passed directly, same as a real primitive switch.
     left2 = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     right2 = _FakeRobot([0.2, 0.0, 1.0, 0.0, 0.0, 0.0])
@@ -395,8 +430,8 @@ def test_pivot_offset_x_survives_freeze_driver_axes_at_entry_without_compounding
     )
     reset_env.attach_shared_runtime_values(shared_runtime_values)
     reset_env.step({"left": {}})
-    assert reset_env.pivot_offset_x == pytest.approx(0.05)
-    assert reset_env._vtcp_world[0] == pytest.approx(0.05)  # driver's own x (0.0) + pivot, not discarded
+    assert reset_env.vtcp_offset_x == pytest.approx(0.05)
+    assert reset_env._vtcp_world[0] == pytest.approx(0.05)  # driver's own x (0.0) + vTCP offset, not discarded
 
     # pushdown: also freezes x, chained after cooperative_reset -- must not compound.
     left3 = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
@@ -414,26 +449,26 @@ def test_freeze_driver_axes_at_entry_persists_across_activations():
     """A freeze_driver_axes_at_entry axis is captured once, on the first activation of the
     whole loop, and reused after that -- not re-measured every activation (which would let it
     silently drift along with whatever small pose changes happen between episodes, the same
-    failure OFFSET_FROM_VTCP_RUNTIME_KEY already guards against for grasp geometry). Answers
+    failure RUNTIME_KEY_ROBOT_POSES_FROM_VTCP already guards against for grasp geometry). Answers
     "keep this pose without specifying exact values": just let the first activation capture
     it -- no ry_angle/x_offset needed."""
     left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.3, 0.0])  # ry = 0.3
     right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     shared_runtime_values = {}
 
-    first = CooperativeInsertPrimitive(
+    first = CooperativeFramePrimitive(
         _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
         driver="left", fps=30.0, freeze_driver_axes_at_entry=(4,),
     )
     first.attach_shared_runtime_values(shared_runtime_values)
     first.step({"left": {}})
 
-    assert shared_runtime_values[FROZEN_AXES_RUNTIME_KEY][4] == pytest.approx(0.3)
+    assert shared_runtime_values[RUNTIME_KEY_FROZEN_AXES][4] == pytest.approx(0.3)
 
     # ry drifts before the next activation (e.g. a slight give under contact).
     left.pose = [0.0, 0.0, 1.0, 0.0, 0.45, 0.0]
 
-    second = CooperativeInsertPrimitive(
+    second = CooperativeFramePrimitive(
         _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
         driver="left", fps=30.0, freeze_driver_axes_at_entry=(4,),
     )
@@ -444,23 +479,6 @@ def test_freeze_driver_axes_at_entry_persists_across_activations():
     assert left.last_action["ry.ee_pos"] == pytest.approx(0.3)
 
 
-def test_midpoint_offset_nudges_the_captured_translation_for_every_robot():
-    """midpoint_offset (used by pushdown for its gentle z push) applies on top of the averaged
-    midpoint, same as pivot_offset_x already does for x -- and reaches every robot's target,
-    not just the driver's, since it shifts the shared vtcp itself."""
-    left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    env = CooperativeFramePrimitive(
-        _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
-        driver="left", fps=30.0, midpoint_offset=[0.0, 0.0, -0.005],
-    )
-
-    env.step({"left": {}})
-
-    assert left.last_action["z.ee_pos"] == pytest.approx(0.995)
-    assert right.last_action["z.ee_pos"] == pytest.approx(0.995)
-
-
 def test_alignment_holds_entry_xz_and_targets_plane_and_orientation():
     cfg = RailBimanualGraspEnvConfig(mock=True)
     alignment = cfg.primitives["align_to_rail"]
@@ -469,10 +487,8 @@ def test_alignment_holds_entry_xz_and_targets_plane_and_orientation():
     start_pose, goal_pose = alignment.resolve_targets(_entry_context())
 
     assert start_pose["left"][:3] == pytest.approx([0.2, -0.1, 0.4])
-    assert goal_pose["left"][:3] == pytest.approx([0.2, DEFAULT_RAIL_Y_M["left"], 0.4])
-    assert goal_pose["left"][3:6] == pytest.approx(DEFAULT_GRASP_ORIENTATION_RPY["left"])
-    assert goal_pose["right"][:3] == pytest.approx([-0.3, DEFAULT_RAIL_Y_M["right"], 0.5])
-    assert goal_pose["right"][3:6] == pytest.approx(DEFAULT_GRASP_ORIENTATION_RPY["right"])
+    assert goal_pose["left"] == pytest.approx([0.2, cfg.rail_target_poses["left"][1], 0.4, *cfg.rail_target_poses["left"][3:6]])
+    assert goal_pose["right"] == pytest.approx([ -0.3, cfg.rail_target_poses["right"][1], 0.5, *cfg.rail_target_poses["right"][3:6]])
 
 
 def test_cooperative_primitives_use_a_softer_translation_wrench_limit():
@@ -502,27 +518,29 @@ def test_cooperative_translation_wrench_limit_is_configurable():
         assert wrench_limits[:3] == pytest.approx([8.0, 8.0, 8.0])
 
 
-def test_calibrate_pivot_offset_range_is_configurable():
-    cfg = RailBimanualGraspEnvConfig(mock=True, pivot_offset_range_m=0.08)
+def test_calibrate_vtcp_offset_range_is_configurable():
+    cfg = RailBimanualGraspEnvConfig(
+        mock=True, calibration=RailCalibration(vtcp_offset_range_m=0.08)
+    )
 
-    assert cfg.primitives["calibrate"].env_kwargs["pivot_offset_range_m"] == pytest.approx(0.08)
+    assert cfg.primitives["calibrate"].env_kwargs["vtcp_offset_range_m"] == pytest.approx(0.08)
 
 
-def test_calibrate_pivot_offset_range_defaults_to_0_3m():
+def test_calibrate_vtcp_offset_range_defaults_to_0_3m():
     """6x the original 0.05m default (4x, then 1.5x again) -- a long rail's contact point can
     sit noticeably far from the raw grasp midpoint."""
     cfg = RailBimanualGraspEnvConfig(mock=True)
 
-    assert cfg.primitives["calibrate"].env_kwargs["pivot_offset_range_m"] == pytest.approx(0.3)
+    assert cfg.primitives["calibrate"].env_kwargs["vtcp_offset_range_m"] == pytest.approx(0.3)
 
 
-def test_calibrate_slider_relocates_the_pivot_without_moving_either_robot():
-    """Regression test for a real bug: moving pivot_offset_x must not itself move either
+def test_calibrate_slider_relocates_the_vtcp_without_moving_either_robot():
+    """Regression test for a real bug: moving the vTCP x offset must not itself move either
     robot -- only relocate where later rotation happens about. The previous implementation (a
-    plain vtcp_world[0] += delta, leaving offset_from_vtcp untouched) instead translated the
+    plain vTCP world x += delta, leaving offset_from_vtcp untouched) instead translated the
     whole rigid assembly by delta on every live change, since rotation composition
-    (task_pose_to_world_pose) always rotates the offset about vtcp_world's position -- exactly
-    the "changing pivot_x visibly moves the rail" symptom this was found from. Slider.set_val
+    (task_pose_to_world_pose) always rotates the offset about the vTCP's position -- exactly
+    the "changing vTCP x visibly moves the rail" symptom this was found from. Slider.set_val
     is the same call a real mouse drag makes."""
     left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     right = _FakeRobot([0.2, 0.0, 1.0, 0.0, 0.0, 0.0])
@@ -536,11 +554,11 @@ def test_calibrate_slider_relocates_the_pivot_without_moving_either_robot():
         env.step({"left": {}})
 
         # The relocation alone must be invisible -- neither robot actually moved.
-        assert env.pivot_offset_x == pytest.approx(0.05)
+        assert env.vtcp_offset_x == pytest.approx(0.05)
         assert left.last_action["x.ee_pos"] == pytest.approx(0.0, abs=1e-9)
         assert right.last_action["x.ee_pos"] == pytest.approx(0.2, abs=1e-9)
 
-        # Rotation now sweeps around the *relocated* pivot (0.15): left (radius 0.15) should
+        # Rotation now sweeps around the *relocated* vTCP (0.15): left (radius 0.15) should
         # move 3x as far as right (radius 0.05) for the same rotation, not equally (which is
         # what rotating around the old raw midpoint, 0.1, would give both).
         env.step({"left": {"ry.ee_pos": 1.0}})
@@ -554,27 +572,27 @@ def test_calibrate_slider_relocates_the_pivot_without_moving_either_robot():
         plt.close(env._slider_fig)
 
 
-def test_cooperative_frame_primitive_reports_pivot_offset_every_step():
-    """Every CooperativeFramePrimitive (not just CalibratePrimitive) reports pivot_offset_x in
+def test_cooperative_frame_primitive_reports_vtcp_offset_every_step():
+    """Every CooperativeFramePrimitive (not just CalibratePrimitive) reports the vTCP x offset in
     info["record_status"] every step -- a slider change should be visible in
     cooperative_reset/cooperative_insert/pushdown too, not just calibrate."""
     left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     env = CooperativeFramePrimitive(
         _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
-        driver="left", fps=30.0, pivot_offset_x=0.012,
+        driver="left", fps=30.0, vtcp_offset_x=0.012,
     )
 
     _obs, _reward, _terminated, _truncated, info = env.step({"left": {}})
 
-    assert info["record_status"] == "pivot_x = +0.0120 m"
+    assert info["record_status"] == "vtcp_x = +0.0120 m"
 
 
 def test_calibrate_disables_reference_limiting_on_every_axis():
     """calibrate needs real range on everything it manually adjusts -- ry (teleop) and
-    pivot_offset_x/y (`,`/`.`/`[`/`]`). CooperativeFramePrimitive's vtcp reference-limit clamp
+    vTCP x offset (`,`/`.`/`[`/`]`). CooperativeFramePrimitive's vTCP reference-limit clamp
     would otherwise cap either at wrench_limits[i]/kp[i] of instantaneous lead over the arm's
-    actual pose (~1.5 deg for ry, 1cm for a pivot offset) -- past which further nudges silently
+    actual pose (~1.5 deg for ry, 1cm for a vTCP offset) -- past which further nudges silently
     stop moving the arm while the printed offset keeps climbing regardless (a real bug found
     this way). Disabled there and only there; wrench_limits/kp themselves (the actual torque/
     stiffness) are untouched, and cooperative_reset/cooperative_insert keep full
@@ -592,9 +610,9 @@ def test_calibrate_disables_reference_limiting_on_every_axis():
             assert frame.controller_overrides["compliance_reference_limit_enable"] == [True] * 6
 
 
-def test_demo_flag_routes_cooperative_insert_success_to_pushdown():
-    """demo=False (default) keeps the normal train/record loop -- a genuine success goes to
-    pull_out. demo=True redirects both success triggers (manual and, if configured, the
+def test_pushdown_routes_cooperative_insert_success_to_pushdown():
+    """pushdown=False (default) keeps the normal train/record loop -- a genuine success goes to
+    pull_out. pushdown=True redirects both success triggers (manual and, if configured, the
     reward classifier) to pushdown instead."""
     default_cfg = RailBimanualGraspEnvConfig(mock=True)
     assert any(
@@ -602,32 +620,33 @@ def test_demo_flag_routes_cooperative_insert_success_to_pushdown():
     )
     assert not any(e.source == "cooperative_insert" and e.target == "pushdown" for e in default_cfg.transitions)
 
-    demo_cfg = RailBimanualGraspEnvConfig(mock=True, demo=True, reward_classifier_path="/tmp/fake")
-    assert any(
-        e.source == "cooperative_insert" and e.target == "pushdown" for e in demo_cfg.transitions
+    pushdown_cfg = RailBimanualGraspEnvConfig(
+        mock=True, pushdown=True, reward_classifier_path="/tmp/fake"
     )
-    assert not any(e.source == "cooperative_insert" and e.target == "pull_out" for e in demo_cfg.transitions)
-    classifier_edge = next(e for e in demo_cfg.transitions if isinstance(e, RewardClassifierTransition))
+    assert any(
+        e.source == "cooperative_insert" and e.target == "pushdown" for e in pushdown_cfg.transitions
+    )
+    assert not any(e.source == "cooperative_insert" and e.target == "pull_out" for e in pushdown_cfg.transitions)
+    classifier_edge = next(e for e in pushdown_cfg.transitions if isinstance(e, RewardClassifierTransition))
     assert classifier_edge.target == "pushdown"
 
 
 def test_pushdown_task_frame_only_exposes_ry_live():
     """x/y/z/rx/rz are all locked in pushdown -- x and y hold wherever cooperative_insert left
-    them (x persisted the same way as elsewhere, y just doesn't move since nothing captures it
-    fresh either), z gets a gentle push via midpoint_offset, rx/rz stay at their static target
+    them (x persisted the same way as elsewhere, y and z just don't move since nothing captures them
+    fresh either), rx/rz stay at their static target
     (rz softened via controller overrides, not policy_mode). ry alone is live, for the operator
     to teleop down toward 0deg by hand -- captured from wherever cooperative_insert froze it
     (freeze_driver_axes_at_entry includes 4, matching cooperative_insert_env_kwargs), not from
-    the static DEFAULT_GRASP_ORIENTATION_RPY target: see
+    the static rail_target_poses target: see
     test_pushdown_freezes_ry_instead_of_snapping_to_static_target for the real-hardware
     regression (ry snapping to 0deg/parallel plus a z lift the instant pushdown activated)."""
-    cfg = RailBimanualGraspEnvConfig(mock=True, pushdown_z_offset_m=-0.007)
+    cfg = RailBimanualGraspEnvConfig(mock=True)
     pushdown = cfg.primitives["pushdown"]
 
     assert pushdown.task_frame["left"].policy_mode == [None, None, None, None, PolicyMode.RELATIVE, None]
     assert pushdown.task_frame["right"].policy_mode == [None] * 6
     assert pushdown.env_kwargs["freeze_driver_axes_at_entry"] == (0, 4)
-    assert pushdown.env_kwargs["midpoint_offset"] == pytest.approx([0.0, 0.0, -0.007])
 
 
 def test_pushdown_freezes_ry_instead_of_snapping_to_static_target():
@@ -635,7 +654,7 @@ def test_pushdown_freezes_ry_instead_of_snapping_to_static_target():
     4 (ry), so CooperativeFramePrimitive's capture (no per-axis freeze/override -> static
     task_frame target) snapped ry to its static 0.0 (parallel) the instant pushdown activated,
     instead of continuing from the calibrated angle cooperative_insert had it frozen at -- and,
-    since rotation composes about the pivot, swung the driven arm in z and lost contact as a
+    since rotation composes about the vTCP, swung the driven arm in z and lost contact as a
     side effect. Chains cooperative_insert (which freezes ry from the robot's own measured
     pose, same as production's ry_angle-less path) into pushdown, exactly like production's
     primitive graph always does."""
@@ -643,13 +662,13 @@ def test_pushdown_freezes_ry_instead_of_snapping_to_static_target():
     right = _FakeRobot([0.2, 0.0, 1.0, 0.0, 0.0, 0.0])
     shared_runtime_values = {}
 
-    insert_env = CooperativeInsertPrimitive(
+    insert_env = CooperativeFramePrimitive(
         _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
         driver="left", fps=30.0, freeze_driver_axes_at_entry=(0, 4),
     )
     insert_env.attach_shared_runtime_values(shared_runtime_values)
     insert_env.step({"left": {}})
-    assert shared_runtime_values[FROZEN_AXES_RUNTIME_KEY][4] == pytest.approx(0.35)
+    assert shared_runtime_values[RUNTIME_KEY_FROZEN_AXES][4] == pytest.approx(0.35)
 
     pushdown_env = CooperativeFramePrimitive(
         _cooperative_insert_task_frame(), {"left": left, "right": right}, {},
@@ -765,19 +784,16 @@ def test_cooperative_primitives_observe_driver_only_xyz_velocity():
 
 
 def test_cooperative_insert_observes_delta_position_and_previous_action_too():
-    """cooperative_insert alone adds two extra channels on top of the driver-only y/z
-    velocity every other cooperative primitive gets: delta position from wherever the driver
-    was when the episode started (position slot, custom dy/dz names), and the previous step's
-    action (velocity slot, alongside the current velocity) -- see CooperativeInsertPrimitive.
-    x is excluded throughout (locked, always ~0). Neither matters for cooperative_reset/
-    calibrate/etc, which have no policy and aren't recorded."""
+    """The learned insert state is relative driver Y/Z position, velocity, and action."""
     cfg = RailBimanualGraspEnvConfig(mock=True)
     obs = cfg.primitives["cooperative_insert"].processor.observation
 
     assert obs.add_ee_pos_to_observation == {"left": True, "right": False}
-    assert obs.ee_pos_axes == ["dy.ee_pos", "dz.ee_pos"]
+    assert obs.relative_ee_pos == {"left": True, "right": False}
+    assert obs.ee_pos_axes == ["y.ee_pos", "z.ee_pos"]
     assert obs.add_ee_velocity_to_observation == {"left": True, "right": False}
-    assert obs.ee_velocity_axes == ["y.ee_vel", "z.ee_vel", "prev_y.ee_vel", "prev_z.ee_vel"]
+    assert obs.ee_velocity_axes == ["y.ee_vel", "z.ee_vel"]
+    assert obs.add_previous_action_to_observation is True
 
     stats = cfg.primitives["cooperative_insert"].policy.dataset_stats["observation.state"]
     half_square = cfg.cooperative_insert_position_range_m / 2
@@ -789,10 +805,8 @@ def test_cooperative_insert_infers_the_full_six_dim_state_shape():
     """Regression test for a real dataset-creation bug: infer_features() samples each robot's
     raw get_observation() once, before any primitive has run, to build the static feature-shape
     snapshot record.py's LeRobotDataset.create() writes into a fresh dataset's metadata. dx/dz
-    and prev_x/prev_z only ever exist because CooperativeInsertPrimitive.step() injects them
-    into the *runtime* observation -- a plain robot double (like real UR robots) never exposes
-    them, so the inferred shape used to silently come out as whatever placeholder was already
-    there instead of the real 6, and record.py crashed on the first real frame."""
+    and the previous action is appended by the generic observation processor, so the inferred
+    shape must include both policy-action values before the first real frame is recorded."""
     cfg = RailBimanualGraspEnvConfig(mock=True)
     primitive = cfg.primitives["cooperative_insert"]
     robot_dict = {
@@ -825,64 +839,53 @@ class _FakeRobot:
         pass
 
 
+def test_cooperative_insert_processor_chain_builds_relative_state_and_action():
+    """The configured chain includes entry-relative pose, velocity, and current action."""
+    cfg = RailBimanualGraspEnvConfig(mock=True)
+    primitive = cfg.primitives["cooperative_insert"]
+    left = _FakeRobot([0.1, 0.2, 0.3, 0.0, 0.0, 0.0])
+    right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    primitive.validate({"left": left, "right": right}, {})
+    processor = primitive.make_env_processor()
+
+    def raw_observation() -> dict[str, float]:
+        return {
+            f"{name}.{key}": value
+            for name, robot in (("left", left), ("right", right))
+            for key, value in robot.get_observation().items()
+        }
+
+    reset = processor(create_transition(observation=raw_observation()))
+    assert reset[TransitionKey.OBSERVATION][OBS_STATE].tolist() == pytest.approx([0.0] * 6)
+
+    left.pose[1:3] = [0.4, 0.6]
+    stepped = processor(create_transition(
+        observation=raw_observation(),
+        action=torch.tensor([0.11, 0.33]),
+    ))
+    assert stepped[TransitionKey.OBSERVATION][OBS_STATE].tolist() == pytest.approx(
+        [0.2, 0.3, 0.2, 0.3, 0.11, 0.33]
+    )
+
+
 def _ry_calibration_task_frame() -> dict:
     return {
-        "left": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=COOPERATIVE_LEFT_POLICY),
+        "left": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=CALIBRATION_POLICY),
         "right": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=[None] * 6),
     }
 
 
 def _cooperative_insert_task_frame() -> dict:
     return {
-        "left": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=COOPERATIVE_INSERT_LEFT_POLICY),
+        "left": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=YZ_POLICY),
         "right": TaskFrame(target=[0.0] * 6, control_mode=[ControlMode.POS] * 6, policy_mode=[None] * 6),
     }
-
-
-def test_cooperative_insert_reset_observation_already_carries_the_full_six_dim_state():
-    """Regression test for a real recording crash: record.py stores the *pre*-step observation
-    alongside each action (o_t paired with a_t), so the very first frame of an episode comes
-    from reset()'s observation, not step()'s. Injecting dy/dz and prev_y/prev_z only from
-    step() left reset()'s observation without them, which is exactly what LeRobotDataset's
-    per-frame shape check caught."""
-    left = _FakeRobot([0.1, 0.2, 0.3, 0.0, 0.0, 0.0])
-    right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    env = CooperativeInsertPrimitive(
-        _cooperative_insert_task_frame(), {"left": left, "right": right}, {}, driver="left", fps=30.0,
-    )
-
-    obs, _info = env.reset()
-
-    for axis in ("dy", "dz"):
-        assert obs[f"left.{axis}.ee_pos"] == pytest.approx(0.0)
-    for axis in ("prev_y", "prev_z"):
-        assert obs[f"left.{axis}.ee_vel"] == pytest.approx(0.0)
-
-
-def test_cooperative_insert_prev_action_is_not_lagged_by_one_step():
-    """The observation returned by step(a_t) must carry a_t itself (the action that just
-    produced it), not a_{t-1} -- ManipulationPrimitive.step() calls _get_observation()
-    internally right after send_action(), so _prev_action has to be updated before
-    super().step() runs, not after."""
-    left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    env = CooperativeInsertPrimitive(
-        _cooperative_insert_task_frame(), {"left": left, "right": right}, {}, driver="left", fps=30.0,
-    )
-    env.reset()
-
-    obs, _reward, _terminated, _truncated, _info = env.step(
-        {"left": {"y.ee_pos": 0.11, "z.ee_pos": 0.33}}
-    )
-
-    assert obs["left.prev_y.ee_vel"] == pytest.approx(0.11)
-    assert obs["left.prev_z.ee_vel"] == pytest.approx(0.33)
 
 
 def test_ry_angle_calibration_reports_the_actual_measured_ry():
     """The printed ry tracks the arm's actual physical pose (what the operator is teleoping
     it to) -- there is no target/lock for it here. Prepended to the base class's own
-    pivot_offset_x readout (see CooperativeFramePrimitive.step()) rather than replacing it, so
+    vTCP x offset readout (see CooperativeFramePrimitive.step()) rather than replacing it, so
     a slider change stays visible here too."""
     left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.3, 0.0])  # actual ry = 0.3
     right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
@@ -892,15 +895,15 @@ def test_ry_angle_calibration_reports_the_actual_measured_ry():
     try:
         _obs, _reward, _terminated, _truncated, info = env.step({"left": {}})
 
-        assert info["record_status"] == "ry = +0.3000 rad  |  pivot_x = +0.0000 m"
+        assert info["record_status"] == "ry = +0.3000 rad  |  vtcp_x = +0.0000 m"
     finally:
         import matplotlib.pyplot as plt
 
         plt.close(env._slider_fig)
 
 
-def test_ry_angle_calibration_lets_the_spacemouse_move_the_whole_pivot():
-    """Unlike bimanual_pick.py's PivotOffsetXCalibrationPrimitive, this one keeps xyz/ry live
+def test_ry_angle_calibration_lets_the_spacemouse_move_the_whole_vtcp():
+    """Unlike bimanual_pick.py's vTCP-offset calibration primitive, this one keeps xyz/ry live
     -- the whole point is teleoperating ry (and whatever else) to the right value."""
     left = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     right = _FakeRobot([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import EnvTransition, TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry, ObservationProcessorStep
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from share.envs.manipulation_primitive.task_frame import TASK_FRAME_AXIS_NAMES
 from share.utils.transformation_utils import (
@@ -123,7 +123,10 @@ class StateObservationProcessor(ProcessorStep):
                     vals = self._differentiate(
                         name,
                         observation,
-                        [f"{name}.{axis}.ee_pos" for axis in axes],
+                        [
+                            f"{name}.{axis.removesuffix('.ee_vel').removesuffix('.ee_pos')}.ee_pos"
+                            for axis in axes
+                        ],
                     )
                 values.extend(vals)
 
@@ -208,15 +211,9 @@ class StateObservationProcessor(ProcessorStep):
     ) -> int:
         """Count one robot/modality's contribution to the inferred observation.state shape.
 
-        obs_features is a one-time snapshot of the robot's own raw get_observation() keys
-        (see ManipulationPrimitiveConfig.infer_features()), taken before any primitive has
-        ever run -- it has no way to know about keys a primitive injects into the observation
-        itself at runtime (e.g. CooperativeInsertPrimitive's dx/dy/dz.ee_pos and
-        prev_x/prev_y/prev_z.ee_vel). Filtering an explicit per-robot axis override against
-        that snapshot would silently drop exactly those keys and undercount state_dim, so an
-        explicit override is trusted directly instead. Only the unconfigured default axis list
-        (TASK_FRAME_AXIS_NAMES) still gets filtered against obs_features -- a robot may
-        legitimately not expose every one of those.
+        obs_features is a one-time snapshot of raw robot keys. Explicit axis overrides are
+        trusted directly because they may refer to channels added by another processor.
+        Only the default axis list is filtered against the snapshot.
         """
         axis_names = self._axes(axis_dict, name, suffix)
         if name in axis_dict:
@@ -287,6 +284,87 @@ class StateObservationProcessor(ProcessorStep):
     def reset(self) -> None:
         self._prev_obs.clear()
         self._state_buffer = deque(maxlen=self._resolved_stack_frames())
+
+
+@dataclass
+@ProcessorStepRegistry.register("previous_action_observation")
+class PreviousActionObservationProcessor(ProcessorStep):
+    """Append the current transition action to ``observation.state``."""
+
+    enable: bool = True
+    action_dim: int = 0
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if not self._is_enabled():
+            return transition
+
+        action = transition.get(TransitionKey.ACTION)
+        values = self._flatten_action(action)
+        if action is None:
+            values = [0.0] * self.action_dim
+        if self.action_dim and len(values) != self.action_dim:
+            raise ValueError(
+                f"Previous action has {len(values)} values, expected {self.action_dim}."
+            )
+
+        new_transition = transition.copy()
+        new_observation = dict(transition.get(TransitionKey.OBSERVATION) or {})
+        state = new_observation.get(OBS_STATE)
+        if isinstance(state, torch.Tensor):
+            action_tensor = torch.tensor(values, dtype=state.dtype, device=state.device)
+            state_tensor = state.reshape(-1)
+        else:
+            action_tensor = torch.tensor(values, dtype=torch.float32)
+            state_tensor = torch.as_tensor(state, dtype=torch.float32).reshape(-1) if state is not None else None
+
+        new_observation[OBS_STATE] = (
+            action_tensor if state_tensor is None else torch.cat((state_tensor, action_tensor))
+        )
+        new_transition[TransitionKey.OBSERVATION] = new_observation
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        if not self._is_enabled():
+            return features
+
+        new_features = {ft: dict(bucket) for ft, bucket in features.items()}
+        action_feature = new_features.get(PipelineFeatureType.ACTION, {}).get(ACTION)
+        action_dim = self.action_dim
+        if action_dim == 0 and action_feature is not None:
+            action_dim = int(np.prod(action_feature.shape))
+        if action_dim == 0:
+            return new_features
+
+        obs_features = new_features.setdefault(PipelineFeatureType.OBSERVATION, {})
+        state_feature = obs_features.get(OBS_STATE)
+        state_dim = 0 if state_feature is None else int(np.prod(state_feature.shape))
+        obs_features[OBS_STATE] = PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(state_dim + action_dim,),
+        )
+        return new_features
+
+    def get_config(self) -> dict[str, Any]:
+        return {"enable": self.enable, "action_dim": self.action_dim}
+
+    def _is_enabled(self) -> bool:
+        return bool(self.enable)
+
+    @classmethod
+    def _flatten_action(cls, action: Any) -> list[float]:
+        if action is None:
+            return []
+        if isinstance(action, torch.Tensor):
+            return action.detach().cpu().reshape(-1).tolist()
+        if isinstance(action, np.ndarray):
+            return action.reshape(-1).tolist()
+        if isinstance(action, dict):
+            return [value for key in sorted(action) for value in cls._flatten_action(action[key])]
+        if isinstance(action, (list, tuple)):
+            return [value for item in action for value in cls._flatten_action(item)]
+        return [float(action)]
 
 
 @dataclass

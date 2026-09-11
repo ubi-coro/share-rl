@@ -29,6 +29,18 @@ This repo is small enough that a few architectural rules matter more than clever
   - `trajectory_progress`
 - When a transition needs the current EE pose, fetch it from the processed observation through the shared observation-pose utility instead of republishing extra pose state in `info`.
 
+## Experiment config conventions
+
+- Put run-time/user-adjustable values in the main environment dataclass. Keep module-level constants for fixed policy shapes, keys, and implementation values; group those constants compactly near the top of the module.
+- Prefer direct per-robot mappings (`task_frame`/`TARGETS`) over helpers or wrapper configs when the entries are always consumed together.
+- Use a plain `ManipulationPrimitiveConfig` with `env_class`/`env_kwargs` unless a custom config genuinely needs custom construction or entry-time resolution.
+- Keep runtime state, measured geometry, and hardware coordination in the primitive env. Keep task-frame targets and processor selection in config.
+- Keep cooperative runtime behavior in a dedicated primitive env, but express observation selection and derived signals through shared, opt-in processors.
+- Prefer a small boolean when a feature only controls whether a transition or processor is enabled; use a mode enum only when there are multiple meaningful behaviors.
+- Use explicit names that describe the user-facing concept (`vtcp`, `driver`, `skip_grasp`, `pushdown`); do not expose implementation details such as which robot drives the cooperative action.
+- When adding a derived observation, update reset behavior, static feature-shape inference, serialization, and focused tests together.
+- Treat tests as architecture contracts: assert config shape and ownership boundaries as well as numerical behavior.
+
 ## Code quality expectations
 
 - Keep docstrings brief, accurate, and local to the file being changed.
