@@ -184,6 +184,11 @@ class ManipulationPrimitive(gymnasium.Env):
             return default
         return self._shared_runtime_values.get(key, default)
 
+    def clear_runtime_value(self, key: str) -> None:
+        """Drop a runtime value so the next writer re-derives it instead of reusing a stale one."""
+        if self._shared_runtime_values is not None:
+            self._shared_runtime_values.pop(key, None)
+
     def set_target_pose(
         self,
         target_pose: dict[str, list[float]],
