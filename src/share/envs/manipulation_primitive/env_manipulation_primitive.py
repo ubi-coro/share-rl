@@ -16,6 +16,13 @@ from share.teleoperators import TeleopEvents
 class ManipulationPrimitive(gymnasium.Env):
     """Minimal gym env wiring robots, cameras, and task-frame commands."""
 
+    # How stale a peeked camera frame may be before _get_observation() raises instead of
+    # silently feeding it to the control loop. ~3 frames at 30 fps: enough slack that one slow
+    # camera (e.g. a webcam auto-throttling its fps in low light) doesn't stall every step
+    # waiting for a fresh frame, while a genuinely dead/disconnected camera still errors quickly
+    # rather than feeding minutes-old frames forever. See LOG.md experiment 6 for how this was found.
+    CAMERA_MAX_AGE_MS = 500
+
     def __init__(
         self,
         task_frame: dict[str, TaskFrame],
@@ -157,7 +164,11 @@ class ManipulationPrimitive(gymnasium.Env):
         obs_dict = {}
 
         for cam_key, cam in self.cameras.items():
-            obs_dict[f"{OBS_IMAGES}.{cam_key}"] = cam.async_read()
+            # Non-blocking: peek the camera's latest buffered frame instead of waiting for a
+            # new one. A camera running at its configured fps still delivers a fresh frame
+            # almost every step; a camera that can't keep up (see CAMERA_MAX_AGE_MS above) now
+            # degrades to repeating its last frame instead of stalling the whole control loop.
+            obs_dict[f"{OBS_IMAGES}.{cam_key}"] = cam.read_latest(max_age_ms=self.CAMERA_MAX_AGE_MS)
 
         for name in self.robot_dict:
             robot_dict_obs_dict = self.robot_dict[name].get_observation()
