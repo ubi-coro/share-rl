@@ -53,6 +53,22 @@ class DatasetRecordConfig(draccus.ChoiceRegistry, DatasetConfig):
     # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
     # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
     vcodec: str = "libsvtav1"
+    # Encode video in real time while recording instead of writing PNGs and encoding them in save_episode().
+    # Cuts the end-of-episode save from tens of seconds to ~1 s, see src/share/scripts/benchmarks/episode_save.
+    # Disables the image writer: no PNGs are written.
+    streaming_encoding: bool = False
+    # Frames buffered per camera for the real-time encoder. A full queue drops frames, which desyncs the
+    # video from the recorded data (logged as an error), so keep it generous (150 frames = 5 s at 30 fps).
+    encoder_queue_maxsize: int = 150
+    # Threads per encoder instance (svt-av1 `lp`). None lets every encoder use all cores, which competes
+    # with the control loop while recording.
+    encoder_threads: int | None = None
+    # Max size of a video file before a new one is started, per camera. With streaming_encoding, each
+    # save_episode() re-muxes (concatenates) the whole current file, which grows from ~0.4 s to 2-3 s as
+    # the file fills up (see src/share/scripts/benchmarks/episode_save/LOG.md, experiment 5). Setting this
+    # near-zero makes every episode its own file instead, so concatenation never runs. None keeps lerobot's
+    # default (200 MB, shared across episodes).
+    video_files_size_in_mb: int | None = None
 
     def __post_init__(self):
         if not self.in_memory:

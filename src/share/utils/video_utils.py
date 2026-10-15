@@ -14,9 +14,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import queue
 import shutil
 
+from lerobot.datasets.video_utils import StreamingVideoEncoder
+
 logger = logging.getLogger(__name__)
+
+
+class ZeroCopyStreamingVideoEncoder(StreamingVideoEncoder):
+    """`StreamingVideoEncoder` whose `feed_frame` does not copy the frame on the calling thread.
+
+    Upstream copies every frame so camera drivers may reuse their buffers. With four 640x480 float32 cameras
+    that copy costs ~10 ms per step on the control thread. Frames fed from `record_loop` are fresh tensors
+    that nobody mutates afterwards (the PNG `AsyncImageWriter` this replaces also keeps unprotected references
+    until a worker writes them), so the encoder thread can read them directly. Do not use this with sources
+    that overwrite the array after `add_frame`.
+    """
+
+    def feed_frame(self, video_key: str, image) -> None:
+        if not self._episode_active:
+            raise RuntimeError("No active episode. Call start_episode() first.")
+
+        thread = self._threads[video_key]
+        if not thread.is_alive():
+            try:
+                status, msg = self._result_queues[video_key].get_nowait()
+                if status == "error":
+                    raise RuntimeError(f"Encoder thread for {video_key} crashed: {msg}")
+            except queue.Empty:
+                pass
+            raise RuntimeError(f"Encoder thread for {video_key} is not alive")
+
+        try:
+            self._frame_queues[video_key].put(image, timeout=0.1)
+        except queue.Full:
+            self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
+            if self._dropped_frames[video_key] == 1:
+                logger.error(
+                    f"Encoder queue full for {video_key}: dropping frames, the video will be out of sync "
+                    f"with the recorded data. Increase dataset.encoder_queue_maxsize or reduce encoder load."
+                )
+
+    def finish_episode(self):
+        dropped = {k: n for k, n in self._dropped_frames.items() if n > 0}
+        if dropped:
+            logger.error(f"Episode has dropped video frames {dropped}: discard it (re-record).")
+        return super().finish_episode()
+
+
+def use_zero_copy_streaming_encoder(dataset):
+    """Swap the dataset writer's streaming encoder for a `ZeroCopyStreamingVideoEncoder` with the same settings."""
+    writer = dataset.writer
+    old = getattr(writer, "_streaming_encoder", None)
+    if old is None:
+        return dataset
+    writer._streaming_encoder = ZeroCopyStreamingVideoEncoder(
+        fps=old.fps,
+        vcodec=old.vcodec,
+        pix_fmt=old.pix_fmt,
+        g=old.g,
+        crf=old.crf,
+        preset=old.preset,
+        queue_maxsize=old.queue_maxsize,
+        encoder_threads=old.encoder_threads,
+    )
+    return dataset
 
 
 class MultiVideoEncodingManager:

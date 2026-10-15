@@ -13,6 +13,7 @@ from lerobot.processor.rename_processor import rename_stats
 from share.configs.record import RecordConfig
 from share.envs.manipulation_primitive.config_manipulation_primitive import ManipulationPrimitiveConfig
 from share.envs.utils import env_to_dataset_features
+from share.utils.video_utils import use_zero_copy_streaming_encoder
 
 
 def make_policies_and_datasets(cfg: RecordConfig):
@@ -33,15 +34,22 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 root = Path(cfg.dataset.root) / name
                 repo_id = f"{cfg.dataset.repo_id}-{name}"
 
+                # Streaming encoding feeds frames straight to the video encoders, so no image writer is needed.
+                streaming = cfg.dataset.streaming_encoding
+                writer_kwargs = dict(
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
+                    image_writer_processes=0 if streaming else cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=0
+                    if streaming
+                    else cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
+                    streaming_encoding=streaming,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                )
+
                 if cfg.resume:
-                    datasets[name] = LeRobotDataset.resume(
-                        repo_id,
-                        root=root,
-                        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                        vcodec=cfg.dataset.vcodec,
-                        image_writer_processes=cfg.dataset.num_image_writer_processes,
-                        image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
-                    )
+                    datasets[name] = LeRobotDataset.resume(repo_id, root=root, **writer_kwargs)
 
                 else:
                     datasets[name] = LeRobotDataset.create(
@@ -51,10 +59,15 @@ def make_policies_and_datasets(cfg: RecordConfig):
                         features=env_to_dataset_features(p.features),
                         robot_type=cfg.env.type,
                         use_videos=cfg.dataset.video,
-                        image_writer_processes=cfg.dataset.num_image_writer_processes,
-                        image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * p.num_cameras,
-                        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                        vcodec=cfg.dataset.vcodec,
+                        **writer_kwargs,
+                    )
+
+                if streaming:
+                    use_zero_copy_streaming_encoder(datasets[name])
+
+                if cfg.dataset.video_files_size_in_mb is not None:
+                    datasets[name].meta.update_chunk_settings(
+                        video_files_size_in_mb=cfg.dataset.video_files_size_in_mb
                     )
 
                 rename_map = cfg.dataset.rename_map

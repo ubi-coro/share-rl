@@ -260,7 +260,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     log_say("Re-record episode", cfg.play_sounds, blocking=True)
                     dataset.clear_episode_buffer()
                 elif dataset.writer.episode_buffer["size"] > 0:
-                    log_say("Save episode", cfg.play_sounds, blocking=True)
+                    # non-blocking: a blocking announcement delays the save by the length of the speech
+                    log_say("Save episode", cfg.play_sounds)
                     dataset.save_episode()
                 else:
                     log_say("Dataset is empty, continue execution", cfg.play_sounds, blocking=True)
