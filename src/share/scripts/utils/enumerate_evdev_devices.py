@@ -7,7 +7,7 @@ for device in devices:
     print(f"{device.path}: {device.name}")
 
 # Open the one named "PCsensor FootSwitch Keyboard"
-device = evdev.InputDevice('/dev/input/event20')
+device = evdev.InputDevice('/dev/input/event6')
 
 print(f"\nListening for events from {device.name} ({device.path})...")
 

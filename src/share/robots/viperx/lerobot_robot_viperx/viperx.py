@@ -263,6 +263,7 @@ class ViperX(Robot):
             del action["finger.pos"]
 
         goal_pos = {key: action.get(key, self._last_motor_obs[key]) for key in self._last_motor_obs}
+        #print("Goal:", goal_pos, "\nCurr:", self._last_motor_obs)
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
