@@ -128,10 +128,12 @@ def record_loop(
             # currently sensed state can be plotted directly against the
             # policy's plans/executed action on the dashboard's "ground truth"
             # trace without any extra unit conversion.
-            recorders[mp_net.active_primitive].record_step(
-                predicted_action=action,
-                ground_truth_action=obs.get(OBS_STATE)
-            )
+            recorder = (recorders or {}).get(mp_net.active_primitive, None)
+            if recorder is not None:
+                recorder.record_step(
+                    predicted_action=action,
+                    ground_truth_action=obs.get(OBS_STATE)
+                )
         else:
             # Dummy action, expected to be overwritten by teleop action
             action = torch.tensor([0.0] * mp_net.action_dim, dtype=torch.float32)
@@ -216,12 +218,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     debugger = None
     datasets, policies, preprocessors, postprocessors = make_policies_and_datasets(cfg)
 
+    # Rollout dashboards are only recorded when there is somewhere to flush them to: an unflushed
+    # recorder would keep every step's plan snapshot in memory for the whole session.
     output_dir = cfg.output_dir
     recorders = {
         name: EpisodeRecorder(
             adapter=PolicyVisualizationAdapter(policies[name], action_postprocessor=postprocessors[name])
         )
-        for name in policies if policies[name] is not None
+        for name in policies if policies[name] is not None and output_dir is not None
     }
 
     try:
@@ -231,7 +235,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 dataset = datasets.get(mp_net.active_primitive, None)
                 recorder = recorders.get(mp_net.active_primitive, None)
-                recorder_root = Path(output_dir) / rf"{mp_net.active_primitive}"
+                recorder_root = None if output_dir is None else Path(output_dir) / mp_net.active_primitive
 
                 info = record_loop(
                     mp_net=mp_net,
