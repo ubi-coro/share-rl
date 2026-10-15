@@ -1,0 +1,83 @@
+{
+  "summary": {
+    "label": "debug-perep",
+    "create_kwargs": {
+      "image_writer_processes": 0,
+      "image_writer_threads": 0,
+      "batch_encoding_size": 1,
+      "vcodec": "libsvtav1",
+      "streaming_encoding": true,
+      "encoder_queue_maxsize": 150,
+      "encoder_threads": 2
+    },
+    "root": "/media/internal/hdd/jstranghoener/tmp/claude-30410/-home-jstranghoener-PycharmProjects-share-rl/63bd66ae-f399-4b97-b9bc-e495d7734b9f/scratchpad/runs/debug-perep-20261008-100342",
+    "pace": "fast",
+    "episodes": [
+      0,
+      1
+    ],
+    "frames_per_episode": [
+      200,
+      200
+    ],
+    "save_s_all": [
+      0.8100304710678756,
+      1.1531212897971272
+    ],
+    "save_s_mean": 0.9815758804325014,
+    "save_s_mean_steady": 1.1531212897971272,
+    "save_s_first": 0.8100304710678756,
+    "save_s_max": 1.1531212897971272,
+    "add_frame_ms_p99_worst": 3.012484379578374,
+    "add_frame_ms_max_worst": 6.777637870982289,
+    "loop_overruns_total": 0,
+    "dropped_frames_total": 0,
+    "cpu_cores_during_episode_mean": 27.20334472985934,
+    "cpu_s_in_save_mean": 12.564999999999984,
+    "finalize_s": 0.0064634280279278755,
+    "dataset_size_mb": 27.624813,
+    "verify": {
+      "frames_match": true,
+      "vectors_match": true,
+      "image_psnr_db_mean": 40.89990758895874
+    }
+  },
+  "episodes": [
+    {
+      "episode": 0,
+      "frames": 200,
+      "save_s": 0.8100304710678756,
+      "replay_s": 2.9040491939522326,
+      "cpu_cores_during_episode": 26.139364359971864,
+      "cpu_s_in_save": 9.449999999999989,
+      "add_frame_ms": {
+        "mean": 0.2388662612065673,
+        "p50": 0.09931751992553473,
+        "p99": 3.012484379578374,
+        "max": 6.777637870982289
+      },
+      "obs_build_ms_mean": 14.28021972766146,
+      "loop_overruns": 0,
+      "dropped_frames": 0,
+      "phases_s": {}
+    },
+    {
+      "episode": 1,
+      "frames": 200,
+      "save_s": 1.1531212897971272,
+      "replay_s": 1.873541264096275,
+      "cpu_cores_during_episode": 28.267325099746813,
+      "cpu_s_in_save": 15.679999999999978,
+      "add_frame_ms": {
+        "mean": 0.22267814725637436,
+        "p50": 0.09664357639849186,
+        "p99": 2.984412105288352,
+        "max": 3.6971948575228453
+      },
+      "obs_build_ms_mean": 9.14404941839166,
+      "loop_overruns": 0,
+      "dropped_frames": 0,
+      "phases_s": {}
+    }
+  ]
+}

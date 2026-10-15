@@ -1,0 +1,122 @@
+{
+  "summary": {
+    "label": "cpu-zc-threads1",
+    "create_kwargs": {
+      "image_writer_processes": 0,
+      "image_writer_threads": 0,
+      "batch_encoding_size": 1,
+      "vcodec": "libsvtav1",
+      "streaming_encoding": true,
+      "encoder_queue_maxsize": 150,
+      "encoder_threads": 1
+    },
+    "root": "/media/internal/hdd/jstranghoener/tmp/claude-30410/-home-jstranghoener-PycharmProjects-share-rl/63bd66ae-f399-4b97-b9bc-e495d7734b9f/scratchpad/runs/cpu-zc-threads1-20261005-164530",
+    "pace": "realtime",
+    "episodes": [
+      0,
+      1,
+      2
+    ],
+    "frames_per_episode": [
+      600,
+      600,
+      600
+    ],
+    "save_s_all": [
+      0.47892716410569847,
+      0.5788248090539128,
+      1.2117640699725598
+    ],
+    "save_s_mean": 0.7565053477107236,
+    "save_s_mean_steady": 0.8952944395132363,
+    "save_s_first": 0.47892716410569847,
+    "save_s_max": 1.2117640699725598,
+    "add_frame_ms_p99_worst": 0.16293702647089958,
+    "add_frame_ms_max_worst": 1.3664360158145428,
+    "loop_overruns_total": 0,
+    "dropped_frames_total": 0,
+    "cpu_cores_during_episode_mean": 3.1835179828429467,
+    "cpu_s_in_save_mean": 1.22666666666665,
+    "finalize_s": 0.006773853907361627,
+    "dataset_size_mb": 142.122931
+  },
+  "episodes": [
+    {
+      "episode": 0,
+      "frames": 600,
+      "save_s": 0.47892716410569847,
+      "replay_s": 20.12136596487835,
+      "cpu_cores_during_episode": 3.168770952791797,
+      "cpu_s_in_save": 1.1699999999999875,
+      "add_frame_ms": {
+        "mean": 0.10547983886984487,
+        "p50": 0.10165991261601448,
+        "p99": 0.16293702647089958,
+        "max": 1.3432248961180449
+      },
+      "obs_build_ms_mean": 5.124993217177689,
+      "loop_overruns": 0,
+      "dropped_frames": 0,
+      "phases_s": {
+        "wait_image_writer": 3.228895366191864e-06,
+        "episode_stats": 0.011061293072998524,
+        "parquet_data": 0.20686605689115822,
+        "streaming_finish_episode": 0.23772388813085854,
+        "save_episode_video": 0.006128696957603097,
+        "meta_save_episode": 0.0013010718394070864
+      }
+    },
+    {
+      "episode": 1,
+      "frames": 600,
+      "save_s": 0.5788248090539128,
+      "replay_s": 20.09775844705291,
+      "cpu_cores_during_episode": 3.163039309457009,
+      "cpu_s_in_save": 1.1899999999999977,
+      "add_frame_ms": {
+        "mean": 0.10263435232142608,
+        "p50": 0.10028248652815819,
+        "p99": 0.13199622044339776,
+        "max": 1.1862011160701513
+      },
+      "obs_build_ms_mean": 5.060498223174363,
+      "loop_overruns": 0,
+      "dropped_frames": 0,
+      "phases_s": {
+        "wait_image_writer": 3.341119736433029e-06,
+        "episode_stats": 0.0072935030329972506,
+        "parquet_data": 0.20483449008315802,
+        "streaming_finish_episode": 0.2520928420126438,
+        "  concat_videos (in save_episode_video)": 0.09272328997030854,
+        "save_episode_video": 0.09768683626316488,
+        "meta_save_episode": 0.002705909078940749
+      }
+    },
+    {
+      "episode": 2,
+      "frames": 600,
+      "save_s": 1.2117640699725598,
+      "replay_s": 20.132078324910253,
+      "cpu_cores_during_episode": 3.2187436862800345,
+      "cpu_s_in_save": 1.3199999999999648,
+      "add_frame_ms": {
+        "mean": 0.10450885320703189,
+        "p50": 0.1005691010504961,
+        "p99": 0.1606484642252326,
+        "max": 1.3664360158145428
+      },
+      "obs_build_ms_mean": 5.635394871933386,
+      "loop_overruns": 0,
+      "dropped_frames": 0,
+      "phases_s": {
+        "wait_image_writer": 2.6049092411994934e-06,
+        "episode_stats": 0.05575792980380356,
+        "parquet_data": 0.20557277998887002,
+        "streaming_finish_episode": 0.24040890508331358,
+        "  concat_videos (in save_episode_video)": 0.6869908401276916,
+        "save_episode_video": 0.6919695942196995,
+        "meta_save_episode": 0.00366932712495327
+      }
+    }
+  ]
+}
