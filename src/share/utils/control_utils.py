@@ -1,19 +1,26 @@
 import logging
 import time
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Sequence, Tuple
 
+import torch
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor.rename_processor import rename_stats
 
 from share.configs.record import RecordConfig
 from share.envs.manipulation_primitive.config_manipulation_primitive import ManipulationPrimitiveConfig
 from share.envs.utils import env_to_dataset_features
 from share.utils.video_utils import use_zero_copy_streaming_encoder
+
+if TYPE_CHECKING:
+    from beast_refiner.async_inference import AsyncInferenceConfig, AsyncPolicyRunner
+    from lerobot.policies.pretrained import PreTrainedPolicy
 
 
 def make_policies_and_datasets(cfg: RecordConfig):
@@ -104,6 +111,119 @@ def make_policies_and_datasets(cfg: RecordConfig):
             postprocessors[name] = post
 
     return datasets, policies, preprocessors, postprocessors
+
+
+def predict_action_async(
+    observation: dict[str, Any],
+    runner: "AsyncPolicyRunner",
+    obs_timestep: int,
+    device: torch.device,
+    preprocessor,
+    postprocessor,
+    task: str | None = None,
+    robot_type: str | None = None,
+) -> torch.Tensor:
+    """`lerobot.utils.control_utils.predict_action` with the policy call routed through an `AsyncPolicyRunner`.
+
+    Same observation preparation, pre- and post-processing; only `policy.select_action(batch)` is replaced by
+    `runner.select_action(batch, obs_timestep)`, which answers from System 1 without waiting for System 2.
+    `obs_timestep` has to increase by one per control step and restart at 0 every episode.
+
+    Runs under `no_grad`, not `inference_mode` like the synchronous path: the batch is handed to the runner's
+    System 2 thread, and inference tensors cannot be updated in place outside of inference mode. Autocast is
+    thread-local and not applied either, so the policy must have `use_amp=False`.
+    """
+    observation = copy(observation)
+    with torch.no_grad():
+        observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        observation = preprocessor(observation)
+        action = runner.select_action(observation, obs_timestep)
+        return postprocessor(action)
+
+
+def make_async_runners(
+    policies: dict[str, "PreTrainedPolicy | None"],
+    async_cfg: "AsyncInferenceConfig | None",
+    fps: float,
+) -> dict[str, "AsyncPolicyRunner"]:
+    """Started `AsyncPolicyRunner`s for the beast_xvla_refiner_v2 policies, if `async_cfg` is set.
+
+    That includes the policies built on its model (e.g. beast_xvla_refiner_v2_ladder). Primitives whose policy
+    is something else (or has none) are left out and keep the synchronous `policy.select_action` path. Call after every policy is loaded: `apply_process_tuning` freezes the GC
+    for the objects alive at that point. `fps` is the rate the control loop runs at.
+    """
+    if async_cfg is None:
+        return {}
+
+    # only needed, and slow to import, when async inference is actually requested
+    from beast_refiner.async_inference import AsyncPolicyRunner, apply_process_tuning
+    from beast_refiner.policies.beast_xvla_refiner_v2.modeling_beast_xvla_refiner_v2 import BeastXVLARefinerV2Model
+
+    runners: dict[str, AsyncPolicyRunner] = {}
+    for name, policy in policies.items():
+        if policy is None:
+            continue
+        if not isinstance(getattr(policy, "model", None), BeastXVLARefinerV2Model):
+            logging.warning(
+                f"[{name}] async inference only supports beast_xvla_refiner_v2, "
+                f"running {policy.config.type} synchronously."
+            )
+            continue
+        if policy.config.use_amp:
+            raise ValueError(
+                f"[{name}] async inference does not apply autocast on its System 2 thread: set use_amp=False "
+                f"(policy_overwrites={{'use_amp': False}})."
+            )
+        if policy.model.fps != fps:
+            logging.warning(
+                f"[{name}] the policy was trained at {policy.model.fps} fps but the env runs at {fps} fps; "
+                f"System 1's velocity pin and the replan margin assume the training rate."
+            )
+        # refuses inference_mode="sys2": System 1 has to run every tick
+        runners[name] = AsyncPolicyRunner(policy, async_cfg)
+
+    if runners:
+        apply_process_tuning(async_cfg)
+    started = []
+    try:
+        for name, runner in runners.items():
+            logging.info(f"[{name}] starting async inference (warming up System 1 and System 2)")
+            started.append(runner)
+            runner.start(tune_process=False)
+    except Exception:
+        for runner in started:
+            runner.stop()
+        raise
+    return runners
+
+
+class TickStats:
+    """Aggregates the control loop's tick times so they can be logged once per window, off the hot path.
+
+    A synchronous write to a slow stderr (pipe, tmux) blocks the control loop, which is what a per-tick INFO
+    line did to the tick after it.
+    """
+
+    def __init__(self, window: int):
+        self.window = max(1, window)
+        self.dt_loop: list[float] = []
+        self.dt_load: list[float] = []
+
+    def add(self, dt_loop: float, dt_load: float) -> str | None:
+        """Record one tick; returns the summary of the window when it is full, else None."""
+        self.dt_loop.append(dt_loop)
+        self.dt_load.append(dt_load)
+        if len(self.dt_loop) < self.window:
+            return None
+        summary = (
+            f"last {len(self.dt_loop)} ticks: "
+            f"dt_loop mean {1000 * sum(self.dt_loop) / len(self.dt_loop):5.2f}ms "
+            f"max {1000 * max(self.dt_loop):5.2f}ms ({1 / max(self.dt_loop):3.1f}hz min), "
+            f"dt_load max {1000 * max(self.dt_load):5.2f}ms"
+        )
+        self.dt_loop.clear()
+        self.dt_load.clear()
+        return summary
 
 
 def make_step_timing_hooks(

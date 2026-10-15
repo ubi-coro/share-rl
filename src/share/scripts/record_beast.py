@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from beast_refiner.async_inference import AsyncPolicyRunner
 from beast_refiner.utils.visualization import EpisodeRecorder, PolicyVisualizationAdapter
 from lerobot.configs import parser
 from lerobot.datasets.image_writer import safe_stop_image_writer
@@ -28,11 +29,11 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
-from share.configs.record import RecordConfig
+from share.configs.record_beast import RecordBeastConfig
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
 from share.teleoperators import TeleopEvents
-from share.utils.control_utils import make_policies_and_datasets
+from share.utils.control_utils import TickStats, make_async_runners, make_policies_and_datasets, predict_action_async
 from share.utils.video_utils import MultiVideoEncodingManager
 
 init_logging()
@@ -77,11 +78,17 @@ def record_loop(
     display_compressed_images: bool = False,
     interactive: bool = False,
     debugger: MPNetDebugger | None = None,
-    recorders: dict[str, EpisodeRecorder] | None = None
+    recorders: dict[str, EpisodeRecorder] | None = None,
+    runners: dict[str, AsyncPolicyRunner] | None = None,
 ):
+    runners = runners or {}
+
     # reset
     transition = mp_net.reset()
-    if policies.get(mp_net.active_primitive, None) is not None:
+    if runners.get(mp_net.active_primitive, None) is not None:
+        # also resets the policy, and drops the System 2 plan still in flight
+        runners[mp_net.active_primitive].reset()
+    elif policies.get(mp_net.active_primitive, None) is not None:
         policies[mp_net.active_primitive].reset()
     if debugger is not None:
         debugger.log_reset(mp_net, transition)
@@ -97,10 +104,14 @@ def record_loop(
 
     # record loop
     sum_reward = 0.0
+    # The async runners index System 1 against this: +1 per control step, restarting with every episode.
+    obs_timestep = 0
+    tick_stats = TickStats(window=round(mp_net.config.fps))
     while True:
         start_loop_t = time.perf_counter()
         obs = transition[TransitionKey.OBSERVATION]
         policy = policies.get(mp_net.active_primitive, None)
+        runner = runners.get(mp_net.active_primitive, None)
         dataset = datasets.get(mp_net.active_primitive, None)
 
         # (1) Decide and process action a_t
@@ -111,17 +122,21 @@ def record_loop(
             # names the policy expects. Filtering by policy.config.input_features here would
             # drop every renamed key (e.g. all camera images) before the rename step ever runs.
             obs_keys = dataset.features if dataset is not None else policy.config.input_features
-            # noinspection PyTypeChecker
-            action = predict_action(
+            inference_kwargs = dict(
                 observation={key: obs[key] for key in obs_keys if key in obs},
-                policy=policy,
                 device=get_safe_torch_device(policy.config.device),
                 preprocessor=preprocessors[mp_net.active_primitive],
                 postprocessor=postprocessors[mp_net.active_primitive],
-                use_amp=policy.config.use_amp,
                 task=task,
                 robot_type=mp_net.config.type
-            ).squeeze()
+            )
+            if runner is not None:
+                # System 1 answers from the newest System 2 plan, System 2 replans on its own thread
+                action = predict_action_async(runner=runner, obs_timestep=obs_timestep, **inference_kwargs)
+            else:
+                # noinspection PyTypeChecker
+                action = predict_action(policy=policy, use_amp=policy.config.use_amp, **inference_kwargs)
+            action = action.squeeze()
 
             # obs and action share the same absolute-joint-state space in this
             # env config (see AlohaBimanualMPNetConfig's TaskFrame), so the
@@ -182,6 +197,7 @@ def record_loop(
 
         # (5) Update current observation
         transition = new_transition
+        obs_timestep += 1
 
         # 6) Handle done
         if (
@@ -195,15 +211,17 @@ def record_loop(
         dt_load = time.perf_counter() - start_loop_t
         precise_sleep(1 / mp_net.config.fps - dt_load)
         dt_loop = time.perf_counter() - start_loop_t
-        logging.info(
-            f"[{task}] "
-            f"dt_loop: {dt_loop * 1000:5.2f}ms ({1 / dt_loop:3.1f}hz), "
-            f"dt_load: {dt_load * 1000:5.2f}ms ({1 / dt_load:3.1f}hz)"
+        logging.debug(
+            "[%s] dt_loop: %5.2fms (%3.1fhz), dt_load: %5.2fms (%3.1fhz)",
+            task, dt_loop * 1000, 1 / dt_loop, dt_load * 1000, 1 / dt_load
         )
+        summary = tick_stats.add(dt_loop, dt_load)
+        if summary is not None:
+            logging.info(f"[{task}] {summary}")
 
 
 @parser.wrap()
-def record(cfg: RecordConfig) -> LeRobotDataset:
+def record(cfg: RecordBeastConfig) -> LeRobotDataset:
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
@@ -228,7 +246,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         for name in policies if policies[name] is not None and output_dir is not None
     }
 
+    runners: dict[str, AsyncPolicyRunner] = {}
     try:
+        runners = make_async_runners(policies, cfg.async_inference, cfg.env.fps)
         with MultiVideoEncodingManager(datasets):
             while True:
                 log_say(f"Record episode for {mp_net.active_primitive}", play_sounds=cfg.play_sounds)
@@ -247,7 +267,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                     interactive=cfg.interactive,
                     debugger=debugger,
-                    recorders=recorders
+                    recorders=recorders,
+                    runners=runners
                 )
 
                 if info.get(TeleopEvents.STOP_RECORDING, False):
@@ -271,6 +292,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     log_say("Dataset is empty, continue execution", cfg.play_sounds, blocking=True)
 
     finally:
+        for runner in runners.values():
+            runner.stop()
         #debugger.close()
         log_say("Stop recording", cfg.play_sounds, blocking=True)
         mp_net.close()
