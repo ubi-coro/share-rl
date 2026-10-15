@@ -75,7 +75,7 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 p.policy = replace(p.policy, **p.policy_overwrites)
                 p.policy.pretrained_path = policy_path
 
-            policies[name] = make_policy(cfg=p.policy, env_cfg=p)
+            policies[name] = make_policy(cfg=p.policy, env_cfg=p, rename_map=rename_map)
             policies[name] = policies[name].eval()
 
             pre, post = make_pre_post_processors(

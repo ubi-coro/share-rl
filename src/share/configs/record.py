@@ -94,6 +94,8 @@ class RecordConfig:
     resume: bool = False
     # Interactively take control during rollouts
     interactive: bool = False
+    # Output directory for episode recordings (e.g. visualizations)
+    output_dir: str | None = None
 
     def __post_init__(self):
 
