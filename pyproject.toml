@@ -60,6 +60,9 @@ aloha = [
     "lerobot_robot_viperx @ file:src/share/robots/viperx",
     "lerobot_teleoperator_widowx @ file:src/share/teleoperators/widowx",
 ]
+bota = [
+    "pyserial>=3.5",
+]
 test = [
     "pytest>=8.1.0,<9.0.0",
     "pytest-timeout>=2.4.0,<3.0.0",
@@ -69,6 +72,7 @@ all = [
     "share-rl[ur]",
     "share-rl[spacemouse]",
     "share-rl[aloha]",
+    "share-rl[bota]",
     "share-rl[test]",
 ]
 

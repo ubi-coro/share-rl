@@ -67,6 +67,7 @@ These extras are designed for use from this repository checkout.
 pip install -e .[ur]
 pip install -e .[spacemouse]
 pip install -e .[aloha]
+pip install -e .[bota]
 pip install -e .[all]
 ```
 
@@ -75,7 +76,8 @@ What each extra does:
 - `.[ur]`: installs the root `share` package plus the sibling `lerobot_robot_ur` project from `src/share/robots/ur`
 - `.[spacemouse]`: installs the root `share` package plus the sibling `lerobot_teleoperator_spacemouse` project from `src/share/teleoperators/spacemouse`
 - `.[aloha]`: installs the root `share` package plus the sibling `lerobot_robot_viperx` and `lerobot_teleoperator_widowx` projects
-- `.[all]`: installs the three hardware extras above plus test dependencies
+- `.[bota]`: installs `pyserial`, the only dependency of the Bota wrist force/torque sensor reader (see below)
+- `.[all]`: installs the hardware extras above plus test dependencies
 
 If you want one sibling package directly, you can also install it by path:
 
@@ -83,6 +85,41 @@ If you want one sibling package directly, you can also install it by path:
 pip install -e src/share/robots/ur
 pip install -e src/share/teleoperators/spacemouse
 ```
+
+### Bota wrist force/torque sensor (ViperX, diagnosis only)
+
+A Bota MiniONE between the wrist and the gripper measures contact forces, e.g. to see an open-loop policy
+grabbing before a human hand lets go. Enable it on the robot config with the sensor's stable port:
+
+```bash
+--robot.bota.enable=true --robot.bota.port=/dev/serial/by-id/usb-Bota_Systems_..._<serial>-if00
+```
+
+- `ViperX.calibrate()` (and the first `connect()` without a saved fit) fits the gripper's payload from the whole
+  trajectory you record. Workflow: support the arm and press Enter, which switches the torque off; move the arm
+  slowly by hand through as many orientations as you can, tilting and rolling the wrist and holding it by the wrist
+  or forearm, not the gripper. A live line shows the measured wrench, whether the current sample is used (moves
+  faster than about 17 deg/s are recorded but not used, the model is static) and how many different orientations
+  you have covered, at least 12. Press Enter to finish once you have enough, or it ends after
+  `bota.calibration_duration_s`. The fit then runs, the arm holds the pose you left it in and the torque comes back
+  on. The fit is stored in the arm's calibration file `<id>.json` under `bota_payload`, next to the motors (the
+  file as it was is kept once as `<id>.json.bak`); its mass should match the gripper's weight.
+- The recorded trajectory is stored next to it as `<id>_bota_trajectory.csv` (time, sensor temperature, joints,
+  wrench). If one exists, the next calibration offers to refit it instead of recording a new one.
+- `--robot.bota.residual=true` adds a small net for what depends on the pose and the weight model cannot know, e.g.
+  cable pull (inputs: gravity direction in the EE frame and the three wrist angles). It needs 30 orientations, is
+  checked on held-out orientations during the fit, and is kept only if it clearly beats the weight model. Its
+  weights are stored with the fit. Connecting with it on and a stored fit that has no net runs the calibration
+  (unless a net was already tried and rejected), which offers to refit the stored trajectory, so the net can be
+  turned on without moving the arm again.
+- Every `connect()` re-zeroes the bias for `bota.tare_duration_s`, so keep the arm still and the gripper untouched.
+- The observation then carries the gravity-compensated wrench (N, Nm, sensor frame) as `x,y,z,rx,ry,rz.ee_wrench`.
+  It stays out of `observation.state` unless the env sets `add_ee_wrench_to_observation`.
+- `python -m share.scripts.record_beast` with `--output_dir` writes it per episode to
+  `<output_dir>/<primitive>/<episode>/wrench.csv`, next to that episode's dashboard, and logs the peak force.
+- To watch it live, run `python -m share.robots.viperx.lerobot_robot_viperx.bota.dashboard --env.type=<env>` with an
+  env config that has a ViperX with `bota.enable`. It opens Rerun with the raw and the calibrated wrench, and
+  switches the arm torque off (after you confirm) so the arm can be moved by hand.
 
 ## Installed Commands
 

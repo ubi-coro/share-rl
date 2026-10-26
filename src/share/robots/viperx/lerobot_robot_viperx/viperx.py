@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import math
 import time
 from collections import OrderedDict
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
+import draccus
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration
 from lerobot.robots import Robot
@@ -26,6 +29,11 @@ from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from share.motors.dynamixel.dynamixel import TrossenDynamixelBus, TrossenNormMode, OperatingMode
+from share.robots.viperx.lerobot_robot_viperx.bota.calibration import (
+    PAYLOAD_KEY, WRENCH_FEATURES, calibrate_payload, needs_calibration, read_payload, read_trajectory, tare_payload,
+    trajectory_path, wrench_observation, write_payload, write_trajectory,
+)
+from share.robots.viperx.lerobot_robot_viperx.bota.driver import BotaDriver
 from share.robots.viperx.lerobot_robot_viperx.config_viperx import ViperXConfig
 
 logger = logging.getLogger(__name__)
@@ -80,6 +88,14 @@ class ViperX(Robot):
         self.cameras = make_cameras_from_configs(config.cameras)
         self._last_motor_obs = None
 
+        self.bota_driver = None
+        self.payload_model = None
+        if config.bota.enable:
+            if not config.bota.port:
+                raise ValueError("ViperXConfig.bota.port must be set when bota.enable is true.")
+            self.bota_driver = BotaDriver(config.bota.port)
+            self.payload_model = read_payload(self.calibration_fpath)
+
     @property
     def _motors_ft(self) -> dict[str, type]:
         motors = {f"{motor}.pos": float for motor in self.bus.motors if not motor.endswith("_shadow")}
@@ -95,7 +111,9 @@ class ViperX(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        # The wrench is observation only: the arm cannot be commanded in wrench, so it stays out of action_features.
+        wrench_ft = {} if self.bota_driver is None else WRENCH_FEATURES
+        return {**self._motors_ft, **wrench_ft, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -103,7 +121,11 @@ class ViperX(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+        return (
+            self.bus.is_connected
+            and all(cam.is_connected for cam in self.cameras.values())
+            and (self.bota_driver is None or self.bota_driver.is_connected)
+        )
 
     def connect(self, calibrate: bool = True) -> None:
         """
@@ -117,6 +139,8 @@ class ViperX(Robot):
         # then we enable it again to read them when we check if our calibration matches (weird ik)
         # then we turn it off again during motor configuration and keep that
         self.bus.connect()
+        if self.bota_driver is not None:
+            self.bota_driver.connect()
 
         self.bus.enable_torque()
 
@@ -134,7 +158,14 @@ class ViperX(Robot):
             cam.connect()
 
         self.configure()
+        if self.bota_driver is not None and needs_calibration(self.payload_model, self.config.bota.residual):
+            if calibrate:
+                self._calibrate_payload()
+            elif self.payload_model is not None:
+                logger.warning(f"{self}: bota.residual is on but the stored payload fit has no net, calibrate to fit one.")
         self.get_observation()
+        if self.payload_model is not None:
+            tare_payload(self.payload_model, self.bus, self.bota_driver, self.config.bota.tare_duration_s)
         logger.info(f"{self} connected.")
 
     @property
@@ -174,6 +205,32 @@ class ViperX(Robot):
             self.bus.write_calibration(self.calibration)
             self._save_calibration()
             logger.info(f"Calibration saved to {self.calibration_fpath}")
+
+        if self.bota_driver is not None:
+            self._calibrate_payload()
+
+    def _calibrate_payload(self) -> None:
+        self.configure()  # the pose is held with goal writes, so the operating modes must be set first
+        trajectory_fpath = trajectory_path(self.calibration_fpath)
+        stored = read_trajectory(trajectory_fpath) if trajectory_fpath.is_file() else None
+        self.payload_model, trajectory = calibrate_payload(
+            self.bus, self.bota_driver, self.config.bota.calibration_duration_s, self.config.bota.residual, stored
+        )
+        write_payload(self.calibration_fpath, self.payload_model)
+        write_trajectory(trajectory_fpath, trajectory)
+
+    def _load_calibration(self, fpath: Path | None = None) -> None:
+        # The calibration file also holds the payload fit, which the base class would try to parse as a motor.
+        data = json.loads((fpath or self.calibration_fpath).read_text())
+        data.pop(PAYLOAD_KEY, None)
+        self.calibration = draccus.decode(dict[str, MotorCalibration], data)
+
+    def _save_calibration(self, fpath: Path | None = None) -> None:
+        fpath = fpath or self.calibration_fpath
+        payload = self.payload_model or read_payload(fpath)  # a stored fit survives even while the sensor is disabled
+        super()._save_calibration(fpath)  # writes the motors only
+        if payload is not None:
+            write_payload(fpath, payload)
 
     def configure(self) -> None:
         """
@@ -229,6 +286,8 @@ class ViperX(Robot):
         #obs_dict["finger.pos"] = gripper_to_linear(obs_dict.pop("gripper.pos"))
         dt_ms = (time.perf_counter() - start) * 1e3
         self._last_motor_obs = dict(obs_dict)
+        if self.bota_driver is not None:
+            obs_dict |= wrench_observation(self.payload_model, self.bota_driver, obs_dict)
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
         # Capture images from cameras
@@ -284,6 +343,8 @@ class ViperX(Robot):
         self.bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
+        if self.bota_driver is not None:
+            self.bota_driver.disconnect()
 
         logger.info(f"{self} disconnected.")
 

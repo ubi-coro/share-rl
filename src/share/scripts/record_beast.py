@@ -38,6 +38,7 @@ from share.utils.control_utils import (
     offer_to_save_episode, predict_action_async
 )
 from share.utils.video_utils import MultiVideoEncodingManager
+from share.utils.wrench_log import read_ee_wrenches, wrench_peak_summary, write_wrench_log
 
 # INFO on the console. The async runner's per-plan timings and the loop's per-tick timings are DEBUG.
 init_logging(console_level="INFO")
@@ -87,6 +88,7 @@ def record_loop(
     recorders: dict[str, EpisodeRecorder] | None = None,
     runners: dict[str, AsyncPolicyRunner] | None = None,
     on_step: Callable[[dict], None] | None = None,
+    wrench_log: list[dict[str, float]] | None = None,
 ):
     runners = runners or {}
 
@@ -121,6 +123,10 @@ def record_loop(
         runner = runners.get(mp_net.active_primitive, None)
         dataset = datasets.get(mp_net.active_primitive, None)
         phases = {}  # durations of the parts of this tick, summarised by tick_stats
+
+        # Diagnosis only: read the wrench off the observation, whether or not the policy state keeps it
+        if wrench_log is not None and (wrench := read_ee_wrenches(obs)):
+            wrench_log.append(wrench)
 
         # (1) Decide and process action a_t
         if policy is not None:
@@ -280,6 +286,8 @@ def record(cfg: RecordBeastConfig) -> LeRobotDataset:
                 dataset = datasets.get(mp_net.active_primitive, None)
                 recorder = recorders.get(mp_net.active_primitive, None)
                 recorder_root = None if output_dir is None else Path(output_dir) / mp_net.active_primitive
+                # Like the dashboards, only kept when there is somewhere to write it
+                wrench_log = None if output_dir is None else []
 
                 with episode_progress(mp_net, dataset) as on_step:
                     info = record_loop(
@@ -295,6 +303,7 @@ def record(cfg: RecordBeastConfig) -> LeRobotDataset:
                         recorders=recorders,
                         runners=runners,
                         on_step=on_step,
+                        wrench_log=wrench_log,
                     )
 
                 if info.get(TeleopEvents.STOP_RECORDING, False):
@@ -303,12 +312,17 @@ def record(cfg: RecordBeastConfig) -> LeRobotDataset:
                 # Named after the dataset episode it belongs to: the recorder's own counter restarts at 0 in
                 # every session, so a resumed run would overwrite the earlier dashboards. A re-recorded
                 # episode reuses its index and replaces the dashboard of the discarded take.
+                episode_name = None if dataset is None else f"episode_{dataset.num_episodes:06d}"
+                episode_dir = None
                 if recorder is not None and output_dir is not None:
-                    # Named after the dataset episode it belongs to: the recorder's own counter restarts at 0 in
-                    # every session, so a resumed run would overwrite the earlier dashboards. A re-recorded
-                    # episode reuses its index and replaces the dashboard of the discarded take.
-                    episode_name = None if dataset is None else f"episode_{dataset.num_episodes:06d}"
-                    recorder.flush(output_root=recorder_root, episode_name=episode_name)
+                    episode_dir = recorder.flush(output_root=recorder_root, episode_name=episode_name)
+
+                if wrench_log:
+                    # Inside the folder of the episode's dashboard, or in a folder of its own without one
+                    stamp = episode_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+                    episode_dir = episode_dir or recorder_root / stamp
+                    write_wrench_log(episode_dir / "wrench.csv", wrench_log, mp_net.config.fps)
+                    logging.info(f"[{recorder_root.name}] {wrench_peak_summary(wrench_log, mp_net.config.fps)}")
 
                 if dataset is None:
                     continue

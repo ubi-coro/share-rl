@@ -122,6 +122,32 @@ def test_record_loop_without_recorders_does_not_need_them():
     assert policy.resets == 2
 
 
+class _WrenchMPNet(_FakeMPNet):
+    """Observations carry the wrench, like a ViperX with the Bota sensor enabled."""
+
+    def reset(self):
+        transition = super().reset()
+        transition[record_beast.TransitionKey.OBSERVATION]["viperx.z.ee_wrench"] = 1.0
+        return transition
+
+    def step(self, action):
+        transition = super().step(action)
+        transition[record_beast.TransitionKey.OBSERVATION]["viperx.z.ee_wrench"] = 1.0 + self.steps
+        return transition
+
+
+def test_record_loop_reads_the_wrench_off_every_observation():
+    """Diagnosis only: the wrench is read from the observation the policy sees, one row per control step."""
+    wrench_log = []
+
+    _loop(_WrenchMPNet(episode_len=3), _FakePolicy(), wrench_log=wrench_log)
+
+    assert wrench_log == [{"viperx.z.ee_wrench": 1.0}, {"viperx.z.ee_wrench": 2.0}, {"viperx.z.ee_wrench": 3.0}]
+
+
+def test_record_loop_without_a_wrench_log_ignores_the_wrench():
+    _loop(_WrenchMPNet(episode_len=2), _FakePolicy())
+
 
 # ---------------------------------------------------------------------------------------------------------
 # a failing env step
@@ -312,6 +338,66 @@ def test_record_session_names_dashboards_after_the_dataset_episode(monkeypatch, 
     )
 
     assert flushed == [{"output_root": tmp_path / "pick", "episode_name": "episode_000012"}]
+
+
+def _wrench_session(monkeypatch, tmp_path, flush) -> None:
+    """One episode with two wrench rows, then stop; ``flush`` stands in for EpisodeRecorder.flush."""
+    monkeypatch.setattr(record_beast, "EpisodeRecorder", lambda **kw: SimpleNamespace(flush=flush))
+    monkeypatch.setattr(record_beast, "PolicyVisualizationAdapter", lambda *a, **kw: None)
+    monkeypatch.setattr(record_beast, "MultiVideoEncodingManager", lambda datasets: nullcontext())
+    episodes = iter([[{"viperx.x.ee_wrench": 3.0, "viperx.y.ee_wrench": 4.0, "viperx.z.ee_wrench": 0.0}] * 2, None])
+
+    def fake_loop(**kwargs):
+        rows = next(episodes)
+        if rows is None:
+            return {TeleopEvents.STOP_RECORDING: True}
+        kwargs["wrench_log"].extend(rows)
+        return {}
+
+    monkeypatch.setattr(record_beast, "record_loop", fake_loop)
+    dataset = SimpleNamespace(
+        num_episodes=7, writer=SimpleNamespace(episode_buffer={"size": 1}), save_episode=lambda: None
+    )
+    _record_session(monkeypatch, _record_config(output_dir=str(tmp_path)), _FakeMPNet(), datasets={"pick": dataset})
+
+
+def test_record_session_writes_the_wrench_into_the_folder_of_the_episode_dashboard(monkeypatch, tmp_path):
+    def flush(output_root, episode_name):
+        (output_root / episode_name).mkdir(parents=True)
+        return output_root / episode_name
+
+    _wrench_session(monkeypatch, tmp_path, flush)
+
+    written = (tmp_path / "pick" / "episode_000007" / "wrench.csv").read_text().splitlines()
+    assert written[0] == "step,time_s,viperx.x.ee_wrench,viperx.y.ee_wrench,viperx.z.ee_wrench"
+    assert len(written) == 3
+    assert not list((tmp_path / "pick").glob("*.csv")), "nothing is left next to the episode folders"
+
+
+def test_record_session_puts_the_wrench_where_the_recorder_put_the_dashboard(monkeypatch, tmp_path):
+    """The recorder names its own folder when the dataset gives no name, the wrench follows it."""
+    _wrench_session(monkeypatch, tmp_path, lambda output_root, episode_name: output_root / "recorder_choice")
+
+    assert (tmp_path / "pick" / "recorder_choice" / "wrench.csv").is_file()
+
+
+def test_record_session_gives_the_wrench_a_folder_when_the_dashboard_wrote_nothing(monkeypatch, tmp_path):
+    """No policy steps means nothing to flush, yet the wrench of the episode is still kept."""
+    _wrench_session(monkeypatch, tmp_path, lambda output_root, episode_name: None)
+
+    assert (tmp_path / "pick" / "episode_000007" / "wrench.csv").is_file()
+
+
+def test_record_session_keeps_no_wrench_log_without_output_dir(monkeypatch):
+    seen = []
+    monkeypatch.setattr(record_beast, "MultiVideoEncodingManager", lambda datasets: nullcontext())
+    monkeypatch.setattr(
+        record_beast, "record_loop", lambda **kw: seen.append(kw["wrench_log"]) or {TeleopEvents.STOP_RECORDING: True}
+    )
+
+    _record_session(monkeypatch, _record_config(output_dir=None), _FakeMPNet())
+
+    assert seen == [None]
 
 
 class _SessionRunner:

@@ -18,6 +18,34 @@ from lerobot.robots import RobotConfig
 from lerobot.cameras import CameraConfig
 
 
+@dataclass
+class BotaConfig:
+    """Bota force/torque sensor between the wrist and the gripper, used to diagnose contact forces.
+
+    When enabled, the observation carries the gravity-compensated wrench as `{x,y,z,rx,ry,rz}.ee_wrench`
+    (N / Nm, sensor frame, NaN until the payload is calibrated). It only reaches a policy if the env's
+    `add_ee_wrench_to_observation` is set. The payload fit is stored in the arm's calibration file and made
+    by `ViperX.calibrate()`.
+    """
+
+    enable: bool = False
+    # Stable /dev/serial/by-id/usb-Bota_Systems_... path of the sensor
+    port: str = ""
+    # Calibration switches the torque off and records the trajectory while you move the arm slowly by hand through
+    # as many orientations as you can, for at most this many seconds. Press Enter to finish earlier once enough
+    # orientations are covered. Hold the arm by the wrist or forearm, not the gripper, so your grip does not
+    # enter the sensor.
+    calibration_duration_s: float = 90.0
+    # Seconds of still readings averaged to re-zero the bias on connect. The arm must be still and untouched.
+    tare_duration_s: float = 1.0
+    # Also fit a small net for what depends on the pose and the weight model cannot know, e.g. cable pull. It is
+    # kept only if it beats the weight model on held-out orientations, and needs more orientations (30 instead of
+    # 12). The trajectory is stored next to the calibration file, so a later calibration can refit it (e.g. to
+    # turn this on) without recording a new one. Connecting with this on and a stored fit that has no net runs the
+    # calibration, unless a net was already tried and rejected. A stored net is used whatever this says.
+    residual: bool = False
+
+
 @RobotConfig.register_subclass("viperx")
 @dataclass
 class ViperXConfig(RobotConfig):
@@ -37,6 +65,8 @@ class ViperXConfig(RobotConfig):
     # The duration of the velocity-based time profile
     # Higher values lead to smoother motions, but increase lag.
     moving_time: float = 0.1
+
+    bota: BotaConfig = field(default_factory=BotaConfig)
 
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
