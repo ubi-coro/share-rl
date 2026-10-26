@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -57,7 +58,8 @@ class _FakeRunner:
 class _FakeMPNet:
     """One primitive with a policy; every episode lasts ``episode_len`` steps, ``stop_on_reset`` ends the session."""
 
-    def __init__(self, episode_len: int = 1, stop_on_reset: bool = False, fps: int = 30):
+    def __init__(self, episode_len: int = 1, stop_on_reset: bool = False, fps: int = 30, fail_on_step: int | None = None):
+        self.fail_on_step = fail_on_step
         self.action_dim = 1
         self.active_primitive = "pick"
         self.episode_len = episode_len
@@ -69,6 +71,7 @@ class _FakeMPNet:
             fps=fps,
             type="mock_robot",
             primitives={"pick": SimpleNamespace(task_description="pick task")},
+            transitions=[],
         )
 
     def reset(self):
@@ -78,6 +81,8 @@ class _FakeMPNet:
 
     def step(self, action):
         self.steps += 1
+        if self.steps == self.fail_on_step:
+            raise RuntimeError("control board disconnected")
         self.actions.append(action)
         return create_transition(
             observation={"obs": torch.tensor([[2.0]])},
@@ -91,10 +96,10 @@ class _FakeMPNet:
         self.closed = True
 
 
-def _loop(mp_net, policy, **kwargs):
+def _loop(mp_net, policy, datasets=None, **kwargs):
     return record_loop(
         mp_net=mp_net,
-        datasets={},
+        datasets=datasets or {},
         policies={"pick": policy},
         preprocessors={"pick": _identity},
         postprocessors={"pick": _identity},
@@ -115,6 +120,85 @@ def test_record_loop_without_recorders_does_not_need_them():
         _loop(_FakeMPNet(), policy, recorders=recorders)
 
     assert policy.resets == 2
+
+
+
+# ---------------------------------------------------------------------------------------------------------
+# a failing env step
+# ---------------------------------------------------------------------------------------------------------
+
+
+class _FakeDataset:
+    """Counts the frames added to the episode buffer and the episodes saved."""
+
+    features = {"obs": None}
+    num_episodes = 4
+
+    def __init__(self):
+        self.writer = SimpleNamespace(episode_buffer={"size": 0})
+        self.saved = 0
+
+    def add_frame(self, frame):
+        self.writer.episode_buffer["size"] += 1
+
+    def save_episode(self):
+        self.saved += 1
+
+
+def _answers(monkeypatch, *answers: str) -> list:
+    """Answer the console prompts in order; returns the prompts that were asked."""
+    prompts, remaining = [], iter(answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or next(remaining))
+    return prompts
+
+
+def _run_failing_episode(dataset, fail_on_step: int = 3):
+    """The env step number `fail_on_step` raises; the error must still reach the caller."""
+    datasets = {} if dataset is None else {"pick": dataset}
+    with pytest.raises(RuntimeError, match="control board disconnected"):
+        _loop(_FakeMPNet(episode_len=10, fail_on_step=fail_on_step), _FakePolicy(), datasets=datasets)
+
+
+def test_failed_env_step_saves_the_episode_when_confirmed(monkeypatch):
+    dataset = _FakeDataset()
+    prompts = _answers(monkeypatch, "maybe", "y")
+
+    _run_failing_episode(dataset)
+
+    assert dataset.saved == 1
+    assert len(prompts) == 2, "anything but y/n is asked again"
+    assert "2 frames" in prompts[0] and "episode 4" in prompts[0]
+
+
+def test_failed_env_step_discards_the_episode_when_declined(monkeypatch):
+    dataset = _FakeDataset()
+    _answers(monkeypatch, "n")
+
+    _run_failing_episode(dataset)
+
+    assert dataset.saved == 0
+
+
+def test_failed_env_step_does_not_ask_without_frames_or_dataset(monkeypatch):
+    prompts = _answers(monkeypatch)
+
+    _run_failing_episode(_FakeDataset(), fail_on_step=1)  # nothing recorded yet
+    _run_failing_episode(None)  # nowhere to save to
+
+    assert prompts == []
+
+
+def test_failed_env_step_with_closed_stdin_counts_as_no(monkeypatch):
+    dataset = _FakeDataset()
+
+    def closed_stdin(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", closed_stdin)
+
+    _run_failing_episode(dataset)
+
+    assert dataset.saved == 0
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -169,14 +253,16 @@ def test_record_loop_keeps_the_sync_path_for_primitives_without_a_runner():
 # ---------------------------------------------------------------------------------------------------------
 
 
-def _record_session(monkeypatch, cfg: RecordBeastConfig, mp_net: _FakeMPNet, policies: dict | None = None):
-    """Run ``record()`` against a fake MP-net, without datasets, robot or sound."""
+def _record_session(
+    monkeypatch, cfg: RecordBeastConfig, mp_net: _FakeMPNet, policies: dict | None = None, datasets: dict | None = None
+):
+    """Run ``record()`` against a fake MP-net, without a robot or sound; datasets default to none."""
     policies = policies if policies is not None else {"pick": _FakePolicy()}
     monkeypatch.setattr(record_beast, "ManipulationPrimitiveNet", lambda env_cfg: mp_net)
     monkeypatch.setattr(
         record_beast,
         "make_policies_and_datasets",
-        lambda _cfg: ({}, policies, {n: _identity for n in policies}, {n: _identity for n in policies}),
+        lambda _cfg: (datasets or {}, policies, {n: _identity for n in policies}, {n: _identity for n in policies}),
     )
     monkeypatch.setattr(record_beast, "log_say", lambda *a, **k: None)
     record_beast.record(cfg)
@@ -207,6 +293,25 @@ def test_record_session_with_output_dir_builds_one_recorder_per_policy(monkeypat
     _record_session(monkeypatch, _record_config(output_dir=str(tmp_path)), _FakeMPNet(stop_on_reset=True))
 
     assert len(built) == 1
+
+
+def test_record_session_names_dashboards_after_the_dataset_episode(monkeypatch, tmp_path):
+    """A resumed dataset continues at its episode count; its dashboards must not restart at episode_000000."""
+    flushed = []
+    monkeypatch.setattr(record_beast, "EpisodeRecorder", lambda **kw: SimpleNamespace(flush=lambda **f: flushed.append(f)))
+    monkeypatch.setattr(record_beast, "PolicyVisualizationAdapter", lambda *a, **kw: None)
+    monkeypatch.setattr(record_beast, "MultiVideoEncodingManager", lambda datasets: nullcontext())
+    results = iter([{}, {TeleopEvents.STOP_RECORDING: True}])
+    monkeypatch.setattr(record_beast, "record_loop", lambda **kw: next(results))
+    dataset = SimpleNamespace(
+        num_episodes=12, writer=SimpleNamespace(episode_buffer={"size": 1}), save_episode=lambda: None
+    )
+
+    _record_session(
+        monkeypatch, _record_config(output_dir=str(tmp_path)), _FakeMPNet(), datasets={"pick": dataset}
+    )
+
+    assert flushed == [{"output_root": tmp_path / "pick", "episode_name": "episode_000012"}]
 
 
 class _SessionRunner:

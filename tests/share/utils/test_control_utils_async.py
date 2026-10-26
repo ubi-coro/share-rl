@@ -222,3 +222,14 @@ def test_tick_stats_summarise_once_per_window():
     assert "last 3 ticks" in summary
     assert "max 50.00ms" in summary and "20.0hz min" in summary and "dt_load max 20.00ms" in summary
     assert stats.add(0.030, 0.010) is None, "the window starts over"
+
+
+def test_tick_stats_report_phases_as_mean_and_max():
+    stats = TickStats(window=2)
+
+    stats.add(0.030, 0.030, policy=0.010, env_step=0.020)
+    summary = stats.add(0.034, 0.034, policy=0.020, env_step=0.010, store=0.004)
+
+    assert "policy 15.0/20.0" in summary and "env_step 15.0/20.0" in summary
+    assert "store 4.0/4.0" in summary, "a phase that occurred on some ticks is averaged over those"
+    assert "policy" not in (stats.add(0.030, 0.030) or "") and not stats.phases, "phases start over with the window"

@@ -1,10 +1,11 @@
 import logging
+import sys
 import time
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, Tuple
 
 import torch
 from lerobot.configs.policies import PreTrainedConfig
@@ -12,10 +13,13 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor.rename_processor import rename_stats
+from tqdm import tqdm
+from tqdm.contrib import DummyTqdmFile
 
 from share.configs.record import RecordConfig
 from share.envs.manipulation_primitive.config_manipulation_primitive import ManipulationPrimitiveConfig
-from share.envs.utils import env_to_dataset_features
+from share.envs.manipulation_primitive_net.transitions import OnTimeLimit
+from share.envs.utils import env_to_dataset_features, resolve_value, to_scalar
 from share.utils.video_utils import use_zero_copy_streaming_encoder
 
 if TYPE_CHECKING:
@@ -28,6 +32,7 @@ def make_policies_and_datasets(cfg: RecordConfig):
     policies = {}
     preprocessors = {}
     postprocessors = {}
+    rename_map = cfg.rename_map
     for name, p in cfg.env.primitives.items():
         if p.is_adaptive:
 
@@ -35,7 +40,6 @@ def make_policies_and_datasets(cfg: RecordConfig):
                 continue
 
             # 1) dataset
-            rename_map = {}
             stats = None
             if cfg.dataset is not None:
                 root = Path(cfg.dataset.root) / name
@@ -77,7 +81,6 @@ def make_policies_and_datasets(cfg: RecordConfig):
                         video_files_size_in_mb=cfg.dataset.video_files_size_in_mb
                     )
 
-                rename_map = cfg.dataset.rename_map
                 stats = rename_stats(datasets[name].meta.stats, rename_map)
 
             # 2) policy
@@ -208,11 +211,18 @@ class TickStats:
         self.window = max(1, window)
         self.dt_loop: list[float] = []
         self.dt_load: list[float] = []
+        self.phases: dict[str, list[float]] = {}
 
-    def add(self, dt_loop: float, dt_load: float) -> str | None:
-        """Record one tick; returns the summary of the window when it is full, else None."""
+    def add(self, dt_loop: float, dt_load: float, **phases: float) -> str | None:
+        """Record one tick; returns the summary of the window when it is full, else None.
+
+        `phases` are named durations (seconds) of parts of the tick, reported as mean/max in ms. A phase that
+        only occurs on some ticks (e.g. no policy on a teleoperated primitive) is averaged over those.
+        """
         self.dt_loop.append(dt_loop)
         self.dt_load.append(dt_load)
+        for name, duration in phases.items():
+            self.phases.setdefault(name, []).append(duration)
         if len(self.dt_loop) < self.window:
             return None
         summary = (
@@ -221,8 +231,14 @@ class TickStats:
             f"max {1000 * max(self.dt_loop):5.2f}ms ({1 / max(self.dt_loop):3.1f}hz min), "
             f"dt_load max {1000 * max(self.dt_load):5.2f}ms"
         )
+        if self.phases:
+            summary += " | mean/max ms: " + ", ".join(
+                f"{name} {1000 * sum(values) / len(values):.1f}/{1000 * max(values):.1f}"
+                for name, values in self.phases.items()
+            )
         self.dt_loop.clear()
         self.dt_load.clear()
+        self.phases.clear()
         return summary
 
 
@@ -335,3 +351,86 @@ def suppress_logging(level=logging.CRITICAL):
         yield
     finally:
         logging.disable(previous)
+
+
+def mute_log_messages(*prefixes: str) -> None:
+    """Drop log records whose message starts with one of `prefixes` from the root handlers.
+
+    Filters by message because some libraries log on the root logger, so their level cannot be set per module.
+    Call after `init_logging()`, which replaces the root handlers.
+    """
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(lambda record: not record.getMessage().startswith(prefixes))
+
+
+@contextmanager
+def _console_logs_via_tqdm() -> Iterator[None]:
+    """Route the root console handlers through `tqdm.write` so log lines do not tear a progress bar.
+
+    Unlike `tqdm.contrib.logging.logging_redirect_tqdm` this keeps the handlers themselves, so their level and
+    filters (see `mute_log_messages`) stay in effect.
+    """
+    handlers = [h for h in logging.getLogger().handlers if getattr(h, "stream", None) in (sys.stdout, sys.stderr)]
+    streams = [handler.setStream(DummyTqdmFile(handler.stream)) for handler in handlers]  # returns the old stream
+    try:
+        yield
+    finally:
+        for handler, stream in zip(handlers, streams):
+            handler.setStream(stream)
+
+
+@contextmanager
+def episode_progress(mp_net, dataset: LeRobotDataset | None = None) -> Iterator[Callable[[dict], None] | None]:
+    """Console progress line for the episode about to be recorded; yields a per-step `on_step(info)` callback.
+
+    Shows the episode number (saved episodes + 1) if the active primitive records into `dataset`, and a bar of
+    elapsed seconds against the primitive's `OnTimeLimit` if it has one, e.g. `grab ep 7  40%|####| 10/25s`.
+    Yields None, and shows nothing, if there is neither. The line is removed when the episode ends and is
+    disabled when stderr is not a terminal.
+    """
+    primitive = mp_net.active_primitive
+    fps = mp_net.config.fps
+    limit = next(
+        (t for t in mp_net.config.transitions if t.source == primitive and isinstance(t, OnTimeLimit)), None
+    )
+    if limit is None and dataset is None:
+        yield None
+        return
+
+    label = primitive if dataset is None else f"{primitive} ep {dataset.num_episodes + 1}"
+    step_key = "primitive_step" if limit is None else limit.step_key
+    bar_format = "{desc} {n:.0f}s" if limit is None else "{desc} {percentage:3.0f}%|{bar:20}| {n:.0f}/{total:.0f}s"
+
+    def on_step(info: dict) -> None:
+        try:
+            seconds = to_scalar(resolve_value(info, step_key)) / fps
+        except KeyError:  # e.g. an intervention-completed step carries no step counters
+            return
+        bar.update(seconds - bar.n)
+
+    with _console_logs_via_tqdm(), tqdm(
+        total=None if limit is None else limit.max_steps / fps,
+        desc=label, bar_format=bar_format, mininterval=0.5, leave=False, disable=None,
+    ) as bar:
+        yield on_step
+
+
+def confirm(question: str) -> bool:
+    """Ask a y/n question on the console until it is answered. A closed stdin counts as no."""
+    with tqdm.external_write_mode():  # clears a progress bar, so the prompt gets a line of its own
+        while True:
+            try:
+                answer = input(f"{question} [y/n] ").strip().lower()
+            except EOFError:
+                return False
+            if answer in ("y", "n"):
+                return answer == "y"
+
+
+def offer_to_save_episode(dataset: LeRobotDataset | None) -> None:
+    """After a failed step, ask whether to keep the frames recorded so far and save them if so."""
+    frames = 0 if dataset is None else dataset.writer.episode_buffer["size"]
+    if frames > 0 and confirm(f"Save the {frames} frames recorded so far as episode {dataset.num_episodes}?"):
+        dataset.save_episode()
+        logging.info("Saved the partial episode.")
+

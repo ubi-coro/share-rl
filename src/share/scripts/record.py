@@ -2,7 +2,7 @@ import logging
 import time
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -29,10 +29,12 @@ from share.configs.record import RecordConfig
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
 from share.teleoperators import TeleopEvents
-from share.utils.control_utils import make_policies_and_datasets
+from share.utils.control_utils import episode_progress, make_policies_and_datasets, mute_log_messages
 from share.utils.video_utils import MultiVideoEncodingManager
 
 init_logging()
+# The clamp itself stays active, only its per-tick warning is hidden
+mute_log_messages("Relative goal position magnitude")
 
 """ --------------- record_loop() data flow --------------------------
        [ Robot ]
@@ -74,6 +76,7 @@ def record_loop(
     display_compressed_images: bool = False,
     interactive: bool = False,
     debugger: MPNetDebugger | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ):
     # reset
     transition = mp_net.reset()
@@ -128,6 +131,8 @@ def record_loop(
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
         info = new_transition.get(TransitionKey.INFO, {})
         sum_reward += float(reward)
+        if on_step is not None:
+            on_step(info)
 
         # (3) Exit on episode end
         if info.get(TeleopEvents.INTERVENTION_COMPLETED, False) or info.get(TeleopEvents.STOP_RECORDING, False):
@@ -204,17 +209,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 dataset = datasets.get(mp_net.active_primitive, None)
 
-                info = record_loop(
-                    mp_net=mp_net,
-                    datasets=datasets,
-                    policies=policies,
-                    preprocessors=preprocessors,
-                    postprocessors=postprocessors,
-                    display_data=cfg.display_data,
-                    display_compressed_images=display_compressed_images,
-                    interactive=cfg.interactive,
-                    debugger=debugger,
-                )
+                with episode_progress(mp_net, dataset) as on_step:
+                    info = record_loop(
+                        mp_net=mp_net,
+                        datasets=datasets,
+                        policies=policies,
+                        preprocessors=preprocessors,
+                        postprocessors=postprocessors,
+                        display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
+                        interactive=cfg.interactive,
+                        debugger=debugger,
+                        on_step=on_step,
+                    )
 
                 if info.get(TeleopEvents.STOP_RECORDING, False):
                     break

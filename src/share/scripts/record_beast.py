@@ -4,7 +4,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from pprint import pformat
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -33,10 +33,16 @@ from share.configs.record_beast import RecordBeastConfig
 from share.debug.mpnet_debug import MPNetDebugger
 from share.envs.manipulation_primitive_net.env_manipulation_primitive_net import ManipulationPrimitiveNet
 from share.teleoperators import TeleopEvents
-from share.utils.control_utils import TickStats, make_async_runners, make_policies_and_datasets, predict_action_async
+from share.utils.control_utils import (
+    TickStats, episode_progress, make_async_runners, make_policies_and_datasets, mute_log_messages,
+    offer_to_save_episode, predict_action_async
+)
 from share.utils.video_utils import MultiVideoEncodingManager
 
-init_logging()
+# INFO on the console. The async runner's per-plan timings and the loop's per-tick timings are DEBUG.
+init_logging(console_level="INFO")
+# The clamp itself stays active, only its per-tick warning is hidden
+mute_log_messages("Relative goal position magnitude")
 
 """ --------------- record_loop() data flow --------------------------
        [ Robot ]
@@ -80,6 +86,7 @@ def record_loop(
     debugger: MPNetDebugger | None = None,
     recorders: dict[str, EpisodeRecorder] | None = None,
     runners: dict[str, AsyncPolicyRunner] | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ):
     runners = runners or {}
 
@@ -113,6 +120,7 @@ def record_loop(
         policy = policies.get(mp_net.active_primitive, None)
         runner = runners.get(mp_net.active_primitive, None)
         dataset = datasets.get(mp_net.active_primitive, None)
+        phases = {}  # durations of the parts of this tick, summarised by tick_stats
 
         # (1) Decide and process action a_t
         if policy is not None:
@@ -137,6 +145,8 @@ def record_loop(
                 # noinspection PyTypeChecker
                 action = predict_action(policy=policy, use_amp=policy.config.use_amp, **inference_kwargs)
             action = action.squeeze()
+            policy_done_t = time.perf_counter()
+            phases["policy"] = policy_done_t - start_loop_t
 
             # obs and action share the same absolute-joint-state space in this
             # env config (see AlohaBimanualMPNetConfig's TaskFrame), so the
@@ -149,12 +159,22 @@ def record_loop(
                     predicted_action=action,
                     ground_truth_action=obs.get(OBS_STATE)
                 )
+                phases["dashboard"] = time.perf_counter() - policy_done_t
         else:
             # Dummy action, expected to be overwritten by teleop action
             action = torch.tensor([0.0] * mp_net.action_dim, dtype=torch.float32)
 
-        # (2) Step environment
-        new_transition = mp_net.step(action)
+        # (2) Step environment (sends the action, reads the next observation)
+        step_start_t = time.perf_counter()
+        try:
+            new_transition = mp_net.step(action)
+        except Exception as exc:
+            # E.g. the arm drops the object and a control board disconnects. The robot cannot be stepped any more,
+            # but the episode so far is worth keeping. The error still propagates, after the dataset is saved.
+            logging.error(f"[{task}] env step failed: {exc!r}")
+            offer_to_save_episode(dataset)
+            raise
+        phases["env_step"] = time.perf_counter() - step_start_t
         if debugger is not None:
             debugger.log_step(mp_net, new_transition)
 
@@ -164,6 +184,8 @@ def record_loop(
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
         info = new_transition.get(TransitionKey.INFO, {})
         sum_reward += float(reward)
+        if on_step is not None:
+            on_step(info)
 
         # (3) Exit on episode end
         if info.get(TeleopEvents.INTERVENTION_COMPLETED, False) or info.get(TeleopEvents.STOP_RECORDING, False):
@@ -172,6 +194,7 @@ def record_loop(
         # (4) Store transition. When interactive, only store frames on interventions
         # store o_t, a_t, r_t+1
         if dataset is not None and (not interactive or info.get(TeleopEvents.IS_INTERVENTION, False)):
+            store_start_t = time.perf_counter()
             # observations are batched and may contain other keys
             dataset_observation = {
                 k: v.squeeze().cpu()
@@ -194,6 +217,7 @@ def record_loop(
                 log_rerun_data(
                     observation=rerun_obs, action=action.squeeze().cpu(), compress_images=display_compressed_images
                 )
+            phases["store"] = time.perf_counter() - store_start_t
 
         # (5) Update current observation
         transition = new_transition
@@ -215,7 +239,7 @@ def record_loop(
             "[%s] dt_loop: %5.2fms (%3.1fhz), dt_load: %5.2fms (%3.1fhz)",
             task, dt_loop * 1000, 1 / dt_loop, dt_load * 1000, 1 / dt_load
         )
-        summary = tick_stats.add(dt_loop, dt_load)
+        summary = tick_stats.add(dt_loop, dt_load, **phases)
         if summary is not None:
             logging.info(f"[{task}] {summary}")
 
@@ -257,25 +281,34 @@ def record(cfg: RecordBeastConfig) -> LeRobotDataset:
                 recorder = recorders.get(mp_net.active_primitive, None)
                 recorder_root = None if output_dir is None else Path(output_dir) / mp_net.active_primitive
 
-                info = record_loop(
-                    mp_net=mp_net,
-                    datasets=datasets,
-                    policies=policies,
-                    preprocessors=preprocessors,
-                    postprocessors=postprocessors,
-                    display_data=cfg.display_data,
-                    display_compressed_images=display_compressed_images,
-                    interactive=cfg.interactive,
-                    debugger=debugger,
-                    recorders=recorders,
-                    runners=runners
-                )
+                with episode_progress(mp_net, dataset) as on_step:
+                    info = record_loop(
+                        mp_net=mp_net,
+                        datasets=datasets,
+                        policies=policies,
+                        preprocessors=preprocessors,
+                        postprocessors=postprocessors,
+                        display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
+                        interactive=cfg.interactive,
+                        debugger=debugger,
+                        recorders=recorders,
+                        runners=runners,
+                        on_step=on_step,
+                    )
 
                 if info.get(TeleopEvents.STOP_RECORDING, False):
                     break
 
+                # Named after the dataset episode it belongs to: the recorder's own counter restarts at 0 in
+                # every session, so a resumed run would overwrite the earlier dashboards. A re-recorded
+                # episode reuses its index and replaces the dashboard of the discarded take.
                 if recorder is not None and output_dir is not None:
-                    recorder.flush(output_root=recorder_root)
+                    # Named after the dataset episode it belongs to: the recorder's own counter restarts at 0 in
+                    # every session, so a resumed run would overwrite the earlier dashboards. A re-recorded
+                    # episode reuses its index and replaces the dashboard of the discarded take.
+                    episode_name = None if dataset is None else f"episode_{dataset.num_episodes:06d}"
+                    recorder.flush(output_root=recorder_root, episode_name=episode_name)
 
                 if dataset is None:
                     continue

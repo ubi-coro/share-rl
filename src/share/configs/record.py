@@ -44,8 +44,6 @@ class DatasetRecordConfig(draccus.ChoiceRegistry, DatasetConfig):
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
-    # Rename map for the observation to override the image and state keys
-    rename_map: dict[str, str] = field(default_factory=dict)
     # Keep an in-memory replay buffer and only write to disk when checkpointing
     in_memory: bool = True
     # Whether to overwrite repo_id and interpret root as dir containing folders, only works for disk (no in-memory) buffers
@@ -96,6 +94,10 @@ class RecordConfig:
     debug: MPNetDebugConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
+    # Maps observation keys of the env to the keys the policies expect, e.g.
+    # {"observation.images.cam_top": "observation.images.image2"}, for the policy of every primitive.
+    # Independent of the dataset: also applies when only evaluating. Empty keeps the keys as they are.
+    rename_map: dict[str, str] = field(default_factory=dict)
     # Display all cameras on screen
     display_data: bool = False
     # Display data on a remote Rerun server

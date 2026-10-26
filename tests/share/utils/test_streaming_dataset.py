@@ -161,7 +161,7 @@ def _stub_cfg(root, *, streaming: bool, resume: bool, video_files_size_in_mb: in
         encoder_threads=2,
         video_files_size_in_mb=video_files_size_in_mb,
     )
-    return SimpleNamespace(env=env, dataset=dataset, resume=resume)
+    return SimpleNamespace(env=env, dataset=dataset, resume=resume, rename_map={})
 
 
 def _frame_with_reward(t: int) -> dict:
