@@ -19,7 +19,10 @@ with its deterministic action: tanh of the actor's mean, unnormalized. When an e
     <out>/full/<key>.npz     the uncropped camera frames of the same steps, JPEG-encoded
     <out>/hidden/<key>.json  diagnostics that are not policy inputs: the absolute task-frame TCP pose per step
 
-When every episode of a request exists, `<queue>/done/<id>.json` is written. An episode that is interrupted (crash,
+When every episode of a request exists, the request is also written as one LeRobot dataset, `<out>/lerobot/` (repo id
+`rollouts/<id>`; observation.state, observation.images.<camera> as the policy's uint8 crop, action, next.reward = 1 on
+the step that reaches success, next.done), built from the episode files in the request's order, and then
+`<queue>/done/<id>.json` is written. An episode that is interrupted (crash,
 network error, operator restart) leaves no file and is simply run again with the same seed: `--supervise` restarts the
 runner after any failure, and nothing in the episode files records that a restart happened. Restarts are logged to
 `<queue>/runner.log` for the operator only.
@@ -44,7 +47,8 @@ import numpy as np
 import torch
 
 POLL_S = 2.0
-RESTART_DELAY_S = 5.0
+RESTART_DELAY_S = 5.0  # Doubles after each consecutive failure, up to RESTART_DELAY_MAX_S.
+RESTART_DELAY_MAX_S = 60.0
 
 
 def _log(queue: Path, msg: str) -> None:
@@ -90,6 +94,8 @@ class DeterministicPolicy:
     def act(self, obs: dict) -> tuple[torch.Tensor, dict[str, np.ndarray]]:
         batch = {k: obs[k].unsqueeze(0) if obs[k].ndim in (1, 3) else obs[k] for k in self.input_keys}
         batch = self.pre(batch)
+        # The saved preprocessor pins the device the policy was trained on; run on this runner's device.
+        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         actor = self.policy.actor
         cache = actor.encoder.get_cached_image_features(batch) if self.image_keys else None
         enc = actor.encoder(batch, cache=cache)
@@ -105,6 +111,47 @@ def _jpeg(frame: np.ndarray, quality: int) -> bytes:
     if not ok:
         raise RuntimeError("JPEG encoding failed")
     return buf.tobytes()
+
+
+def write_lerobot(out: Path, req: dict, fps: int) -> None:
+    """The request's episodes, in request order, as one LeRobot dataset in <out>/lerobot (built once, atomically)."""
+    import shutil
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    final, tmp = out / "lerobot", out / "lerobot.tmp"
+    if final.exists():
+        return
+    shutil.rmtree(tmp, ignore_errors=True)
+    episodes = [np.load(out / f"{ep['key']}.npz") for ep in req["episodes"]]
+    first = next(e for e in episodes if int(e["steps"]) > 0)
+    image_key = req.get("image_key", "observation.images.main")
+    c, h, w = first["image"].shape[1:]
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (first["state"].shape[1],), "names": None},
+        image_key: {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channels"]},
+        "action": {"dtype": "float32", "shape": (first["action"].shape[1],), "names": None},
+        "next.reward": {"dtype": "float32", "shape": (1,), "names": None},
+        "next.done": {"dtype": "bool", "shape": (1,), "names": None},
+    }
+    ds = LeRobotDataset.create(repo_id=f"rollouts/{req['id']}", fps=fps, features=features, root=tmp,
+                               use_videos=False)
+    for ep in episodes:
+        n, success = int(ep["steps"]), bool(ep["success"])
+        for t in range(n):
+            last = t == n - 1
+            ds.add_frame({
+                "observation.state": ep["state"][t].astype(np.float32),
+                image_key: np.transpose(ep["image"][t], (1, 2, 0)),
+                "action": ep["action"][t].astype(np.float32),
+                "next.reward": np.array([float(last and success)], dtype=np.float32),
+                "next.done": np.array([last], dtype=bool),
+                "task": req.get("task", req.get("primitive", "insert")),
+            })
+        if n:
+            ds.save_episode()
+    ds.finalize()
+    os.replace(tmp, final)
 
 
 def run_episode(net, policy: DeterministicPolicy, primitive: str, seed: int, realtime: bool, jpeg_quality: int):
@@ -195,6 +242,7 @@ def serve(args) -> None:
                 _atomic_savez(out / f"{ep['key']}.npz", **arrays, **{k: np.array(v) for k, v in meta.items()})
                 print(f"[{req['id']}] {ep['key']}: {'success' if meta['success'] else meta['reason']} "
                       f"after {meta['duration_s']:.1f} s", flush=True)
+            write_lerobot(out, req, EnvConfig.get_choice_class(args.env_type)().fps)
             _atomic_json(queue / "done" / pending[0].name, dict(id=req["id"], finished=time.time()))
     finally:
         if net is not None:
@@ -204,12 +252,17 @@ def serve(args) -> None:
 def supervise(argv: list[str], queue: Path) -> None:
     cmd = [sys.executable, "-m", "share.scripts.rollout_runner", *[a for a in argv if a != "--supervise"]]
     queue.mkdir(parents=True, exist_ok=True)
+    delay = RESTART_DELAY_S
     while True:
+        t0 = time.time()
         rc = subprocess.call(cmd)
         if rc == 0:
             return
-        _log(queue, f"runner exited with code {rc}; restarting in {RESTART_DELAY_S:.0f} s (unfinished episodes rerun)")
-        time.sleep(RESTART_DELAY_S)
+        if time.time() - t0 > 600:  # It ran for a while: a fresh failure, not a crash loop.
+            delay = RESTART_DELAY_S
+        _log(queue, f"runner exited with code {rc}; restarting in {delay:.0f} s (unfinished episodes rerun)")
+        time.sleep(delay)
+        delay = min(2 * delay, RESTART_DELAY_MAX_S)
 
 
 def main() -> None:
